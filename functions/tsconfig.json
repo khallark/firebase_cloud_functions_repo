@@ -1,17 +1,25 @@
 {
   "compilerOptions": {
+    "target": "ES2022",
+    "lib": ["ES2022"],
     "module": "NodeNext",
+    "moduleResolution": "NodeNext",
+
+    "types": ["node"],                 // <-- lets TS know about process, Buffer, console
     "esModuleInterop": true,
-    "moduleResolution": "nodenext",
-    "noImplicitReturns": true,
-    "noUnusedLocals": true,
-    "outDir": "lib",
-    "sourceMap": true,
+    "resolveJsonModule": true,
+
     "strict": true,
-    "target": "es2017"
+    "noImplicitReturns": true,
+    "noUnusedLocals": false,           // set true if you want stricter builds
+    "forceConsistentCasingInFileNames": true,
+    "skipLibCheck": true,
+
+    "rootDir": "src",
+    "outDir": "lib",
+    "sourceMap": true
   },
   "compileOnSave": true,
-  "include": [
-    "src"
-  ]
+  "include": ["src/**/*.ts"]
 }
+

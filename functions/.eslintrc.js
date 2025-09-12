@@ -1,33 +1,32 @@
+// functions/.eslintrc.cjs
 module.exports = {
   root: true,
-  env: {
-    es6: true,
-    node: true,
-  },
+  env: { node: true, es2022: true },
+  parser: '@typescript-eslint/parser',
+  plugins: ['@typescript-eslint'],
   extends: [
-    "eslint:recommended",
-    "plugin:import/errors",
-    "plugin:import/warnings",
-    "plugin:import/typescript",
-    "google",
-    "plugin:@typescript-eslint/recommended",
+    'eslint:recommended',
+    'plugin:@typescript-eslint/recommended',
+    'prettier', // keep last
   ],
-  parser: "@typescript-eslint/parser",
   parserOptions: {
-    project: ["tsconfig.json", "tsconfig.dev.json"],
-    sourceType: "module",
+    sourceType: 'module',
+    // Remove "project" for faster/less finicky lint (type-aware rules not needed here)
+    // project: ['tsconfig.json', 'tsconfig.dev.json'],
+  },
+  rules: {
+    // Match the advice I gave earlier
+    'linebreak-style': 'off',       // no CRLF noise on Windows
+    'max-len': 'off',               // avoid 80-char noise
+    'valid-jsdoc': 'off',           // Google style used to require this
+    'object-curly-spacing': ['error', 'always'], // align with Prettier
+    quotes: ['error', 'double'],
+    indent: ['error', 2],
   },
   ignorePatterns: [
-    "/lib/**/*", // Ignore built files.
-    "/generated/**/*", // Ignore generated files.
+    'lib/**',
+    'generated/**',
+    'dist/**',
+    'node_modules/**',
   ],
-  plugins: [
-    "@typescript-eslint",
-    "import",
-  ],
-  rules: {
-    "quotes": ["error", "double"],
-    "import/no-unresolved": 0,
-    "indent": ["error", 2],
-  },
 };

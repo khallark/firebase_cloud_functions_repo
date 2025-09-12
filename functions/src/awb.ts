@@ -16,7 +16,10 @@ export async function allocateAwb(shop: string): Promise<string> {
 
 /** Optionally push AWB back if you want strict accounting on failures. */
 export async function releaseAwb(shop: string, awb: string) {
-  await db.collection("accounts").doc(shop)
-    .collection("unused_awbs").doc(awb)
+  await db
+    .collection("accounts")
+    .doc(shop)
+    .collection("unused_awbs")
+    .doc(awb)
     .set({ status: "unused", createdAt: new Date() }, { merge: true });
 }
