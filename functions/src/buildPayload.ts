@@ -6,7 +6,7 @@ export function buildDelhiveryPayload(params: {
   pickupName: string;
   shippingMode: string;
 }) {
-  const { orderId, awb, order, pickupName, shippingMode } = params;
+  const { awb, order, pickupName, shippingMode } = params;
 
   const ship =
     order?.raw?.shipping_address || order?.shipping_address || order?.shippingAddress || {};
@@ -64,7 +64,7 @@ export function buildDelhiveryPayload(params: {
         order?.raw?.customer?.phone ||
         "",
     ),
-    order: _(orderId),
+    order: _(order?.name),
     payment_mode: paid ? "Prepaid" : "COD",
 
     // Return-to fields (left blank unless you populate from your store profile)
