@@ -8,56 +8,52 @@ export interface CreateTaskPayload {
   shop: string;
   batchId: string;
   jobId: string;
-  pickupName: string;
-  shippingMode: string;
+  pickupName?: string | null;
+  shippingMode?: string | null;
 }
 
 export interface CreateTaskOptions {
-  /** Pass the Tasks secret from the caller (mounted via defineSecret). */
-  tasksSecret: string;
-
-  /** Optional overrides for tests/local runs */
-  url?: string;
-  queue?: string;
+  /** Secret value that the processing endpoint will check in x-tasks-secret */
+  tasksSecret?: string;
+  /** Full URL of the Cloud Function that handles one job. */
+  targetUrl?: string;
+  /** Queue config overrides */
+  projectId?: string;
   location?: string;
-
-  /** Optional delay before dispatch (seconds) */
+  queueName?: string;
+  /** Optional delay in seconds */
   delaySeconds?: number;
+  /** Additional headers to include */
+  headers?: Record<string, string>;
 }
 
+/** Create a single HTTP task for processing one shipment job. */
 export async function createTask(
   payload: CreateTaskPayload,
-  opts: CreateTaskOptions,
+  opts: CreateTaskOptions = {},
 ): Promise<void> {
-  const project =
-    process.env.GOOGLE_CLOUD_PROJECT ||
-    process.env.GCLOUD_PROJECT ||
-    process.env.GCP_PROJECT ||
-    (await client.getProjectId());
+  const projectId = opts.projectId || process.env.GCLOUD_PROJECT || process.env.PROJECT_ID;
+  const location = opts.location || process.env.LOCATION || "asia-south1";
+  const queueName = opts.queueName || process.env.TASKS_QUEUE || "shipments-queue";
+  const targetUrl =
+    opts.targetUrl ||
+    process.env.PROCESS_TASK_URL ||
+    `https://${location}-${projectId}.cloudfunctions.net/processShipmentTask`;
 
-  const location = opts.location ?? process.env.LOCATION;
-  const queue = opts.queue ?? process.env.QUEUE_NAME;
-  const url = opts.url ?? process.env.TASK_TARGET_URL;
-
-  if (!location || !queue || !url) {
-    throw new Error("Missing env: LOCATION / QUEUE_NAME / TASK_TARGET_URL");
-  }
-  if (!opts.tasksSecret) {
-    throw new Error("Missing tasksSecret");
-  }
-
-  const parent = client.queuePath(project, location, queue);
+  const parent = client.queuePath(projectId!, location, queueName);
 
   const headers: Record<string, string> = {
-    "Content-Type": "application/json",
-    "X-Tasks-Secret": opts.tasksSecret,
+    "content-type": "application/json",
+    ...(opts.headers || {}),
   };
+  const tasksSecret = opts.tasksSecret || process.env.TASKS_SECRET;
+  if (tasksSecret) headers["x-tasks-secret"] = tasksSecret;
 
   // Use the top-level protos type (not v2.protos)
   const task: tasksProtos.google.cloud.tasks.v2.ITask = {
     httpRequest: {
       httpMethod: "POST",
-      url,
+      url: targetUrl,
       headers,
       body: Buffer.from(JSON.stringify(payload)),
       // If you later move to OIDC instead of header secrets:
