@@ -4,15 +4,6 @@ import type { protos as tasksProtos } from "@google-cloud/tasks";
 
 const client = new cloudtasks.CloudTasksClient();
 
-export interface CreateTaskPayload {
-  shop: string;
-  batchId: string;
-  jobId: string;
-  courier: string;
-  pickupName: string;
-  shippingMode: string;
-}
-
 export interface CreateTaskOptions {
   /** Pass the Tasks secret from the caller (mounted via defineSecret). */
   tasksSecret: string;
@@ -26,10 +17,7 @@ export interface CreateTaskOptions {
   delaySeconds?: number;
 }
 
-export async function createTask(
-  payload: CreateTaskPayload,
-  opts: CreateTaskOptions,
-): Promise<void> {
+export async function createTask(payload: any, opts: CreateTaskOptions): Promise<void> {
   const project =
     process.env.GOOGLE_CLOUD_PROJECT ||
     process.env.GCLOUD_PROJECT ||
@@ -37,9 +25,9 @@ export async function createTask(
     (await client.getProjectId());
 
   const location = process.env.LOCATION;
-  const queue = process.env.QUEUE_NAME;
-  const url =
-    payload.courier === "Delhivery" ? process.env.TASK_TARGET_URL : process.env.TASK_TARGET_URL_2;
+  const queue = opts.queue;
+
+  const url = opts.url;
 
   if (!location || !queue || !url) {
     throw new Error("Missing env: LOCATION / QUEUE_NAME / TASK_TARGET_URL");

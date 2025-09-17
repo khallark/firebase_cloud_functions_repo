@@ -11,9 +11,7 @@ export function buildDelhiveryPayload(params: {
   const ship =
     order?.raw?.shipping_address || order?.shipping_address || order?.shippingAddress || {};
 
-  const paid =
-    String(order?.financialStatus || order?.raw?.financial_status || "").toLowerCase() === "paid";
-
+  const paid = !order.raw.payment_gateway_names.join(",").toLowerCase().includes("cod");
   const items =
     (Array.isArray(order?.raw?.line_items) && order.raw.line_items) || order?.lineItems || [];
 
@@ -33,22 +31,16 @@ export function buildDelhiveryPayload(params: {
     0,
   );
 
-  // weight in KG if you have grams on items
-  const grams = items.reduce(
-    (g: number, it: any) => g + Number(it?.grams ?? it?.weight_grams ?? it?.weight ?? 0),
-    0,
-  );
-  const weightKg = grams > 0 ? (grams / 1000).toFixed(3) : "";
-
-  const total = Number(order?.raw?.total_price ?? order?.totalPrice ?? order?.amount ?? 0) || "";
+  const total = Number(order.raw.total_price);
+  const cod = Number(order.raw.total_outstanding);
 
   const _ = (v: any) => (v === undefined || v === null ? "" : String(v));
 
   const shipment = {
     name: _(
       order?.raw?.billing_address?.name ||
-        order?.raw?.customer?.default_address ||
         ship?.name ||
+        order?.raw?.customer?.default_address?.name ||
         "Customer",
     ),
     add: _([ship?.address1, ship?.address2].filter(Boolean).join(", ")),
@@ -77,8 +69,8 @@ export function buildDelhiveryPayload(params: {
 
     products_desc,
     hsn_code: "6109",
-    cod_amount: paid ? "" : _(total),
-    order_date: order?.created_at ? new Date(order.created_at).toISOString() : null,
+    cod_amount: cod === 0 ? "" : _(cod),
+    order_date: order?.createdAt ? new Date(order.createdAt).toISOString() : null,
     total_amount: _(total),
 
     // Seller fields (fill from your account doc if available)
@@ -92,7 +84,7 @@ export function buildDelhiveryPayload(params: {
     // Dimensions (strings as per sample)
     shipment_width: _(order?.package?.width ?? order?.shipment_width ?? "100"),
     shipment_height: _(order?.package?.height ?? order?.shipment_height ?? "100"),
-    weight: _(order?.package?.weight ?? weightKg),
+    weight: _(order?.raw?.total_weight),
 
     shipping_mode: shippingMode,
     address_type: _(order?.address_type),
@@ -101,9 +93,7 @@ export function buildDelhiveryPayload(params: {
   return {
     shipments: [shipment],
     pickup_location: {
-      name:
-        _(pickupName ?? order?.pickup_location_name ?? order?.raw?.location?.name) ||
-        "Default Warehouse",
+      name: pickupName ? "Majime Productions 2" : "Majime Productions 2",
     },
   };
 }
@@ -115,13 +105,7 @@ export function buildShiprocketPayload(opts: {
   shippingMode: string;
 }) {
   const { orderId, order, pickupName } = opts;
-  const ship =
-    order?.shippingAddress ||
-    order?.shipping_address ||
-    order?.customer?.default_address ||
-    order?.billingAddress ||
-    order?.billing_address ||
-    {};
+  const ship = order?.raw?.shipping_address || {};
 
   const name =
     `${ship?.first_name ?? ship?.firstName ?? ""}`.trim() ||
@@ -160,23 +144,21 @@ export function buildShiprocketPayload(opts: {
           },
         ];
 
-  const sub_total =
-    order_items.reduce(
-      (sum: number, it: any) => sum + Number(it.selling_price || 0) * Number(it.units || 0),
-      0,
-    ) - order_items.reduce((sum: number, it: any) => sum + Number(it.discount || 0), 0);
+  const sub_total = order?.raw?.total_outstanding;
 
-  const payment_method = order?.financialStatus === "pending" ? "COD" : "Prepaid";
+  const payment_method = order.raw.payment_gateway_names.join(",").toLowerCase().includes("cod")
+    ? "COD"
+    : "Prepaid";
 
-  const length = Number(order?.package?.length ?? 10);
-  const breadth = Number(order?.package?.breadth ?? 10);
-  const height = Number(order?.package?.height ?? 10);
-  const weight = Number(order?.package?.weight ?? order?.total_weight ?? 0.5);
+  const length = Number(order?.package?.length ?? 100);
+  const breadth = Number(order?.package?.breadth ?? 100);
+  const height = Number(order?.package?.height ?? 100);
+  const weight = Number(order?.raw?.total_weight) / 1000;
 
   return {
     order_id: String(orderId), // make order_id == jobId for idempotency
     order_date: new Date().toISOString().slice(0, 16).replace("T", " "), // "YYYY-MM-DD HH:mm"
-    pickup_location: pickupName,
+    pickup_location: pickupName ? "Majime Productions 2" : "Majime Productions 2",
     comment: order?.note || "",
     billing_customer_name: name,
     billing_last_name: last,
@@ -198,10 +180,10 @@ export function buildShiprocketPayload(opts: {
     shipping_phone: "",
     order_items,
     payment_method,
-    shipping_charges: Number(order?.shipping_lines?.[0]?.price ?? 0) || 0,
+    shipping_charges: Number(order?.raw?.shipping_lines?.[0]?.price ?? 0) || 0,
     giftwrap_charges: 0,
     transaction_charges: 0,
-    total_discount: Number(order?.total_discounts ?? 0) || 0,
+    total_discount: Number(order?.raw?.total_discounts ?? 0) || 0,
     sub_total: Number(sub_total || 0),
     length,
     breadth,
