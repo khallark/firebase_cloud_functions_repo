@@ -36,6 +36,20 @@ export function buildDelhiveryPayload(params: {
 
   const _ = (v: any) => (v === undefined || v === null ? "" : String(v));
 
+  function normalizePhoneNumber(phoneNumber: string): string {
+    // Remove all whitespace characters from the phone number
+    const cleanedNumber = phoneNumber.replace(/\s/g, "");
+
+    // Check if the cleaned number length is >= 10
+    if (cleanedNumber.length >= 10) {
+      // Extract the last 10 digits
+      return cleanedNumber.slice(-10);
+    } else {
+      // Return the whole string if length is less than 10
+      return cleanedNumber;
+    }
+  }
+
   const shipment = {
     name: _(
       order?.raw?.billing_address?.name ||
@@ -44,11 +58,11 @@ export function buildDelhiveryPayload(params: {
         "Customer",
     ),
     add: _([ship?.address1, ship?.address2].filter(Boolean).join(", ")),
-    pin: _(ship?.zip),
+    pin: _(ship?.zip || order?.raw?.billing_address?.zip),
     city: _(ship?.city),
     state: _(ship?.province),
     country: _(ship?.country || "India"),
-    phone: _(
+    phone: normalizePhoneNumber(
       ship?.phone ||
         order?.raw?.phone ||
         ship?.phone ||
@@ -82,8 +96,9 @@ export function buildDelhiveryPayload(params: {
     waybill: _(awb),
 
     // Dimensions (strings as per sample)
-    shipment_width: _(order?.package?.width ?? order?.shipment_width ?? "100"),
-    shipment_height: _(order?.package?.height ?? order?.shipment_height ?? "100"),
+    shipment_width: "10",
+    shipment_height: "10",
+    shipment_length: "10",
     weight: _(order?.raw?.total_weight),
 
     shipping_mode: shippingMode,
@@ -150,10 +165,21 @@ export function buildShiprocketPayload(opts: {
     ? "COD"
     : "Prepaid";
 
-  const length = Number(order?.package?.length ?? 100);
-  const breadth = Number(order?.package?.breadth ?? 100);
-  const height = Number(order?.package?.height ?? 100);
   const weight = Number(order?.raw?.total_weight) / 1000;
+
+  function normalizePhoneNumber(phoneNumber: string): string {
+    // Remove all whitespace characters from the phone number
+    const cleanedNumber = phoneNumber.replace(/\s/g, "");
+
+    // Check if the cleaned number length is >= 10
+    if (cleanedNumber.length >= 10) {
+      // Extract the last 10 digits
+      return cleanedNumber.slice(-10);
+    } else {
+      // Return the whole string if length is less than 10
+      return cleanedNumber;
+    }
+  }
 
   return {
     order_id: String(orderId), // make order_id == jobId for idempotency
@@ -169,7 +195,14 @@ export function buildShiprocketPayload(opts: {
     billing_state: ship?.province ?? ship?.state ?? "",
     billing_country: ship?.country ?? "India",
     billing_email: ship?.email ?? order?.email ?? "",
-    billing_phone: ship?.phone ?? order?.phone ?? "",
+    billing_phone: normalizePhoneNumber(
+      ship?.phone ||
+        order?.raw?.phone ||
+        ship?.phone ||
+        order?.raw?.billing_address?.phone ||
+        order?.raw?.customer?.phone ||
+        "",
+    ),
     shipping_is_billing: true,
     shipping_address: "",
     shipping_address_2: "",
@@ -185,9 +218,9 @@ export function buildShiprocketPayload(opts: {
     transaction_charges: 0,
     total_discount: Number(order?.raw?.total_discounts ?? 0) || 0,
     sub_total: Number(sub_total || 0),
-    length,
-    breadth,
-    height,
+    length: 10,
+    breadth: 10,
+    height: 10,
     weight,
   };
 }

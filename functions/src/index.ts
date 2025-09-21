@@ -33,27 +33,61 @@ export const enqueueShipmentTasks = onRequest(
         return;
       }
 
-      const { shop, batchId, jobIds, courier, pickupName, shippingMode } = (req.body || {}) as {
+      const { shop, orders, courier, pickupName, shippingMode, requestedBy } = (req.body || {}) as {
         shop?: string;
-        batchId?: string;
-        jobIds?: string[];
+        orders?: string;
         courier?: string;
         pickupName?: string;
         shippingMode?: string;
+        requestedBy?: string;
       };
 
       if (
         !shop ||
-        !batchId ||
         !courier ||
         !pickupName ||
         !shippingMode ||
-        !Array.isArray(jobIds) ||
-        jobIds.length === 0
+        !Array.isArray(orders) ||
+        orders.length === 0
       ) {
         res.status(400).json({ error: "bad_payload" });
         return;
       }
+
+      // 1) Create batch header
+      const batchRef = db.collection("accounts").doc(shop).collection("shipment_batches").doc();
+
+      await batchRef.set({
+        shop,
+        createdAt: FieldValue.serverTimestamp(),
+        createdBy: requestedBy, // <-- stamp UID
+        total: orders.length,
+        queued: orders.length,
+        status: "running", // queued | running | complete
+        carrier: courier,
+        processing: 0,
+        success: 0,
+        failed: 0,
+      });
+
+      // 2) Create job docs
+      const writer = db.bulkWriter();
+      for (const o of orders) {
+        writer.set(
+          batchRef.collection("jobs").doc(String(o.orderId)),
+          {
+            orderId: String(o.orderId),
+            orderName: o.name,
+            status: "queued",
+            attempts: 0,
+          },
+          { merge: true },
+        );
+      }
+      await writer.close();
+
+      const batchId = batchRef.id;
+      const jobIds = orders.map((o) => String(o.orderId));
 
       const url =
         courier === "Delhivery"
@@ -63,22 +97,20 @@ export const enqueueShipmentTasks = onRequest(
       // Create one Cloud Task per job
       await Promise.all(
         jobIds.map((jobId) =>
-          createTask(
-            { shop, batchId, jobId, courier, pickupName, shippingMode },
-            {
-              tasksSecret: TASKS_SECRET.value() || "",
-              url,
-              queue: String(process.env.SHIPMENT_QUEUE_NAME),
-            },
-          ),
+          createTask({ shop, batchId, jobId, courier, pickupName, shippingMode } as any, {
+            tasksSecret: TASKS_SECRET.value() || "",
+            url,
+            queue: String(process.env.SHIPMENT_QUEUE_NAME) || "shipments-queue",
+          }),
         ),
       );
 
-      res.json({ ok: true, enqueued: jobIds.length });
+      await batchRef.update({ status: "running" });
+      res.status(202).json({ collectionName: "shipment_batches", batchId });
       return;
     } catch (e: any) {
       console.error("enqueue error:", e);
-      res.status(500).json({ error: "enqueue_failed", details: String(e?.message ?? e) });
+      res.status(500).json({ error: "start_batch_failed", details: String(e?.message ?? e) });
       return;
     }
   },
@@ -392,9 +424,9 @@ export const processShipmentTask = onRequest(
         orderRef.set(
           {
             awb,
-            shipmentStatus: "created",
             courier: "Delhivery",
             customStatus: "Ready To Dispatch",
+            shippingMode,
           },
           { merge: true },
         ),
@@ -779,6 +811,12 @@ export const processShipmentTask2 = onRequest(
           },
           { merge: true },
         );
+
+        // Wait for a second
+        function sleep(ms: number): Promise<void> {
+          return new Promise((resolve) => setTimeout(resolve, ms));
+        }
+        await sleep(1000);
       }
 
       // ---- Shiprocket Assign AWB ----
@@ -880,7 +918,6 @@ export const processShipmentTask2 = onRequest(
             {
               awb: awbCode,
               courier: `Shiprocket: ${courierName ?? "Unknown"}`,
-              shipmentStatus: "created",
               customStatus: "Ready To Dispatch",
 
               // Persist Shiprocket IDs for future reference
@@ -1056,7 +1093,7 @@ export const enqueueOrdersFulfillmentTasks = onRequest(
         shop,
         createdBy: requestedBy ?? null,
         createdAt: now,
-        status: "queued", // queued | running | complete
+        status: "running", // queued | running | complete
         total,
         processing: 0,
         success: 0,
@@ -1097,13 +1134,14 @@ export const enqueueOrdersFulfillmentTasks = onRequest(
               tasksSecret: TASKS_SECRET.value() || "",
               url: workerUrl,
               queue: process.env.FULFILLMENT_QUEUE_NAME || "fulfillments-queue",
+              delaySeconds: 1,
             },
           ),
         ),
       );
 
       await summaryRef.update({ status: "running" });
-      res.status(202).json({ summaryId, total });
+      res.status(202).json({ collectionName: "orders_fulfillment_summary", summaryId });
       return;
     } catch (e: any) {
       console.error("startOrdersFulfillmentBatch error:", e);
@@ -1113,18 +1151,23 @@ export const enqueueOrdersFulfillmentTasks = onRequest(
   },
 );
 
-// Fulfill ONE Shopify order (returns fulfillmentId or nothingToDo)
+// Fulfill ONE Shopify order (handles on_hold/scheduled → open)
 async function fulfillOrderOnShopify(
   shop: string,
   accessToken: string,
   orderId: string | number,
   awb: string | number,
+  courier: string,
 ): Promise<{ fulfillmentId?: string; nothingToDo?: boolean }> {
-  // Reuse your region default:
-  const SHOPIFY_API_VERSION = "2025-07";
-  const foUrl = `https://${shop}/admin/api/${SHOPIFY_API_VERSION}/orders/${orderId}/fulfillment_orders.json`;
-  const foResp = await fetch(foUrl, { headers: { "X-Shopify-Access-Token": accessToken } });
+  const V = "2025-07";
+  const headers = {
+    "X-Shopify-Access-Token": accessToken,
+    "Content-Type": "application/json",
+  };
 
+  // 1) Get Fulfillment Orders (requires merchant-managed FO scopes if it's your own location)
+  const foUrl = `https://${shop}/admin/api/${V}/orders/${orderId}/fulfillment_orders.json`;
+  const foResp = await fetch(foUrl, { headers });
   if (!foResp.ok) {
     const text = await foResp.text();
     const err: any = new Error(`FO fetch failed: HTTP_${foResp.status}`);
@@ -1132,30 +1175,80 @@ async function fulfillOrderOnShopify(
     err.detail = text;
     throw err;
   }
+  let { fulfillment_orders: fos } = (await foResp.json()) as any;
 
-  const { fulfillment_orders } = (await foResp.json()) as any;
-  const openFOs = (fulfillment_orders || []).filter((fo: any) => fo.status === "open");
-  if (!openFOs.length) return { nothingToDo: true };
+  // If no FOs are visible, it’s almost always a scope issue
+  if (!Array.isArray(fos) || fos.length === 0) {
+    return { nothingToDo: true }; // caller can treat this as "check app scopes"
+  }
 
-  const lineItemsByFO = openFOs.map((fo: any) => ({
+  // Helpers
+  const releaseHold = (id: number | string) =>
+    fetch(`https://${shop}/admin/api/${V}/fulfillment_orders/${id}/release_hold.json`, {
+      method: "POST",
+      headers,
+      body: JSON.stringify({}),
+    });
+
+  const openFO = (id: number | string) =>
+    fetch(`https://${shop}/admin/api/${V}/fulfillment_orders/${id}/open.json`, {
+      method: "POST",
+      headers,
+      body: JSON.stringify({}),
+    });
+
+  // 2) Try to convert on_hold/scheduled to open
+  let touched = false;
+  for (const fo of fos) {
+    if (fo.status === "on_hold") {
+      await releaseHold(fo.id);
+      touched = true;
+    } else if (fo.status === "scheduled") {
+      await openFO(fo.id);
+      touched = true;
+    }
+  }
+  if (touched) {
+    const refetch = await fetch(foUrl, { headers });
+    if (!refetch.ok) {
+      const text = await refetch.text();
+      const err: any = new Error(`FO refetch failed: HTTP_${refetch.status}`);
+      err.code = `HTTP_${refetch.status}`;
+      err.detail = text;
+      throw err;
+    }
+    fos = ((await refetch.json()) as any).fulfillment_orders;
+  }
+
+  // 3) Only work on fulfillable FOs
+  const fulfillableFOs = (fos || []).filter(
+    (fo: any) => fo.status === "open" || fo.status === "in_progress",
+  );
+  if (!fulfillableFOs.length) return { nothingToDo: true };
+
+  // 4) Create the fulfillment:
+  //    Pass only the FO IDs → fulfill all remaining quantities automatically.
+  const lineItemsByFO = fulfillableFOs.map((fo: any) => ({
     fulfillment_order_id: fo.id,
-    fulfillment_order_line_items: fo.line_items.map((li: any) => ({
-      id: li.id,
-      quantity: li.quantity,
-    })),
+    // Omit fulfillment_order_line_items to fulfill all remaining; safer than sending li.quantity.
   }));
 
-  const fulfillUrl = `https://${shop}/admin/api/${SHOPIFY_API_VERSION}/fulfillments.json`;
+  const fulfillUrl = `https://${shop}/admin/api/${V}/fulfillments.json`;
   const resp = await fetch(fulfillUrl, {
     method: "POST",
-    headers: {
-      "X-Shopify-Access-Token": accessToken,
-      "Content-Type": "application/json",
-    },
+    headers,
     body: JSON.stringify({
       fulfillment: {
         line_items_by_fulfillment_order: lineItemsByFO,
-        tracking_info: { number: String(awb) || "" },
+        tracking_info: {
+          number: String(awb) || "",
+          // Optionally set company/url so the link is clickable in Admin:
+          company: courier,
+          url: String(courier).toLowerCase().includes("shiprocket")
+            ? `https://apiv2.shiprocket.in/v1/external/courier/track/awb/${awb}`
+            : `https://track.delhivery.com/api/v1/packages/json/?waybill=${awb}&ref_ids=`,
+        },
+        notify_customer: false,
       },
     }),
   });
@@ -1206,8 +1299,10 @@ export const processFulfillmentTask = onRequest(
       const orderRef = db.collection("accounts").doc(shop).collection("orders").doc(String(jobId));
       const order = await orderRef.get();
       let awb = "";
+      let courier = "";
       if (order.exists) {
         awb = order.get("awb");
+        courier = order.get("courier");
       }
 
       const [accountSnap, jobSnap] = await Promise.all([
@@ -1253,7 +1348,7 @@ export const processFulfillmentTask = onRequest(
       ]);
 
       try {
-        const result = await fulfillOrderOnShopify(shop, accessToken, orderId, awb);
+        const result = await fulfillOrderOnShopify(shop, accessToken, orderId, awb, courier);
 
         await Promise.all([
           jobRef.set(
