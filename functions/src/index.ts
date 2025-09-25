@@ -9,7 +9,7 @@ import { allocateAwb, releaseAwb } from "./awb";
 import { buildDelhiveryPayload, buildShiprocketPayload } from "./buildPayload";
 import { defineSecret } from "firebase-functions/params";
 import { setGlobalOptions } from "firebase-functions/options";
-import { DocumentReference } from "firebase-admin/firestore";
+import { DocumentReference, Timestamp } from "firebase-admin/firestore";
 
 setGlobalOptions({ region: process.env.LOCATION || "asia-south1" });
 
@@ -428,6 +428,11 @@ export const processShipmentTask = onRequest(
             courier: "Delhivery",
             customStatus: "Ready To Dispatch",
             shippingMode,
+            customStatusesLogs: FieldValue.arrayUnion({
+              status: "Ready To Dispatch",
+              createdAt: Timestamp.now(),
+              remarks: `The order's shipment was successfully made on Delhivery (${shippingMode}) (AWB: ${awb})`,
+            }),
           },
           { merge: true },
         ),
@@ -920,6 +925,11 @@ export const processShipmentTask2 = onRequest(
               awb: awbCode,
               courier: `Shiprocket: ${courierName ?? "Unknown"}`,
               customStatus: "Ready To Dispatch",
+              customStatusesLogs: FieldValue.arrayUnion({
+                status: "Ready To Dispatch",
+                createdAt: Timestamp.now(),
+                remarks: `The order's shipment was successfully made on ${courierName} via Shiprocket (AWB: ${awbCode})`,
+              }),
 
               // Persist Shiprocket IDs for future reference
               shiprocketOrderId: srOrderId ?? null,
@@ -1370,6 +1380,11 @@ export const processFulfillmentTask = onRequest(
           orderRef.set(
             {
               customStatus: "Dispatched",
+              customStatusesLogs: FieldValue.arrayUnion({
+                status: "Dispatched",
+                createdAt: Timestamp.now(),
+                remarks: `The order's shipment was dipatched from the warehouse.`,
+              }),
             },
             { merge: true },
           ),
@@ -1806,11 +1821,11 @@ export const updateDelhiveryStatusesJob = onRequest(
               newStatus = "Delivered";
             } else if (status.Status === "Delivered" && status.StatusType === "RT") {
               newStatus = "RTO Delivered";
-            } else if (status.Status === "In Transit" && status.StatusType === "DT") {
+            } else if (status.Status === "In Transit" && status.StatusType === "PU") {
               newStatus = "DTO In Transit";
-            } else if (status.Status === "Pending" && status.StatusType === "DT") {
+            } else if (status.Status === "Pending" && status.StatusType === "PU") {
               newStatus = "DTO In Transit";
-            } else if (status.Status === "Delivered" && status.StatusType === "DT") {
+            } else if (status.Status === "Delivered" && status.StatusType === "PU") {
               newStatus = "DTO Delivered";
             } else if (status.Status === "Lost" && status.StatusType === "LT") {
               newStatus = "Lost";
@@ -1829,14 +1844,43 @@ export const updateDelhiveryStatusesJob = onRequest(
                   .update({
                     customStatus: newStatus,
                     lastStatusUpdate: FieldValue.serverTimestamp(),
-                    delhiveryLastScan: {
-                      status: status.Status,
-                      statusType: status.StatusType,
-                      statusCode: status.StatusCode,
-                      location: status.StatusLocation,
-                      dateTime: status.StatusDateTime,
-                      instructions: status.Instructions,
-                    },
+                    customStatusesLogs: FieldValue.arrayUnion({
+                      status: newStatus,
+                      createdAt: Timestamp.now(),
+                      remarks: (() => {
+                        let remarks = "";
+                        switch (newStatus) {
+                          case "In Transit":
+                            remarks = "This order was being moved from origin to the destination";
+                            break;
+                          case "RTO In Transit":
+                            remarks =
+                              "This order was returned and being moved from pickup to origin";
+                            break;
+                          case "Out For Delivery":
+                            remarks = "This order was about to reach its final destination";
+                            break;
+                          case "Delivered":
+                            remarks = "This order was successfully delivered to its destination";
+                            break;
+                          case "RTO Delivered":
+                            remarks = "This order was successfully returned to its destination";
+                            break;
+                          case "DTO In Transit":
+                            remarks =
+                              "This order was returned by the customer and was being moved to the origin";
+                            break;
+                          case "DTO Delivered":
+                            remarks =
+                              "This order was returned by the customer and successfully returned to its origin";
+                            break;
+                          case "Lost":
+                            remarks = "This order was lost";
+                            break;
+                        }
+                        return remarks;
+                      })(),
+                    }),
                   })
                   .then(() => {
                     console.log(`Updated order ${order.id} (${order.name}) to ${newStatus}`);
@@ -2141,11 +2185,11 @@ export const updateDelhiveryStatusesManual = onRequest(
               newStatus = "Delivered";
             } else if (status.Status === "Delivered" && status.StatusType === "RT") {
               newStatus = "RTO Delivered";
-            } else if (status.Status === "In Transit" && status.StatusType === "DT") {
+            } else if (status.Status === "In Transit" && status.StatusType === "PU") {
               newStatus = "DTO In Transit";
-            } else if (status.Status === "Pending" && status.StatusType === "DT") {
+            } else if (status.Status === "Pending" && status.StatusType === "PU") {
               newStatus = "DTO In Transit";
-            } else if (status.Status === "Delivered" && status.StatusType === "DT") {
+            } else if (status.Status === "Delivered" && status.StatusType === "PU") {
               newStatus = "DTO Delivered";
             } else if (status.Status === "Lost" && status.StatusType === "LT") {
               newStatus = "Lost";
@@ -2166,14 +2210,43 @@ export const updateDelhiveryStatusesManual = onRequest(
                     lastStatusUpdate: FieldValue.serverTimestamp(),
                     lastManualUpdate: FieldValue.serverTimestamp(),
                     lastUpdateRequestedBy: requestedBy || "manual",
-                    delhiveryLastScan: {
-                      status: status.Status,
-                      statusType: status.StatusType,
-                      statusCode: status.StatusCode,
-                      location: status.StatusLocation,
-                      dateTime: status.StatusDateTime,
-                      instructions: status.Instructions,
-                    },
+                    customStatusesLogs: FieldValue.arrayUnion({
+                      status: newStatus,
+                      createdAt: Timestamp.now(),
+                      remarks: (() => {
+                        let remarks = ``;
+                        switch (newStatus) {
+                          case "In Transit":
+                            remarks = "This order was being moved from origin to the destination";
+                            break;
+                          case "RTO In Transit":
+                            remarks =
+                              "This order was returned and being moved from pickup to origin";
+                            break;
+                          case "Out For Delivery":
+                            remarks = "This order was about to reach its final destination";
+                            break;
+                          case "Delivered":
+                            remarks = "This order was successfully delivered to its destination";
+                            break;
+                          case "RTO Delivered":
+                            remarks = "This order was successfully returned to its destination";
+                            break;
+                          case "DTO In Transit":
+                            remarks =
+                              "This order was returned by the customer and was being moved to the origin";
+                            break;
+                          case "DTO Delivered":
+                            remarks =
+                              "This order was returned by the customer and successfully returned to its origin";
+                            break;
+                          case "Lost":
+                            remarks = "This order was lost";
+                            break;
+                        }
+                        return remarks;
+                      })(),
+                    }),
                   })
                   .then(() => {
                     console.log(
