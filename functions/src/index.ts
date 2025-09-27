@@ -1490,8 +1490,9 @@ export const enqueueStatusUpdateTasksScheduled = onSchedule(
 
       console.log(`Found ${usersSnapshot.size} users with active accounts`);
 
-      // Filter users whose accounts have Delhivery configured
-      const eligibleUserIds: string[] = [];
+      // Group users by their account ID and filter for Delhivery integration
+      const accountToUsers = new Map<string, string[]>(); // accountId -> userIds[]
+      let totalUsersCount = 0;
 
       for (const userDoc of usersSnapshot.docs) {
         const userId = userDoc.id;
@@ -1505,19 +1506,25 @@ export const enqueueStatusUpdateTasksScheduled = onSchedule(
 
           const apiKey = accountDoc.data()?.integrations?.couriers?.delhivery?.apiKey;
           if (apiKey) {
-            eligibleUserIds.push(userId);
+            if (!accountToUsers.has(activeAccountId)) {
+              accountToUsers.set(activeAccountId, []);
+            }
+            accountToUsers.get(activeAccountId)!.push(userId);
+            totalUsersCount++;
           }
         } catch (error) {
           console.error(`Error checking account ${activeAccountId} for user ${userId}:`, error);
         }
       }
 
-      if (eligibleUserIds.length === 0) {
-        console.log("No users with Delhivery integration found");
+      if (accountToUsers.size === 0) {
+        console.log("No accounts with Delhivery integration found");
         return;
       }
 
-      console.log(`Found ${eligibleUserIds.length} users with Delhivery integration`);
+      console.log(
+        `Found ${accountToUsers.size} unique accounts with Delhivery integration covering ${totalUsersCount} users`,
+      );
 
       // Create global batch header
       const batchRef = db.collection("status_update_batches").doc();
@@ -1526,8 +1533,9 @@ export const enqueueStatusUpdateTasksScheduled = onSchedule(
       await batchRef.set({
         createdAt: FieldValue.serverTimestamp(),
         createdBy: "system-scheduled",
-        total: eligibleUserIds.length,
-        queued: eligibleUserIds.length,
+        total: accountToUsers.size, // Total accounts to process
+        totalUsers: totalUsersCount, // Total users covered
+        queued: accountToUsers.size,
         status: "running", // queued | running | completed
         processing: 0,
         success: 0,
@@ -1536,13 +1544,15 @@ export const enqueueStatusUpdateTasksScheduled = onSchedule(
         schedule: "6x_daily",
       });
 
-      // Create job documents
+      // Create job documents - one per unique account
       const writer = db.bulkWriter();
-      for (const userId of eligibleUserIds) {
+      for (const [accountId, userIds] of accountToUsers) {
         writer.set(
-          batchRef.collection("jobs").doc(userId), // userId as jobId since one job per user
+          batchRef.collection("jobs").doc(accountId), // accountId as jobId
           {
-            userId,
+            accountId,
+            userIds,
+            userCount: userIds.length,
             status: "queued",
             attempts: 0,
             createdAt: FieldValue.serverTimestamp(),
@@ -1558,29 +1568,30 @@ export const enqueueStatusUpdateTasksScheduled = onSchedule(
         throw new Error("UPDATE_STATUS_TASK_TARGET_URL not configured");
       }
 
-      // Create one Cloud Task per user
-      await Promise.all(
-        eligibleUserIds.map((userId) =>
-          createTask(
-            {
-              userId,
-              batchId,
-              jobId: userId, // userId as jobId
-            } as any,
-            {
-              tasksSecret: TASKS_SECRET.value() || "",
-              url: targetUrl,
-              queue: process.env.STATUS_UPDATE_QUEUE_NAME || "statuses-updates-queue",
-              delaySeconds: Math.floor(Math.random() * 300), // Random delay 0-5 minutes to spread load
-            },
-          ),
+      // Create one Cloud Task per unique account
+      const taskPromises = Array.from(accountToUsers.entries()).map(([accountId, userIds]) =>
+        createTask(
+          {
+            accountId,
+            userIds,
+            batchId,
+            jobId: accountId, // accountId as jobId
+          } as any,
+          {
+            tasksSecret: TASKS_SECRET.value() || "",
+            url: targetUrl,
+            queue: process.env.STATUS_UPDATE_QUEUE_NAME || "statuses-updates-queue",
+            delaySeconds: Math.floor(Math.random() * 300), // Random delay 0-5 minutes to spread load
+          },
         ),
       );
+
+      await Promise.all(taskPromises);
 
       await batchRef.update({ status: "running" });
 
       console.log(
-        `Successfully enqueued ${eligibleUserIds.length} status update tasks in batch ${batchId}`,
+        `Successfully enqueued ${accountToUsers.size} status update tasks for ${totalUsersCount} users in batch ${batchId}`,
       );
     } catch (error) {
       console.error("enqueueStatusUpdateTasks failed:", error);
@@ -1589,7 +1600,6 @@ export const enqueueStatusUpdateTasksScheduled = onSchedule(
   },
 );
 
-/** Cloud Tasks → updates Delhivery shipment statuses for a user's orders */
 export const updateDelhiveryStatusesJob = onRequest(
   { cors: true, timeoutSeconds: 300, secrets: [TASKS_SECRET] },
   async (req: Request, res: Response): Promise<void> => {
@@ -1624,20 +1634,27 @@ export const updateDelhiveryStatusesJob = onRequest(
         return;
       }
 
-      const { userId, batchId, jobId } = (req.body || {}) as {
-        userId?: string;
+      const { accountId, userIds, batchId, jobId } = (req.body || {}) as {
+        accountId?: string;
+        userIds?: string[];
         batchId?: string;
         jobId?: string;
       };
 
-      if (!userId || !batchId || !jobId) {
+      if (
+        !accountId ||
+        !userIds ||
+        !Array.isArray(userIds) ||
+        userIds.length === 0 ||
+        !batchId ||
+        !jobId
+      ) {
         res.status(400).json({ error: "missing_required_params" });
         return;
       }
 
       // Setup references
       const batchRef = db.collection("status_update_batches").doc(batchId);
-
       const jobRef = batchRef.collection("jobs").doc(jobId);
 
       // Idempotency: if already success, just ack
@@ -1647,15 +1664,43 @@ export const updateDelhiveryStatusesJob = onRequest(
         return;
       }
 
-      // Get user's active account
-      const userDoc = await db.collection("users").doc(userId).get();
-      if (!userDoc.exists) {
-        throw new Error("USER_NOT_FOUND");
+      // Verify account exists
+      const accountDoc = await db.collection("accounts").doc(accountId).get();
+      if (!accountDoc.exists) {
+        throw new Error("ACCOUNT_NOT_FOUND");
       }
 
-      const activeAccountId = userDoc.get("activeAccountId");
-      if (!activeAccountId) {
-        throw new Error("NO_ACTIVE_ACCOUNT");
+      // Verify users exist and have this as their active account (optional validation)
+      const userValidationPromises = userIds.map(async (userId) => {
+        try {
+          const userDoc = await db.collection("users").doc(userId).get();
+          if (!userDoc.exists) {
+            console.warn(`User ${userId} not found, but continuing with account processing`);
+            return { userId, valid: false };
+          }
+
+          const userActiveAccountId = userDoc.get("activeAccountId");
+          if (userActiveAccountId !== accountId) {
+            console.warn(
+              `User ${userId} active account mismatch: expected ${accountId}, got ${userActiveAccountId}`,
+            );
+            return { userId, valid: false };
+          }
+
+          return { userId, valid: true };
+        } catch (error) {
+          console.error(`Error validating user ${userId}:`, error);
+          return { userId, valid: false };
+        }
+      });
+
+      const userValidationResults = await Promise.all(userValidationPromises);
+      const validUserIds = userValidationResults
+        .filter((result) => result.valid)
+        .map((result) => result.userId);
+
+      if (validUserIds.length === 0) {
+        throw new Error("NO_VALID_USERS_FOR_ACCOUNT");
       }
 
       // --- Start bookkeeping (transaction) ---
@@ -1672,8 +1717,10 @@ export const updateDelhiveryStatusesJob = onRequest(
             status: "processing",
             attempts: (prevAttempts || 0) + 1,
             lastAttemptAt: new Date(),
-            userId,
-            accountId: activeAccountId,
+            accountId,
+            userIds: validUserIds,
+            userCount: validUserIds.length,
+            originalUserIds: userIds, // Keep track of original user list
           },
           { merge: true },
         );
@@ -1684,12 +1731,7 @@ export const updateDelhiveryStatusesJob = onRequest(
       });
       // -----------------------------------------------------------------------
 
-      // Get account and API key
-      const accountDoc = await db.collection("accounts").doc(activeAccountId).get();
-      if (!accountDoc.exists) {
-        throw new Error("ACCOUNT_NOT_FOUND");
-      }
-
+      // Get API key from account
       const apiKey = accountDoc.data()?.integrations?.couriers?.delhivery?.apiKey;
       if (!apiKey) {
         throw new Error("API_KEY_MISSING");
@@ -1712,7 +1754,7 @@ export const updateDelhiveryStatusesJob = onRequest(
       // Get eligible orders for this account
       const ordersSnapshot = await db
         .collection("accounts")
-        .doc(activeAccountId)
+        .doc(accountId)
         .collection("orders")
         .where("courier", "==", "Delhivery")
         .get();
@@ -1732,6 +1774,9 @@ export const updateDelhiveryStatusesJob = onRequest(
             message: "no_eligible_orders",
             total: 0,
             updated: 0,
+            accountId,
+            affectedUsers: validUserIds,
+            userCount: validUserIds.length,
             errorCode: FieldValue.delete(),
             errorMessage: FieldValue.delete(),
           }),
@@ -1742,11 +1787,20 @@ export const updateDelhiveryStatusesJob = onRequest(
         ]);
 
         await maybeCompleteBatch(batchRef);
-        res.json({ ok: true, message: "no_eligible_orders", total: 0, updated: 0 });
+        res.json({
+          ok: true,
+          message: "no_eligible_orders",
+          total: 0,
+          updated: 0,
+          accountId,
+          affectedUsers: validUserIds.length,
+        });
         return;
       }
 
-      console.log(`Found ${eligibleOrders.length} eligible orders for status update`);
+      console.log(
+        `Found ${eligibleOrders.length} eligible orders for account ${accountId} affecting ${validUserIds.length} users`,
+      );
 
       // Process orders in batches of 50
       const batchSize = 50;
@@ -1835,7 +1889,7 @@ export const updateDelhiveryStatusesJob = onRequest(
             if (newStatus && newStatus !== order.customStatus) {
               const orderRef = db
                 .collection("accounts")
-                .doc(activeAccountId)
+                .doc(accountId)
                 .collection("orders")
                 .doc(order.id);
 
@@ -1916,7 +1970,7 @@ export const updateDelhiveryStatusesJob = onRequest(
       totalUpdated = updateResults.reduce((sum, result) => sum + result, 0);
 
       console.log(
-        `Status update completed: ${totalUpdated}/${eligibleOrders.length} orders updated`,
+        `Status update completed: ${totalUpdated}/${eligibleOrders.length} orders updated for account ${accountId}`,
       );
 
       // Mark job as successful
@@ -1926,6 +1980,9 @@ export const updateDelhiveryStatusesJob = onRequest(
           message: "status_update_completed",
           total: eligibleOrders.length,
           updated: totalUpdated,
+          accountId,
+          affectedUsers: validUserIds,
+          userCount: validUserIds.length,
           errors: errors.length > 0 ? errors.slice(0, 10) : FieldValue.delete(), // Limit errors to prevent doc size issues
           errorCode: FieldValue.delete(),
           errorMessage: FieldValue.delete(),
@@ -1942,8 +1999,8 @@ export const updateDelhiveryStatusesJob = onRequest(
         message: "status_update_completed",
         total: eligibleOrders.length,
         updated: totalUpdated,
-        userId,
-        accountId: activeAccountId,
+        accountId,
+        affectedUsers: validUserIds.length,
         batchId,
         jobId,
       });
@@ -1953,21 +2010,21 @@ export const updateDelhiveryStatusesJob = onRequest(
       const msg = error instanceof Error ? error.message : String(error);
       const code = msg.split(/\s/)[0]; // first token
       const NON_RETRYABLE = new Set([
-        "USER_NOT_FOUND",
-        "NO_ACTIVE_ACCOUNT",
         "ACCOUNT_NOT_FOUND",
         "API_KEY_MISSING",
+        "NO_VALID_USERS_FOR_ACCOUNT",
       ]);
       const isRetryable = !NON_RETRYABLE.has(code);
 
       try {
-        const { userId, batchId, jobId } = (req.body || {}) as {
-          userId?: string;
+        const { accountId, userIds, batchId, jobId } = (req.body || {}) as {
+          accountId?: string;
+          userIds?: string[];
           batchId?: string;
           jobId?: string;
         };
 
-        if (userId && batchId && jobId) {
+        if (accountId && batchId && jobId) {
           const batchRef = db.collection("status_update_batches").doc(batchId);
           const jobRef = batchRef.collection("jobs").doc(jobId);
 
@@ -1979,6 +2036,9 @@ export const updateDelhiveryStatusesJob = onRequest(
                 status: isRetryable ? (areAttemptsExhausted ? "failed" : "retrying") : "failed",
                 errorCode: isRetryable ? "EXCEPTION" : code,
                 errorMessage: msg.slice(0, 400),
+                accountId,
+                userIds: userIds || [],
+                userCount: (userIds || []).length,
               },
               { merge: true },
             ),
