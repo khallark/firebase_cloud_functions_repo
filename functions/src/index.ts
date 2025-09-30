@@ -1742,13 +1742,12 @@ export const updateDelhiveryStatusesJob = onRequest(
         "New",
         "Confirmed",
         "Ready To Dispatch",
+        "DTO Requested",
         "Lost",
-        "Delivered",
-        "RTO Delivered",
         "Closed",
         "RTO Closed",
+        "RTO Delivered",
         "DTO Delivered",
-        "Cancelled",
       ]);
 
       // Get eligible orders for this account
@@ -1873,7 +1872,7 @@ export const updateDelhiveryStatusesJob = onRequest(
               newStatus = "Out For Delivery";
             } else if (status.Status === "Delivered" && status.StatusType === "DL") {
               newStatus = "Delivered";
-            } else if (status.Status === "Delivered" && status.StatusType === "RT") {
+            } else if (status.Status === "RTO" && status.StatusType === "DL") {
               newStatus = "RTO Delivered";
             } else if (status.Status === "In Transit" && status.StatusType === "PU") {
               newStatus = "DTO In Transit";
@@ -1886,66 +1885,105 @@ export const updateDelhiveryStatusesJob = onRequest(
             }
 
             // Update order if status changed
-            if (newStatus && newStatus !== order.customStatus) {
+            if (newStatus) {
               const orderRef = db
                 .collection("accounts")
                 .doc(accountId)
                 .collection("orders")
                 .doc(order.id);
-
-              updatePromises.push(
-                orderRef
-                  .update({
-                    customStatus: newStatus,
-                    lastStatusUpdate: FieldValue.serverTimestamp(),
-                    customStatusesLogs: FieldValue.arrayUnion({
-                      status: newStatus,
-                      createdAt: Timestamp.now(),
-                      remarks: (() => {
-                        let remarks = "";
-                        switch (newStatus) {
-                          case "In Transit":
-                            remarks = "This order was being moved from origin to the destination";
-                            break;
-                          case "RTO In Transit":
-                            remarks =
-                              "This order was returned and being moved from pickup to origin";
-                            break;
-                          case "Out For Delivery":
-                            remarks = "This order was about to reach its final destination";
-                            break;
-                          case "Delivered":
-                            remarks = "This order was successfully delivered to its destination";
-                            break;
-                          case "RTO Delivered":
-                            remarks = "This order was successfully returned to its destination";
-                            break;
-                          case "DTO In Transit":
-                            remarks =
-                              "This order was returned by the customer and was being moved to the origin";
-                            break;
-                          case "DTO Delivered":
-                            remarks =
-                              "This order was returned by the customer and successfully returned to its origin";
-                            break;
-                          case "Lost":
-                            remarks = "This order was lost";
-                            break;
-                        }
-                        return remarks;
-                      })(),
+              if (newStatus !== order.customStatus) {
+                updatePromises.push(
+                  orderRef
+                    .update({
+                      customStatus: newStatus,
+                      lastStatusUpdate: FieldValue.serverTimestamp(),
+                      customStatusesLogs: FieldValue.arrayUnion({
+                        status: newStatus,
+                        createdAt: Timestamp.now(),
+                        remarks: (() => {
+                          let remarks = "";
+                          switch (newStatus) {
+                            case "In Transit":
+                              remarks = "This order was being moved from origin to the destination";
+                              break;
+                            case "RTO In Transit":
+                              remarks =
+                                "This order was returned and being moved from pickup to origin";
+                              break;
+                            case "Out For Delivery":
+                              remarks = "This order was about to reach its final destination";
+                              break;
+                            case "Delivered":
+                              remarks = "This order was successfully delivered to its destination";
+                              break;
+                            case "RTO Delivered":
+                              remarks = "This order was successfully returned to its destination";
+                              break;
+                            case "DTO In Transit":
+                              remarks =
+                                "This order was returned by the customer and was being moved to the origin";
+                              break;
+                            case "DTO Delivered":
+                              remarks =
+                                "This order was returned by the customer and successfully returned to its origin";
+                              break;
+                            case "Lost":
+                              remarks = "This order was lost";
+                              break;
+                          }
+                          return remarks;
+                        })(),
+                      }),
+                    })
+                    .then(() => {
+                      console.log(`Updated order ${order.id} (${order.name}) to ${newStatus}`);
+                      return 1;
+                    })
+                    .catch((error) => {
+                      console.error(`Failed to update order ${order.id}:`, error);
+                      errors.push(`Failed to update order ${order.id}: ${error.message}`);
+                      return 0;
                     }),
-                  })
-                  .then(() => {
-                    console.log(`Updated order ${order.id} (${order.name}) to ${newStatus}`);
-                    return 1;
-                  })
-                  .catch((error) => {
-                    console.error(`Failed to update order ${order.id}:`, error);
-                    errors.push(`Failed to update order ${order.id}: ${error.message}`);
-                    return 0;
-                  }),
-              );
+                );
+              } else if (newStatus === "Delivered") {
+                const date = order.lastStatusUpdate;
+                const dateObj = date.toDate ? date.toDate() : new Date(date);
+                const now = new Date();
+                const diffMs = now.getTime() - dateObj.getTime();
+                const hours144InMs = 144 * 60 * 60 * 1000;
+                const isOlderThan144Hours = diffMs >= hours144InMs;
+
+                if (isOlderThan144Hours) {
+                  const closedStatus = "Closed";
+
+                  console.log(
+                    `More than or equal to 144 hours have passed, Closing the order ${order.id} from ${newStatus} to ${closedStatus}`,
+                  );
+
+                  updatePromises.push(
+                    orderRef
+                      .update({
+                        customStatus: closedStatus,
+                        lastStatusUpdate: FieldValue.serverTimestamp(),
+                        customStatusesLogs: FieldValue.arrayUnion({
+                          status: closedStatus,
+                          createdAt: Timestamp.now(),
+                          remarks:
+                            "This order Closed after approximately 144 hrs of being Delivered to the customer.",
+                        }),
+                      })
+                      .then(() => {
+                        console.log(`Updated order ${order.id} (${order.name}) to ${closedStatus}`);
+                        return 1;
+                      })
+                      .catch((error) => {
+                        console.error(`Failed to update order ${order.id}:`, error);
+                        errors.push(`Failed to update order ${order.id}: ${error.message}`);
+                        return 0;
+                      }),
+                  );
+                }
+              }
             }
           }
 
@@ -2114,13 +2152,12 @@ export const updateDelhiveryStatusesManual = onRequest(
         "New",
         "Confirmed",
         "Ready To Dispatch",
+        "DTO Requested",
         "Lost",
-        "Delivered",
-        "RTO Delivered",
         "Closed",
         "RTO Closed",
+        "RTO Delivered",
         "DTO Delivered",
-        "Cancelled",
       ]);
 
       // Get eligible orders for this account using the provided orderIds
@@ -2243,7 +2280,7 @@ export const updateDelhiveryStatusesManual = onRequest(
               newStatus = "Out For Delivery";
             } else if (status.Status === "Delivered" && status.StatusType === "DL") {
               newStatus = "Delivered";
-            } else if (status.Status === "Delivered" && status.StatusType === "RT") {
+            } else if (status.Status === "RTO" && status.StatusType === "DL") {
               newStatus = "RTO Delivered";
             } else if (status.Status === "In Transit" && status.StatusType === "PU") {
               newStatus = "DTO In Transit";
@@ -2256,77 +2293,116 @@ export const updateDelhiveryStatusesManual = onRequest(
             }
 
             // Update order if status changed
-            if (newStatus && newStatus !== order.customStatus) {
+            if (newStatus) {
               const orderRef = db
                 .collection("accounts")
                 .doc(shop)
                 .collection("orders")
                 .doc(order.id);
-
-              updatePromises.push(
-                orderRef
-                  .update({
-                    customStatus: newStatus,
-                    lastStatusUpdate: FieldValue.serverTimestamp(),
-                    lastManualUpdate: FieldValue.serverTimestamp(),
-                    lastUpdateRequestedBy: requestedBy || "manual",
-                    customStatusesLogs: FieldValue.arrayUnion({
-                      status: newStatus,
-                      createdAt: Timestamp.now(),
-                      remarks: (() => {
-                        let remarks = ``;
-                        switch (newStatus) {
-                          case "In Transit":
-                            remarks = "This order was being moved from origin to the destination";
-                            break;
-                          case "RTO In Transit":
-                            remarks =
-                              "This order was returned and being moved from pickup to origin";
-                            break;
-                          case "Out For Delivery":
-                            remarks = "This order was about to reach its final destination";
-                            break;
-                          case "Delivered":
-                            remarks = "This order was successfully delivered to its destination";
-                            break;
-                          case "RTO Delivered":
-                            remarks = "This order was successfully returned to its destination";
-                            break;
-                          case "DTO In Transit":
-                            remarks =
-                              "This order was returned by the customer and was being moved to the origin";
-                            break;
-                          case "DTO Delivered":
-                            remarks =
-                              "This order was returned by the customer and successfully returned to its origin";
-                            break;
-                          case "Lost":
-                            remarks = "This order was lost";
-                            break;
-                        }
-                        return remarks;
-                      })(),
+              if (newStatus !== order.customStatus) {
+                updatePromises.push(
+                  orderRef
+                    .update({
+                      customStatus: newStatus,
+                      lastStatusUpdate: FieldValue.serverTimestamp(),
+                      lastManualUpdate: FieldValue.serverTimestamp(),
+                      lastUpdateRequestedBy: requestedBy || "manual",
+                      customStatusesLogs: FieldValue.arrayUnion({
+                        status: newStatus,
+                        createdAt: Timestamp.now(),
+                        remarks: (() => {
+                          let remarks = "";
+                          switch (newStatus) {
+                            case "In Transit":
+                              remarks = "This order was being moved from origin to the destination";
+                              break;
+                            case "RTO In Transit":
+                              remarks =
+                                "This order was returned and being moved from pickup to origin";
+                              break;
+                            case "Out For Delivery":
+                              remarks = "This order was about to reach its final destination";
+                              break;
+                            case "Delivered":
+                              remarks = "This order was successfully delivered to its destination";
+                              break;
+                            case "RTO Delivered":
+                              remarks = "This order was successfully returned to its destination";
+                              break;
+                            case "DTO In Transit":
+                              remarks =
+                                "This order was returned by the customer and was being moved to the origin";
+                              break;
+                            case "DTO Delivered":
+                              remarks =
+                                "This order was returned by the customer and successfully returned to its origin";
+                              break;
+                            case "Lost":
+                              remarks = "This order was lost";
+                              break;
+                          }
+                          return remarks;
+                        })(),
+                      }),
+                    })
+                    .then(() => {
+                      console.log(
+                        `Updated order ${order.id} (${order.name}) from ${order.customStatus} to ${newStatus}`,
+                      );
+                      updatedOrders.push({
+                        orderId: order.id,
+                        orderName: order.name,
+                        oldStatus: order.customStatus,
+                        newStatus: newStatus,
+                        awb: order.awb,
+                      });
+                      return 1;
+                    })
+                    .catch((error) => {
+                      console.error(`Failed to update order ${order.id}:`, error);
+                      errors.push(`Failed to update order ${order.id}: ${error.message}`);
+                      return 0;
                     }),
-                  })
-                  .then(() => {
-                    console.log(
-                      `Updated order ${order.id} (${order.name}) from ${order.customStatus} to ${newStatus}`,
-                    );
-                    updatedOrders.push({
-                      orderId: order.id,
-                      orderName: order.name,
-                      oldStatus: order.customStatus,
-                      newStatus: newStatus,
-                      awb: order.awb,
-                    });
-                    return 1;
-                  })
-                  .catch((error) => {
-                    console.error(`Failed to update order ${order.id}:`, error);
-                    errors.push(`Failed to update order ${order.id}: ${error.message}`);
-                    return 0;
-                  }),
-              );
+                );
+              } else if (newStatus === "Delivered") {
+                const date = order.lastStatusUpdate;
+                const dateObj = date.toDate ? date.toDate() : new Date(date);
+                const now = new Date();
+                const diffMs = now.getTime() - dateObj.getTime();
+                const hours144InMs = 144 * 60 * 60 * 1000;
+                const isOlderThan144Hours = diffMs >= hours144InMs;
+
+                if (isOlderThan144Hours) {
+                  const closedStatus = "Closed";
+
+                  console.log(
+                    `More than or equal to 144 hours have passed, Closing the order ${order.id} from ${newStatus} to ${closedStatus}`,
+                  );
+
+                  updatePromises.push(
+                    orderRef
+                      .update({
+                        customStatus: closedStatus,
+                        lastStatusUpdate: FieldValue.serverTimestamp(),
+                        customStatusesLogs: FieldValue.arrayUnion({
+                          status: closedStatus,
+                          createdAt: Timestamp.now(),
+                          remarks:
+                            "This order Closed after approximately 144 hrs of being Delivered to the customer.",
+                        }),
+                      })
+                      .then(() => {
+                        console.log(`Updated order ${order.id} (${order.name}) to ${closedStatus}`);
+                        return 1;
+                      })
+                      .catch((error) => {
+                        console.error(`Failed to update order ${order.id}:`, error);
+                        errors.push(`Failed to update order ${order.id}: ${error.message}`);
+                        return 0;
+                      }),
+                  );
+                }
+              }
             }
           }
 
