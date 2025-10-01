@@ -2301,6 +2301,13 @@ export const processManualUpdateChunk = onRequest(
         .collection("manual_status_updates")
         .doc(jobId);
 
+      // Idempotency check
+      const jSnap = await jobRef.get();
+      if (jSnap.exists && jSnap.data()?.status === "success") {
+        res.json({ ok: true, dedup: true });
+        return;
+      }
+
       // Mark job as processing on first chunk
       if (chunkIndex === 0) {
         await jobRef.update({
