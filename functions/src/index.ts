@@ -234,6 +234,21 @@ export const processShipmentTask = onRequest(
       // Idempotency: if already success, just ack
       const jSnap = await jobRef.get();
       if (jSnap.exists && jSnap.data()?.status === "success") {
+        // Fix any inconsistent batch counters
+        await db.runTransaction(async (tx) => {
+          const b = await tx.get(batchRef);
+          const d = b.data() || {};
+          
+          // If still marked as processing, decrement it
+          if ((d.processing || 0) > 0) {
+            tx.update(batchRef, {
+              processing: FieldValue.increment(-1),
+            });
+          }
+        });
+        
+        await maybeCompleteBatch(batchRef);
+        
         res.json({ ok: true, dedup: true });
         return;
       }
@@ -631,6 +646,21 @@ export const processShipmentTask2 = onRequest(
       // Idempotency: if already success, just ack
       const jSnap = await jobRef.get();
       if (jSnap.exists && jSnap.data()?.status === "success") {
+        // Ensure batch counters are consistent on retry
+        await db.runTransaction(async (tx) => {
+          const b = await tx.get(batchRef);
+          const d = b.data() || {};
+          
+          // If still marked as processing, fix the counter
+          if ((d.processing || 0) > 0) {
+            tx.update(batchRef, {
+              processing: FieldValue.increment(-1),
+            });
+          }
+        });
+        
+        await maybeCompleteBatch(batchRef);
+        
         return void res.json({ ok: true, dedup: true });
       }
 
