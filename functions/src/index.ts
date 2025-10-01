@@ -1466,21 +1466,69 @@ async function maybeCompleteSummary(summaryRef: DocumentReference) {
   });
 }
 
-/** Scheduled function that runs 6 times daily to enqueue status update tasks */
+// ============================================================================
+// SHARED UTILITIES - Used by both scheduled and manual updates
+// ============================================================================
+function determineNewStatus(status: any): string | null {
+  const { Status, StatusType } = status;
+
+  const statusMap: Record<string, Record<string, string>> = {
+    "In Transit": { UD: "In Transit", RT: "RTO In Transit", PU: "DTO In Transit" },
+    Pending: { UD: "In Transit", RT: "RTO In Transit", PU: "DTO In Transit" },
+    Dispatched: { UD: "Out For Delivery" },
+    Delivered: { DL: "Delivered" },
+    RTO: { DL: "RTO Delivered" },
+    DTO: { DL: "DTO Delivered" },
+    Lost: { LT: "Lost" },
+  };
+
+  return statusMap[Status]?.[StatusType] || null;
+}
+
+function getStatusRemarks(status: string): string {
+  const remarks: Record<string, string> = {
+    "In Transit": "This order was being moved from origin to the destination",
+    "RTO In Transit": "This order was returned and being moved from pickup to origin",
+    "Out For Delivery": "This order was about to reach its final destination",
+    Delivered: "This order was successfully delivered to its destination",
+    "RTO Delivered": "This order was successfully returned to its destination",
+    "DTO In Transit": "This order was returned by the customer and was being moved to the origin",
+    "DTO Delivered":
+      "This order was returned by the customer and successfully returned to its origin",
+    Lost: "This order was lost",
+  };
+  return remarks[status] || "";
+}
+
+function sleep(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+// ============================================================================
+// CONFIGURATION
+// ============================================================================
+const CHUNK_SIZE = 200; // Orders processed per scheduled task
+const MANUAL_CHUNK_SIZE = 100; // Order IDs processed per manual task
+const API_BATCH_SIZE = 50; // Orders per Delhivery API call
+
+// ============================================================================
+// SCHEDULED STATUS UPDATES
+// ============================================================================
+
+// 1. SCHEDULER - Enqueues initial tasks (one per account)
 export const enqueueStatusUpdateTasksScheduled = onSchedule(
   {
-    schedule: "0 0,4,8,12,16,20 * * *", // 12am, 4am, 8am, 12pm, 4pm, 8pm daily
+    schedule: "0 0,4,8,12,16,20 * * *", // 6 times daily
     timeZone: "Asia/Kolkata",
     region: process.env.LOCATION || "asia-south1",
     memory: "512MiB",
-    timeoutSeconds: 540, // 9 minutes
+    timeoutSeconds: 540,
     secrets: [TASKS_SECRET],
   },
   async (event) => {
-    console.log(`Starting scheduled status update batch processing... ${event ? "" : ""}`);
+    console.log(`Starting scheduled status update batch processing...${event ? "" : ""}`);
 
     try {
-      // Get all users who have active accounts with Delhivery integration
       const usersSnapshot = await db.collection("users").where("activeAccountId", "!=", null).get();
 
       if (usersSnapshot.empty) {
@@ -1488,16 +1536,13 @@ export const enqueueStatusUpdateTasksScheduled = onSchedule(
         return;
       }
 
-      console.log(`Found ${usersSnapshot.size} users with active accounts`);
-
-      // Group users by their account ID and filter for Delhivery integration
-      const accountToUsers = new Map<string, string[]>(); // accountId -> userIds[]
+      // Group users by account and filter for Delhivery integration
+      const accountToUsers = new Map<string, string[]>();
       let totalUsersCount = 0;
 
       for (const userDoc of usersSnapshot.docs) {
         const userId = userDoc.id;
         const activeAccountId = userDoc.get("activeAccountId");
-
         if (!activeAccountId) continue;
 
         try {
@@ -1513,7 +1558,7 @@ export const enqueueStatusUpdateTasksScheduled = onSchedule(
             totalUsersCount++;
           }
         } catch (error) {
-          console.error(`Error checking account ${activeAccountId} for user ${userId}:`, error);
+          console.error(`Error checking account ${activeAccountId}:`, error);
         }
       }
 
@@ -1523,20 +1568,20 @@ export const enqueueStatusUpdateTasksScheduled = onSchedule(
       }
 
       console.log(
-        `Found ${accountToUsers.size} unique accounts with Delhivery integration covering ${totalUsersCount} users`,
+        `Found ${accountToUsers.size} accounts with Delhivery (${totalUsersCount} users)`,
       );
 
-      // Create global batch header
+      // Create batch header
       const batchRef = db.collection("status_update_batches").doc();
       const batchId = batchRef.id;
 
       await batchRef.set({
         createdAt: FieldValue.serverTimestamp(),
         createdBy: "system-scheduled",
-        total: accountToUsers.size, // Total accounts to process
-        totalUsers: totalUsersCount, // Total users covered
+        total: accountToUsers.size,
+        totalUsers: totalUsersCount,
         queued: accountToUsers.size,
-        status: "running", // queued | running | completed
+        status: "running",
         processing: 0,
         success: 0,
         failed: 0,
@@ -1544,11 +1589,11 @@ export const enqueueStatusUpdateTasksScheduled = onSchedule(
         schedule: "6x_daily",
       });
 
-      // Create job documents - one per unique account
+      // Create job documents (one per account)
       const writer = db.bulkWriter();
       for (const [accountId, userIds] of accountToUsers) {
         writer.set(
-          batchRef.collection("jobs").doc(accountId), // accountId as jobId
+          batchRef.collection("jobs").doc(accountId),
           {
             accountId,
             userIds,
@@ -1556,77 +1601,55 @@ export const enqueueStatusUpdateTasksScheduled = onSchedule(
             status: "queued",
             attempts: 0,
             createdAt: FieldValue.serverTimestamp(),
+            processedOrders: 0,
+            updatedOrders: 0,
+            totalChunks: 0,
           },
           { merge: true },
         );
       }
       await writer.close();
 
-      // Get the target URL for status update tasks
       const targetUrl = process.env.UPDATE_STATUS_TASK_JOB_TARGET_URL;
       if (!targetUrl) {
         throw new Error("UPDATE_STATUS_TASK_TARGET_URL not configured");
       }
 
-      // Create one Cloud Task per unique account
-      const taskPromises = Array.from(accountToUsers.entries()).map(([accountId, userIds]) =>
+      // Create initial tasks (chunk 0 for each account)
+      const taskPromises = Array.from(accountToUsers.entries()).map(([accountId, userIds], index) =>
         createTask(
           {
             accountId,
             userIds,
             batchId,
-            jobId: accountId, // accountId as jobId
+            jobId: accountId,
+            chunkIndex: 0,
+            cursor: null,
           } as any,
           {
             tasksSecret: TASKS_SECRET.value() || "",
             url: targetUrl,
-            queue: process.env.STATUS_UPDATE_QUEUE_NAME || "statuses-updates-queue",
-            delaySeconds: Math.floor(Math.random() * 300), // Random delay 0-5 minutes to spread load
+            queue: process.env.STATUS_UPDATE_QUEUE_NAME || "statuses-update-queue",
+            delaySeconds: Math.floor(index * 2),
           },
         ),
       );
 
       await Promise.all(taskPromises);
 
-      await batchRef.update({ status: "running" });
-
-      console.log(
-        `Successfully enqueued ${accountToUsers.size} status update tasks for ${totalUsersCount} users in batch ${batchId}`,
-      );
+      console.log(`Enqueued ${accountToUsers.size} initial tasks for batch ${batchId}`);
     } catch (error) {
       console.error("enqueueStatusUpdateTasks failed:", error);
-      throw error; // This will mark the scheduled function as failed in Cloud Scheduler
+      throw error;
     }
   },
 );
 
+// 2. MAIN TASK HANDLER - Processes one chunk and queues next if needed
 export const updateDelhiveryStatusesJob = onRequest(
-  { cors: true, timeoutSeconds: 300, secrets: [TASKS_SECRET] },
+  { cors: true, timeoutSeconds: 540, secrets: [TASKS_SECRET], memory: "512MiB" },
   async (req: Request, res: Response): Promise<void> => {
-    // --- Helper functions ---
-    async function maybeCompleteBatch(batchRef: DocumentReference) {
-      await db.runTransaction(async (tx) => {
-        const b = await tx.get(batchRef);
-        const d = b.data() || {};
-        const total = Number(d.total || 0);
-        const success = Number(d.success || 0);
-        const failed = Number(d.failed || 0);
-        const processing = Number(d.processing || 0);
-        if (total && success + failed === total && processing === 0) {
-          tx.update(batchRef, { status: "completed" });
-        }
-      });
-    }
-
-    async function attemptsExhausted(jobRef: DocumentReference) {
-      const snap = await jobRef.get();
-      const data = snap.data() || {};
-      const attempts = Number(data.attempts || 0);
-      return attempts >= Number(process.env.STATUS_UPDATE_QUEUE_MAX_ATTEMPTS || 1);
-    }
-
     try {
-      // Authentication
       requireHeaderSecret(req, "x-tasks-secret", TASKS_SECRET.value() || "");
 
       if (req.method !== "POST") {
@@ -1634,396 +1657,120 @@ export const updateDelhiveryStatusesJob = onRequest(
         return;
       }
 
-      const { accountId, userIds, batchId, jobId } = (req.body || {}) as {
+      const {
+        accountId,
+        userIds,
+        batchId,
+        jobId,
+        cursor = null,
+        chunkIndex = 0,
+      } = req.body as {
         accountId?: string;
         userIds?: string[];
         batchId?: string;
         jobId?: string;
+        cursor?: string | null;
+        chunkIndex?: number;
       };
 
-      if (
-        !accountId ||
-        !userIds ||
-        !Array.isArray(userIds) ||
-        userIds.length === 0 ||
-        !batchId ||
-        !jobId
-      ) {
+      if (!accountId || !userIds?.length || !batchId || !jobId) {
         res.status(400).json({ error: "missing_required_params" });
         return;
       }
 
-      // Setup references
       const batchRef = db.collection("status_update_batches").doc(batchId);
       const jobRef = batchRef.collection("jobs").doc(jobId);
 
-      // Idempotency: if already success, just ack
+      // Idempotency check
       const jSnap = await jobRef.get();
       if (jSnap.exists && jSnap.data()?.status === "success") {
         res.json({ ok: true, dedup: true });
         return;
       }
 
-      // Verify account exists
-      const accountDoc = await db.collection("accounts").doc(accountId).get();
-      if (!accountDoc.exists) {
-        throw new Error("ACCOUNT_NOT_FOUND");
-      }
-
-      // Verify users exist and have this as their active account (optional validation)
-      const userValidationPromises = userIds.map(async (userId) => {
-        try {
-          const userDoc = await db.collection("users").doc(userId).get();
-          if (!userDoc.exists) {
-            console.warn(`User ${userId} not found, but continuing with account processing`);
-            return { userId, valid: false };
-          }
-
-          const userActiveAccountId = userDoc.get("activeAccountId");
-          if (userActiveAccountId !== accountId) {
-            console.warn(
-              `User ${userId} active account mismatch: expected ${accountId}, got ${userActiveAccountId}`,
-            );
-            return { userId, valid: false };
-          }
-
-          return { userId, valid: true };
-        } catch (error) {
-          console.error(`Error validating user ${userId}:`, error);
-          return { userId, valid: false };
+      // Initialize job on first chunk
+      if (chunkIndex === 0) {
+        const validUserIds = await validateUsers(accountId, userIds);
+        if (validUserIds.length === 0) {
+          throw new Error("NO_VALID_USERS_FOR_ACCOUNT");
         }
-      });
 
-      const userValidationResults = await Promise.all(userValidationPromises);
-      const validUserIds = userValidationResults
-        .filter((result) => result.valid)
-        .map((result) => result.userId);
+        await db.runTransaction(async (tx) => {
+          const snap = await tx.get(jobRef);
+          const data = snap.data() || {};
+          const prevAttempts = Number(data.attempts || 0);
+          const firstAttempt = prevAttempts === 0 || data.status === "queued";
 
-      if (validUserIds.length === 0) {
-        throw new Error("NO_VALID_USERS_FOR_ACCOUNT");
+          tx.set(
+            jobRef,
+            {
+              status: "processing",
+              attempts: (prevAttempts || 0) + 1,
+              lastAttemptAt: FieldValue.serverTimestamp(),
+              accountId,
+              userIds: validUserIds,
+              userCount: validUserIds.length,
+              processedOrders: 0,
+              updatedOrders: 0,
+              totalChunks: 0,
+            },
+            { merge: true },
+          );
+
+          const inc: any = { processing: FieldValue.increment(1) };
+          if (firstAttempt) inc.queued = FieldValue.increment(-1);
+          tx.update(batchRef, inc);
+        });
       }
 
-      // --- Start bookkeeping (transaction) ---
-      await db.runTransaction(async (tx) => {
-        const snap = await tx.get(jobRef);
-        const data = snap.data() || {};
-        const prevAttempts = Number(data.attempts || 0);
-        const firstAttempt = prevAttempts === 0 || data.status === "queued" || !data.status;
+      // Verify account and get API key
+      const accountDoc = await db.collection("accounts").doc(accountId).get();
+      if (!accountDoc.exists) throw new Error("ACCOUNT_NOT_FOUND");
 
-        // move to processing, increment attempts
-        tx.set(
-          jobRef,
-          {
-            status: "processing",
-            attempts: (prevAttempts || 0) + 1,
-            lastAttemptAt: new Date(),
-            accountId,
-            userIds: validUserIds,
-            userCount: validUserIds.length,
-            originalUserIds: userIds, // Keep track of original user list
-          },
-          { merge: true },
-        );
-
-        const inc: any = { processing: FieldValue.increment(1) };
-        if (firstAttempt) inc.queued = FieldValue.increment(-1);
-        tx.update(batchRef, inc);
-      });
-      // -----------------------------------------------------------------------
-
-      // Get API key from account
       const apiKey = accountDoc.data()?.integrations?.couriers?.delhivery?.apiKey;
-      if (!apiKey) {
-        throw new Error("API_KEY_MISSING");
-      }
+      if (!apiKey) throw new Error("API_KEY_MISSING");
 
-      // Statuses to exclude
-      const excludedStatuses = new Set([
-        "New",
-        "Confirmed",
-        "Ready To Dispatch",
-        "DTO Requested",
-        "Lost",
-        "Closed",
-        "RTO Closed",
-        "RTO Delivered",
-        "DTO Delivered",
-      ]);
+      // Process one chunk of orders
+      const result = await processOrderChunk(accountId, apiKey, cursor);
 
-      // Get eligible orders for this account
-      const ordersSnapshot = await db
-        .collection("accounts")
-        .doc(accountId)
-        .collection("orders")
-        .where("courier", "==", "Delhivery")
-        .get();
+      // Update job progress
+      await jobRef.update({
+        processedOrders: FieldValue.increment(result.processed),
+        updatedOrders: FieldValue.increment(result.updated),
+        totalChunks: FieldValue.increment(1),
+        lastChunkAt: FieldValue.serverTimestamp(),
+        lastCursor: result.nextCursor || FieldValue.delete(),
+      });
 
-      const eligibleOrders = ordersSnapshot.docs
-        .map((doc) => ({ id: doc.id, ...doc.data() }))
-        .filter(
-          (order: any) =>
-            order.awb && order.customStatus && !excludedStatuses.has(order.customStatus),
-        );
+      // If more work remains, queue next chunk
+      if (result.hasMore && result.nextCursor) {
+        await queueNextChunk(TASKS_SECRET.value() || "", {
+          accountId,
+          userIds,
+          batchId,
+          jobId,
+          cursor: result.nextCursor,
+          chunkIndex: chunkIndex + 1,
+        });
 
-      if (eligibleOrders.length === 0) {
-        // No eligible orders - mark job as success
-        await Promise.all([
-          jobRef.update({
-            status: "success",
-            message: "no_eligible_orders",
-            total: 0,
-            updated: 0,
-            accountId,
-            affectedUsers: validUserIds,
-            userCount: validUserIds.length,
-            errorCode: FieldValue.delete(),
-            errorMessage: FieldValue.delete(),
-          }),
-          batchRef.update({
-            processing: FieldValue.increment(-1),
-            success: FieldValue.increment(1),
-          }),
-        ]);
-
-        await maybeCompleteBatch(batchRef);
         res.json({
           ok: true,
-          message: "no_eligible_orders",
-          total: 0,
-          updated: 0,
-          accountId,
-          affectedUsers: validUserIds.length,
+          status: "chunk_completed",
+          chunkIndex,
+          processed: result.processed,
+          updated: result.updated,
+          hasMore: true,
         });
         return;
       }
 
-      console.log(
-        `Found ${eligibleOrders.length} eligible orders for account ${accountId} affecting ${validUserIds.length} users`,
-      );
-
-      // Process orders in batches of 50
-      const batchSize = 50;
-      let totalUpdated = 0;
-      const updatePromises: Promise<any>[] = [];
-      const errors: string[] = [];
-
-      for (let i = 0; i < eligibleOrders.length; i += batchSize) {
-        const batch = eligibleOrders.slice(i, i + batchSize);
-        const waybills = batch
-          .map((order: any) => (order.customStatus.includes("DTO") ? order.awb_reverse : order.awb))
-          .join(",");
-
-        try {
-          // Call Delhivery tracking API
-          const trackingUrl = `https://track.delhivery.com/api/v1/packages/json/?waybill=${waybills}`;
-          const response = await fetch(trackingUrl, {
-            headers: {
-              Authorization: `Token ${apiKey}`,
-              Accept: "application/json",
-            },
-          });
-
-          if (!response.ok) {
-            const errorMsg = `Delhivery API error for batch ${i / batchSize + 1}: ${response.status}`;
-            console.error(errorMsg);
-            errors.push(errorMsg);
-
-            // If this is a retryable HTTP error, we should retry the whole job
-            if (response.status >= 500 || response.status === 429) {
-              throw new Error(`HTTP_${response.status}`);
-            }
-            continue;
-          }
-
-          const trackingData = (await response.json()) as any;
-          const shipments = trackingData.ShipmentData || [];
-
-          // Create map of order name to order for efficient lookup
-          const ordersByName = new Map();
-          batch.forEach((order: any) => {
-            if (order.name) {
-              ordersByName.set(order.name, order);
-            }
-          });
-
-          // Process each shipment
-          for (const shipmentWrapper of shipments) {
-            const shipment = shipmentWrapper.Shipment;
-            if (!shipment || !shipment.ReferenceNo) continue;
-
-            const order = ordersByName.get(shipment.ReferenceNo);
-            if (!order) continue;
-
-            const status = shipment.Status;
-            if (!status) continue;
-
-            // Determine new status based on Delhivery response
-            let newStatus: string | null = null;
-
-            if (status.Status === "In Transit" && status.StatusType === "UD") {
-              newStatus = "In Transit";
-            } else if (status.Status === "Pending" && status.StatusType === "UD") {
-              newStatus = "In Transit";
-            } else if (status.Status === "In Transit" && status.StatusType === "RT") {
-              newStatus = "RTO In Transit";
-            } else if (status.Status === "Pending" && status.StatusType === "RT") {
-              newStatus = "RTO In Transit";
-            } else if (status.Status === "Dispatched" && status.StatusType === "UD") {
-              newStatus = "Out For Delivery";
-            } else if (status.Status === "Delivered" && status.StatusType === "DL") {
-              newStatus = "Delivered";
-            } else if (status.Status === "RTO" && status.StatusType === "DL") {
-              newStatus = "RTO Delivered";
-            } else if (status.Status === "In Transit" && status.StatusType === "PU") {
-              newStatus = "DTO In Transit";
-            } else if (status.Status === "Pending" && status.StatusType === "PU") {
-              newStatus = "DTO In Transit";
-            } else if (status.Status === "Delivered" && status.StatusType === "PU") {
-              newStatus = "DTO Delivered";
-            } else if (status.Status === "Lost" && status.StatusType === "LT") {
-              newStatus = "Lost";
-            }
-
-            // Update order if status changed
-            if (newStatus) {
-              const orderRef = db
-                .collection("accounts")
-                .doc(accountId)
-                .collection("orders")
-                .doc(order.id);
-              if (newStatus !== order.customStatus) {
-                updatePromises.push(
-                  orderRef
-                    .update({
-                      customStatus: newStatus,
-                      lastStatusUpdate: FieldValue.serverTimestamp(),
-                      customStatusesLogs: FieldValue.arrayUnion({
-                        status: newStatus,
-                        createdAt: Timestamp.now(),
-                        remarks: (() => {
-                          let remarks = "";
-                          switch (newStatus) {
-                            case "In Transit":
-                              remarks = "This order was being moved from origin to the destination";
-                              break;
-                            case "RTO In Transit":
-                              remarks =
-                                "This order was returned and being moved from pickup to origin";
-                              break;
-                            case "Out For Delivery":
-                              remarks = "This order was about to reach its final destination";
-                              break;
-                            case "Delivered":
-                              remarks = "This order was successfully delivered to its destination";
-                              break;
-                            case "RTO Delivered":
-                              remarks = "This order was successfully returned to its destination";
-                              break;
-                            case "DTO In Transit":
-                              remarks =
-                                "This order was returned by the customer and was being moved to the origin";
-                              break;
-                            case "DTO Delivered":
-                              remarks =
-                                "This order was returned by the customer and successfully returned to its origin";
-                              break;
-                            case "Lost":
-                              remarks = "This order was lost";
-                              break;
-                          }
-                          return remarks;
-                        })(),
-                      }),
-                    })
-                    .then(() => {
-                      console.log(`Updated order ${order.id} (${order.name}) to ${newStatus}`);
-                      return 1;
-                    })
-                    .catch((error) => {
-                      console.error(`Failed to update order ${order.id}:`, error);
-                      errors.push(`Failed to update order ${order.id}: ${error.message}`);
-                      return 0;
-                    }),
-                );
-              } else if (newStatus === "Delivered") {
-                const date = order.lastStatusUpdate;
-                const dateObj = date.toDate ? date.toDate() : new Date(date);
-                const now = new Date();
-                const diffMs = now.getTime() - dateObj.getTime();
-                const hours144InMs = 144 * 60 * 60 * 1000;
-                const isOlderThan144Hours = diffMs >= hours144InMs;
-
-                if (isOlderThan144Hours) {
-                  const closedStatus = "Closed";
-
-                  console.log(
-                    `More than or equal to 144 hours have passed, Closing the order ${order.id} from ${newStatus} to ${closedStatus}`,
-                  );
-
-                  updatePromises.push(
-                    orderRef
-                      .update({
-                        customStatus: closedStatus,
-                        lastStatusUpdate: FieldValue.serverTimestamp(),
-                        customStatusesLogs: FieldValue.arrayUnion({
-                          status: closedStatus,
-                          createdAt: Timestamp.now(),
-                          remarks:
-                            "This order Closed after approximately 144 hrs of being Delivered to the customer.",
-                        }),
-                      })
-                      .then(() => {
-                        console.log(`Updated order ${order.id} (${order.name}) to ${closedStatus}`);
-                        return 1;
-                      })
-                      .catch((error) => {
-                        console.error(`Failed to update order ${order.id}:`, error);
-                        errors.push(`Failed to update order ${order.id}: ${error.message}`);
-                        return 0;
-                      }),
-                  );
-                }
-              }
-            }
-          }
-
-          // Small delay between API calls to be respectful
-          if (i + batchSize < eligibleOrders.length) {
-            await new Promise((resolve) => setTimeout(resolve, 100));
-          }
-        } catch (error: any) {
-          const errorMsg = `Error processing batch ${i / batchSize + 1}: ${error.message}`;
-          console.error(errorMsg);
-          errors.push(errorMsg);
-
-          // If it's a retryable HTTP error, rethrow to trigger job retry
-          if (error.message.startsWith("HTTP_")) {
-            throw error;
-          }
-        }
-      }
-
-      // Wait for all updates to complete
-      const updateResults = await Promise.all(updatePromises);
-      totalUpdated = updateResults.reduce((sum, result) => sum + result, 0);
-
-      console.log(
-        `Status update completed: ${totalUpdated}/${eligibleOrders.length} orders updated for account ${accountId}`,
-      );
-
-      // Mark job as successful
+      // Job complete
+      const jobData = (await jobRef.get()).data() || {};
       await Promise.all([
         jobRef.update({
           status: "success",
           message: "status_update_completed",
-          total: eligibleOrders.length,
-          updated: totalUpdated,
-          accountId,
-          affectedUsers: validUserIds,
-          userCount: validUserIds.length,
-          errors: errors.length > 0 ? errors.slice(0, 10) : FieldValue.delete(), // Limit errors to prevent doc size issues
-          errorCode: FieldValue.delete(),
-          errorMessage: FieldValue.delete(),
+          completedAt: FieldValue.serverTimestamp(),
         }),
         batchRef.update({
           processing: FieldValue.increment(-1),
@@ -2032,85 +1779,382 @@ export const updateDelhiveryStatusesJob = onRequest(
       ]);
 
       await maybeCompleteBatch(batchRef);
+
       res.json({
         ok: true,
-        message: "status_update_completed",
-        total: eligibleOrders.length,
-        updated: totalUpdated,
-        accountId,
-        affectedUsers: validUserIds.length,
-        batchId,
-        jobId,
+        status: "job_completed",
+        totalProcessed: jobData.processedOrders || 0,
+        totalUpdated: jobData.updatedOrders || 0,
+        totalChunks: jobData.totalChunks || 0,
       });
     } catch (error: any) {
-      console.error("updateDelhiveryStatuses error:", error);
+      await handleJobError(error, req.body);
+      const msg = error.message || String(error);
+      const code = msg.split(/\s/)[0];
+      const NON_RETRYABLE = ["ACCOUNT_NOT_FOUND", "API_KEY_MISSING", "NO_VALID_USERS_FOR_ACCOUNT"];
+      const isRetryable = !NON_RETRYABLE.includes(code);
 
-      const msg = error instanceof Error ? error.message : String(error);
-      const code = msg.split(/\s/)[0]; // first token
-      const NON_RETRYABLE = new Set([
-        "ACCOUNT_NOT_FOUND",
-        "API_KEY_MISSING",
-        "NO_VALID_USERS_FOR_ACCOUNT",
-      ]);
-      const isRetryable = !NON_RETRYABLE.has(code);
-
-      try {
-        const { accountId, userIds, batchId, jobId } = (req.body || {}) as {
-          accountId?: string;
-          userIds?: string[];
-          batchId?: string;
-          jobId?: string;
-        };
-
-        if (accountId && batchId && jobId) {
-          const batchRef = db.collection("status_update_batches").doc(batchId);
-          const jobRef = batchRef.collection("jobs").doc(jobId);
-
-          const areAttemptsExhausted = await attemptsExhausted(jobRef);
-
-          await Promise.all([
-            jobRef.set(
-              {
-                status: isRetryable ? (areAttemptsExhausted ? "failed" : "retrying") : "failed",
-                errorCode: isRetryable ? "EXCEPTION" : code,
-                errorMessage: msg.slice(0, 400),
-                accountId,
-                userIds: userIds || [],
-                userCount: (userIds || []).length,
-              },
-              { merge: true },
-            ),
-            batchRef.update(
-              isRetryable
-                ? areAttemptsExhausted
-                  ? { processing: FieldValue.increment(-1), failed: FieldValue.increment(1) }
-                  : { processing: FieldValue.increment(-1) }
-                : { processing: FieldValue.increment(-1), failed: FieldValue.increment(1) },
-            ),
-          ]);
-
-          await maybeCompleteBatch(batchRef);
-        }
-      } catch (e) {
-        // Best effort
-        console.error("Failed to update job with error status:", e);
-      }
-
-      if (isRetryable) {
-        res.status(503).json({ error: "job_failed_transient", code, message: msg });
-      } else {
-        res.status(200).json({ ok: false, permanent: true, reason: code, message: msg });
-      }
+      res.status(isRetryable ? 503 : 200).json({
+        ok: false,
+        error: isRetryable ? "job_failed_transient" : "job_failed_permanent",
+        code,
+        message: msg,
+      });
     }
   },
 );
 
-/** User callable function → updates Delhivery shipment statuses for a user's orders */
+// 3. CHUNK PROCESSOR - Fetches and processes one page of orders
+interface ChunkResult {
+  processed: number;
+  updated: number;
+  hasMore: boolean;
+  nextCursor?: string;
+}
+
+async function processOrderChunk(
+  accountId: string,
+  apiKey: string,
+  cursor: string | null,
+): Promise<ChunkResult> {
+  const excludedStatuses = new Set([
+    "New",
+    "Confirmed",
+    "Ready To Dispatch",
+    "DTO Requested",
+    "Lost",
+    "Closed",
+    "RTO Closed",
+    "RTO Delivered",
+    "DTO Delivered",
+  ]);
+
+  // Build paginated query
+  let query = db
+    .collection("accounts")
+    .doc(accountId)
+    .collection("orders")
+    .where("courier", "==", "Delhivery")
+    .orderBy("__name__")
+    .limit(CHUNK_SIZE);
+
+  if (cursor) {
+    query = query.startAfter(cursor);
+  }
+
+  const snapshot = await query.get();
+
+  if (snapshot.empty) {
+    return { processed: 0, updated: 0, hasMore: false };
+  }
+
+  const eligibleOrders = snapshot.docs
+    .map((doc) => ({ id: doc.id, ref: doc.ref, ...doc.data() }))
+    .filter(
+      (order: any) => order.awb && order.customStatus && !excludedStatuses.has(order.customStatus),
+    );
+
+  if (eligibleOrders.length === 0) {
+    const lastDoc = snapshot.docs[snapshot.docs.length - 1];
+    return {
+      processed: snapshot.size,
+      updated: 0,
+      hasMore: snapshot.size === CHUNK_SIZE,
+      nextCursor: lastDoc.id,
+    };
+  }
+
+  console.log(`Processing ${eligibleOrders.length} eligible orders for account ${accountId}`);
+
+  // Process in API batches
+  let totalUpdated = 0;
+
+  for (let i = 0; i < eligibleOrders.length; i += API_BATCH_SIZE) {
+    const batch = eligibleOrders.slice(i, Math.min(i + API_BATCH_SIZE, eligibleOrders.length));
+    const updates = await fetchAndProcessBatch(batch, apiKey);
+
+    // Apply updates using Firestore batch writes
+    if (updates.length > 0) {
+      const writeBatch = db.batch();
+      updates.forEach((update) => {
+        writeBatch.update(update.ref, update.data);
+      });
+      await writeBatch.commit();
+      totalUpdated += updates.length;
+      console.log(`Updated ${updates.length} orders in API batch ${i / API_BATCH_SIZE + 1}`);
+    }
+
+    // Rate limiting between API calls
+    if (i + API_BATCH_SIZE < eligibleOrders.length) {
+      await sleep(150);
+    }
+  }
+
+  const lastDoc = snapshot.docs[snapshot.docs.length - 1];
+  const hasMore = snapshot.size === CHUNK_SIZE;
+
+  return {
+    processed: eligibleOrders.length,
+    updated: totalUpdated,
+    hasMore,
+    nextCursor: hasMore ? lastDoc.id : undefined,
+  };
+}
+
+// 4. API PROCESSOR - Calls Delhivery and prepares updates
+interface OrderUpdate {
+  ref: DocumentReference;
+  data: any;
+}
+
+async function fetchAndProcessBatch(orders: any[], apiKey: string): Promise<OrderUpdate[]> {
+  const waybills = orders
+    .map((order) => (order.customStatus?.includes("DTO") ? order.awb_reverse : order.awb))
+    .filter(Boolean)
+    .join(",");
+
+  if (!waybills) return [];
+
+  try {
+    const trackingUrl = `https://track.delhivery.com/api/v1/packages/json/?waybill=${waybills}`;
+    const response = await fetch(trackingUrl, {
+      headers: {
+        Authorization: `Token ${apiKey}`,
+        Accept: "application/json",
+      },
+    });
+
+    if (!response.ok) {
+      if (response.status >= 500 || response.status === 429) {
+        throw new Error(`HTTP_${response.status}`);
+      }
+      console.error(`Delhivery API error: ${response.status}`);
+      return [];
+    }
+
+    const trackingData = (await response.json()) as any;
+    const shipments = trackingData.ShipmentData || [];
+
+    return prepareOrderUpdates(orders, shipments);
+  } catch (error: any) {
+    console.error("Batch processing error:", error);
+    if (error.message.startsWith("HTTP_")) {
+      throw error;
+    }
+    return [];
+  }
+}
+
+// 5. UPDATE PREPARATION - Maps API responses to Firestore updates
+function prepareOrderUpdates(orders: any[], shipments: any[]): OrderUpdate[] {
+  const updates: OrderUpdate[] = [];
+  const ordersByName = new Map(orders.map((o) => [o.name, o]));
+
+  for (const shipmentWrapper of shipments) {
+    const shipment = shipmentWrapper.Shipment;
+    if (!shipment?.ReferenceNo || !shipment.Status) continue;
+
+    const order = ordersByName.get(shipment.ReferenceNo);
+    if (!order) continue;
+
+    const newStatus = determineNewStatus(shipment.Status);
+    if (!newStatus || newStatus === order.customStatus) continue;
+
+    updates.push({
+      ref: order.ref,
+      data: {
+        customStatus: newStatus,
+        lastStatusUpdate: FieldValue.serverTimestamp(),
+        customStatusesLogs: FieldValue.arrayUnion({
+          status: newStatus,
+          createdAt: Timestamp.now(),
+          remarks: getStatusRemarks(newStatus),
+        }),
+      },
+    });
+  }
+
+  return updates;
+}
+
+// 6. HELPER FUNCTIONS
+async function validateUsers(accountId: string, userIds: string[]): Promise<string[]> {
+  const results = await Promise.all(
+    userIds.map(async (userId) => {
+      try {
+        const userDoc = await db.collection("users").doc(userId).get();
+        if (!userDoc.exists) return null;
+        if (userDoc.get("activeAccountId") !== accountId) return null;
+        return userId;
+      } catch {
+        return null;
+      }
+    }),
+  );
+  return results.filter((id): id is string => id !== null);
+}
+
+async function queueNextChunk(
+  tasksSecret: string,
+  params: {
+    accountId: string;
+    userIds: string[];
+    batchId: string;
+    jobId: string;
+    cursor: string;
+    chunkIndex: number;
+  },
+): Promise<void> {
+  const targetUrl = process.env.UPDATE_STATUS_TASK_JOB_TARGET_URL;
+
+  await createTask(params, {
+    tasksSecret,
+    url: targetUrl,
+    queue: process.env.STATUS_UPDATE_QUEUE_NAME || "statuses-update-queue",
+    delaySeconds: 2,
+  });
+}
+
+async function maybeCompleteBatch(batchRef: DocumentReference): Promise<void> {
+  await db.runTransaction(async (tx) => {
+    const b = await tx.get(batchRef);
+    const d = b.data() || {};
+    const total = Number(d.total || 0);
+    const success = Number(d.success || 0);
+    const failed = Number(d.failed || 0);
+    const processing = Number(d.processing || 0);
+    if (total && success + failed === total && processing === 0) {
+      tx.update(batchRef, {
+        status: "completed",
+        completedAt: FieldValue.serverTimestamp(),
+      });
+    }
+  });
+}
+
+async function handleJobError(error: any, body: any): Promise<void> {
+  const { batchId, jobId, chunkIndex } = body;
+  if (!batchId || !jobId) return;
+
+  const msg = error.message || String(error);
+  const code = msg.split(/\s/)[0];
+  const NON_RETRYABLE = ["ACCOUNT_NOT_FOUND", "API_KEY_MISSING", "NO_VALID_USERS_FOR_ACCOUNT"];
+  const isRetryable = !NON_RETRYABLE.includes(code);
+
+  const batchRef = db.collection("status_update_batches").doc(batchId);
+  const jobRef = batchRef.collection("jobs").doc(jobId);
+
+  try {
+    const jobSnap = await jobRef.get();
+    const attempts = Number(jobSnap.data()?.attempts || 0);
+    const maxAttempts = Number(process.env.STATUS_UPDATE_QUEUE_MAX_ATTEMPTS || 3);
+    const attemptsExhausted = attempts >= maxAttempts;
+
+    await Promise.all([
+      jobRef.set(
+        {
+          status: isRetryable ? (attemptsExhausted ? "failed" : "retrying") : "failed",
+          errorCode: isRetryable ? "EXCEPTION" : code,
+          errorMessage: msg.slice(0, 400),
+          failedAt: FieldValue.serverTimestamp(),
+          failedAtChunk: chunkIndex || 0,
+        },
+        { merge: true },
+      ),
+      batchRef.update(
+        isRetryable && !attemptsExhausted
+          ? { processing: FieldValue.increment(-1) }
+          : { processing: FieldValue.increment(-1), failed: FieldValue.increment(1) },
+      ),
+    ]);
+
+    await maybeCompleteBatch(batchRef);
+  } catch (e) {
+    console.error("Failed to update job with error status:", e);
+  }
+}
+
+// ============================================================================
+// CRON JOB - Closes delivered orders after 144 hours
+// ============================================================================
+export const closeDeliveredOrdersJob = onSchedule(
+  {
+    schedule: "0 3 * * *",
+    timeZone: "Asia/Kolkata",
+    memory: "512MiB",
+    timeoutSeconds: 540,
+  },
+  async () => {
+    console.log("Starting closeDeliveredOrdersJob");
+
+    const hours144InMs = 144 * 60 * 60 * 1000;
+    const cutoffTime = new Date(Date.now() - hours144InMs);
+
+    console.log(`Cutoff time: ${cutoffTime.toISOString()}`);
+
+    const accountsSnapshot = await db.collection("accounts").get();
+    console.log(`Found ${accountsSnapshot.size} accounts to check`);
+
+    let totalClosed = 0;
+    let accountsProcessed = 0;
+    let accountsFailed = 0;
+
+    for (const accountDoc of accountsSnapshot.docs) {
+      try {
+        const ordersToClose = await accountDoc.ref
+          .collection("orders")
+          .where("customStatus", "==", "Delivered")
+          .where("lastStatusUpdate", "<=", cutoffTime)
+          .limit(500)
+          .get();
+
+        console.log(`Account ${accountDoc.id}: found ${ordersToClose.size} orders to close`);
+
+        if (ordersToClose.empty) {
+          accountsProcessed++;
+          continue;
+        }
+
+        const batch = db.batch();
+        ordersToClose.docs.forEach((doc) => {
+          batch.update(doc.ref, {
+            customStatus: "Closed",
+            lastStatusUpdate: FieldValue.serverTimestamp(),
+            customStatusesLogs: FieldValue.arrayUnion({
+              status: "Closed",
+              createdAt: Timestamp.now(),
+              remarks: "This order Closed after approximately 144 hrs of being Delivered.",
+            }),
+          });
+        });
+
+        await batch.commit();
+        totalClosed += ordersToClose.size;
+        accountsProcessed++;
+        console.log(
+          `Successfully closed ${ordersToClose.size} orders for account ${accountDoc.id}`,
+        );
+      } catch (error) {
+        accountsFailed++;
+        console.error(`Failed to close orders for account ${accountDoc.id}:`, error);
+      }
+    }
+
+    console.log(
+      `Job complete - Accounts: ${accountsProcessed} processed, ${accountsFailed} failed. Orders closed: ${totalClosed}`,
+    );
+  },
+);
+
+// ============================================================================
+// MANUAL STATUS UPDATES
+// ============================================================================
+
+// 1. ENTRY POINT - Creates job and queues first chunk
 export const updateDelhiveryStatusesManual = onRequest(
-  { cors: true, timeoutSeconds: 300, secrets: [ENQUEUE_FUNCTION_SECRET] },
+  { cors: true, timeoutSeconds: 60, secrets: [ENQUEUE_FUNCTION_SECRET, TASKS_SECRET] },
   async (req: Request, res: Response): Promise<void> => {
     try {
-      // Authentication
       requireHeaderSecret(req, "x-api-key", ENQUEUE_FUNCTION_SECRET.value() || "");
 
       if (req.method !== "POST") {
@@ -2118,7 +2162,7 @@ export const updateDelhiveryStatusesManual = onRequest(
         return;
       }
 
-      const { shop, orderIds, requestedBy } = (req.body || {}) as {
+      const { shop, orderIds, requestedBy } = req.body as {
         shop?: string;
         orderIds?: string[];
         requestedBy?: string;
@@ -2134,7 +2178,7 @@ export const updateDelhiveryStatusesManual = onRequest(
         return;
       }
 
-      // Get account and API key
+      // Verify account exists and has API key
       const accountDoc = await db.collection("accounts").doc(shop).get();
       if (!accountDoc.exists) {
         res.status(404).json({ error: "account_not_found" });
@@ -2147,308 +2191,421 @@ export const updateDelhiveryStatusesManual = onRequest(
         return;
       }
 
-      // Statuses to exclude
-      const excludedStatuses = new Set([
-        "New",
-        "Confirmed",
-        "Ready To Dispatch",
-        "DTO Requested",
-        "Lost",
-        "Closed",
-        "RTO Closed",
-        "RTO Delivered",
-        "DTO Delivered",
-      ]);
+      // Create manual update job document
+      const jobRef = db.collection("accounts").doc(shop).collection("manual_status_updates").doc();
+      const jobId = jobRef.id;
 
-      // Get eligible orders for this account using the provided orderIds
-      const ordersRefs = orderIds.map((orderId) =>
-        db.collection("accounts").doc(shop).collection("orders").doc(orderId),
-      );
-
-      // Fetch orders in batches to avoid Firestore limits
-      const orderDocs: any[] = [];
-      let batchSize = 500; // Firestore getAll limit
-
-      for (let i = 0; i < ordersRefs.length; i += batchSize) {
-        const batch = ordersRefs.slice(i, i + batchSize);
-        const docs = await db.getAll(...batch);
-        orderDocs.push(...docs);
-      }
-
-      // Filter existing orders and map to our format
-      const existingOrders = orderDocs
-        .filter((doc) => doc.exists)
-        .map((doc) => ({ id: doc.id, ...doc.data() }));
-
-      if (existingOrders.length === 0) {
-        res.status(404).json({
-          error: "no_orders_found",
-          message: "None of the provided order IDs exist in the account",
-          requestedCount: orderIds.length,
-          accountId: shop,
-        });
-        return;
-      }
-
-      // Filter eligible orders (Delhivery orders with AWB and not in excluded statuses)
-      const eligibleOrders = existingOrders.filter(
-        (order: any) =>
-          order.courier === "Delhivery" &&
-          order.awb &&
-          order.customStatus &&
-          !excludedStatuses.has(order.customStatus),
-      );
-
-      if (eligibleOrders.length === 0) {
-        res.json({
-          error: "no_eligible_orders",
-          total: 0,
-          updated: 0,
-          accountId: shop,
-        });
-        return;
-      }
-
-      console.log(
-        `Found ${eligibleOrders.length} eligible orders for status update (shop: ${shop})`,
-      );
-
-      // Process orders in batches of 50
-      batchSize = 50;
-      let totalUpdated = 0;
-      const updatePromises: Promise<any>[] = [];
-      const errors: string[] = [];
-      const updatedOrders: any[] = [];
-
-      for (let i = 0; i < eligibleOrders.length; i += batchSize) {
-        const batch = eligibleOrders.slice(i, i + batchSize);
-        const waybills = batch
-          .map((order: any) => (order.customStatus.includes("DTO") ? order.awb_reverse : order.awb))
-          .join(",");
-
-        try {
-          // Call Delhivery tracking API
-          const trackingUrl = `https://track.delhivery.com/api/v1/packages/json/?waybill=${waybills}`;
-          const response = await fetch(trackingUrl, {
-            headers: {
-              Authorization: `Token ${apiKey}`,
-              Accept: "application/json",
-            },
-          });
-
-          if (!response.ok) {
-            const errorMsg = `Delhivery API error for batch ${i / batchSize + 1}: ${response.status}`;
-            console.error(errorMsg);
-            errors.push(errorMsg);
-            continue;
-          }
-
-          const trackingData = (await response.json()) as any;
-          const shipments = trackingData.ShipmentData || [];
-
-          // Create map of order name to order for efficient lookup
-          const ordersByName = new Map();
-          batch.forEach((order: any) => {
-            if (order.name) {
-              ordersByName.set(order.name, order);
-            }
-          });
-
-          // Process each shipment
-          for (const shipmentWrapper of shipments) {
-            const shipment = shipmentWrapper.Shipment;
-            if (!shipment || !shipment.ReferenceNo) continue;
-
-            const order = ordersByName.get(shipment.ReferenceNo);
-            if (!order) continue;
-
-            const status = shipment.Status;
-            if (!status) continue;
-
-            // Determine new status based on Delhivery response
-            let newStatus: string | null = null;
-
-            if (status.Status === "In Transit" && status.StatusType === "UD") {
-              newStatus = "In Transit";
-            } else if (status.Status === "Pending" && status.StatusType === "UD") {
-              newStatus = "In Transit";
-            } else if (status.Status === "In Transit" && status.StatusType === "RT") {
-              newStatus = "RTO In Transit";
-            } else if (status.Status === "Pending" && status.StatusType === "RT") {
-              newStatus = "RTO In Transit";
-            } else if (status.Status === "Dispatched" && status.StatusType === "UD") {
-              newStatus = "Out For Delivery";
-            } else if (status.Status === "Delivered" && status.StatusType === "DL") {
-              newStatus = "Delivered";
-            } else if (status.Status === "RTO" && status.StatusType === "DL") {
-              newStatus = "RTO Delivered";
-            } else if (status.Status === "In Transit" && status.StatusType === "PU") {
-              newStatus = "DTO In Transit";
-            } else if (status.Status === "Pending" && status.StatusType === "PU") {
-              newStatus = "DTO In Transit";
-            } else if (status.Status === "Delivered" && status.StatusType === "PU") {
-              newStatus = "DTO Delivered";
-            } else if (status.Status === "Lost" && status.StatusType === "LT") {
-              newStatus = "Lost";
-            }
-
-            // Update order if status changed
-            if (newStatus) {
-              const orderRef = db
-                .collection("accounts")
-                .doc(shop)
-                .collection("orders")
-                .doc(order.id);
-              if (newStatus !== order.customStatus) {
-                updatePromises.push(
-                  orderRef
-                    .update({
-                      customStatus: newStatus,
-                      lastStatusUpdate: FieldValue.serverTimestamp(),
-                      lastManualUpdate: FieldValue.serverTimestamp(),
-                      lastUpdateRequestedBy: requestedBy || "manual",
-                      customStatusesLogs: FieldValue.arrayUnion({
-                        status: newStatus,
-                        createdAt: Timestamp.now(),
-                        remarks: (() => {
-                          let remarks = "";
-                          switch (newStatus) {
-                            case "In Transit":
-                              remarks = "This order was being moved from origin to the destination";
-                              break;
-                            case "RTO In Transit":
-                              remarks =
-                                "This order was returned and being moved from pickup to origin";
-                              break;
-                            case "Out For Delivery":
-                              remarks = "This order was about to reach its final destination";
-                              break;
-                            case "Delivered":
-                              remarks = "This order was successfully delivered to its destination";
-                              break;
-                            case "RTO Delivered":
-                              remarks = "This order was successfully returned to its destination";
-                              break;
-                            case "DTO In Transit":
-                              remarks =
-                                "This order was returned by the customer and was being moved to the origin";
-                              break;
-                            case "DTO Delivered":
-                              remarks =
-                                "This order was returned by the customer and successfully returned to its origin";
-                              break;
-                            case "Lost":
-                              remarks = "This order was lost";
-                              break;
-                          }
-                          return remarks;
-                        })(),
-                      }),
-                    })
-                    .then(() => {
-                      console.log(
-                        `Updated order ${order.id} (${order.name}) from ${order.customStatus} to ${newStatus}`,
-                      );
-                      updatedOrders.push({
-                        orderId: order.id,
-                        orderName: order.name,
-                        oldStatus: order.customStatus,
-                        newStatus: newStatus,
-                        awb: order.awb,
-                      });
-                      return 1;
-                    })
-                    .catch((error) => {
-                      console.error(`Failed to update order ${order.id}:`, error);
-                      errors.push(`Failed to update order ${order.id}: ${error.message}`);
-                      return 0;
-                    }),
-                );
-              } else if (newStatus === "Delivered") {
-                const date = order.lastStatusUpdate;
-                const dateObj = date.toDate ? date.toDate() : new Date(date);
-                const now = new Date();
-                const diffMs = now.getTime() - dateObj.getTime();
-                const hours144InMs = 144 * 60 * 60 * 1000;
-                const isOlderThan144Hours = diffMs >= hours144InMs;
-
-                if (isOlderThan144Hours) {
-                  const closedStatus = "Closed";
-
-                  console.log(
-                    `More than or equal to 144 hours have passed, Closing the order ${order.id} from ${newStatus} to ${closedStatus}`,
-                  );
-
-                  updatePromises.push(
-                    orderRef
-                      .update({
-                        customStatus: closedStatus,
-                        lastStatusUpdate: FieldValue.serverTimestamp(),
-                        customStatusesLogs: FieldValue.arrayUnion({
-                          status: closedStatus,
-                          createdAt: Timestamp.now(),
-                          remarks:
-                            "This order Closed after approximately 144 hrs of being Delivered to the customer.",
-                        }),
-                      })
-                      .then(() => {
-                        console.log(`Updated order ${order.id} (${order.name}) to ${closedStatus}`);
-                        return 1;
-                      })
-                      .catch((error) => {
-                        console.error(`Failed to update order ${order.id}:`, error);
-                        errors.push(`Failed to update order ${order.id}: ${error.message}`);
-                        return 0;
-                      }),
-                  );
-                }
-              }
-            }
-          }
-
-          // Small delay between API calls to be respectful
-          if (i + batchSize < eligibleOrders.length) {
-            await new Promise((resolve) => setTimeout(resolve, 100));
-          }
-        } catch (error: any) {
-          const errorMsg = `Error processing batch ${i / batchSize + 1}: ${error.message}`;
-          console.error(errorMsg);
-          errors.push(errorMsg);
-        }
-      }
-
-      // Wait for all updates to complete
-      const updateResults = await Promise.all(updatePromises);
-      totalUpdated = updateResults.reduce((sum, result) => sum + result, 0);
-
-      console.log(
-        `Manual status update completed: ${totalUpdated}/${eligibleOrders.length} orders updated for shop ${shop}`,
-      );
-
-      res.json({
-        message: "status_update_completed",
-        total: eligibleOrders.length,
-        updated: totalUpdated,
+      await jobRef.set({
         accountId: shop,
+        orderIds,
+        totalOrders: orderIds.length,
         requestedBy: requestedBy || "manual",
-        timestamp: new Date().toISOString(),
-        updatedOrders: updatedOrders.slice(0, 20), // Limit to first 20 for response size
-        errors: errors.length > 0 ? errors.slice(0, 5) : undefined,
-        summary: {
-          apiCallsMade: Math.ceil(eligibleOrders.length / batchSize),
-          ordersProcessed: eligibleOrders.length,
-          ordersUpdated: totalUpdated,
-          ordersSkipped: eligibleOrders.length - totalUpdated,
-          errorsEncountered: errors.length,
-        },
+        status: "queued",
+        createdAt: FieldValue.serverTimestamp(),
+        processedOrders: 0,
+        updatedOrders: 0,
+        skippedOrders: 0,
+        totalChunks: 0,
+      });
+
+      // Queue first chunk task
+      await queueManualUpdateChunk(TASKS_SECRET.value() || "", {
+        jobId,
+        accountId: shop,
+        orderIds,
+        requestedBy: requestedBy || "manual",
+        chunkIndex: 0,
+        startIndex: 0,
+      });
+
+      // Return immediately with job tracking info
+      res.json({
+        success: true,
+        message: "status_update_job_created",
+        jobId,
+        accountId: shop,
+        totalOrders: orderIds.length,
+        estimatedChunks: Math.ceil(orderIds.length / MANUAL_CHUNK_SIZE),
+        status: "processing",
+        checkStatusUrl: `/api/manual-update-status?jobId=${jobId}`,
       });
     } catch (error: any) {
       console.error("updateDelhiveryStatusesManual error:", error);
       res.status(500).json({
-        error: "status_update_failed",
+        error: error?.message ?? error ?? "status_update_failed",
         details: String(error?.message ?? error),
-        timestamp: new Date().toISOString(),
       });
     }
   },
 );
+
+// 2. CHUNK PROCESSOR - Processes one batch of order IDs
+export const processManualUpdateChunk = onRequest(
+  { cors: true, timeoutSeconds: 540, secrets: [TASKS_SECRET], memory: "512MiB" },
+  async (req: Request, res: Response): Promise<void> => {
+    try {
+      requireHeaderSecret(req, "x-tasks-secret", TASKS_SECRET.value() || "");
+
+      if (req.method !== "POST") {
+        res.status(405).json({ error: "method_not_allowed" });
+        return;
+      }
+
+      const { jobId, accountId, orderIds, requestedBy, chunkIndex, startIndex } = req.body as {
+        jobId?: string;
+        accountId?: string;
+        orderIds?: string[];
+        requestedBy?: string;
+        chunkIndex?: number;
+        startIndex?: number;
+      };
+
+      if (!jobId || !accountId || !orderIds || startIndex === undefined) {
+        res.status(400).json({ error: "missing_required_params" });
+        return;
+      }
+
+      const jobRef = db
+        .collection("accounts")
+        .doc(accountId)
+        .collection("manual_status_updates")
+        .doc(jobId);
+
+      // Mark job as processing on first chunk
+      if (chunkIndex === 0) {
+        await jobRef.update({
+          status: "processing",
+          startedAt: FieldValue.serverTimestamp(),
+        });
+      }
+
+      // Get account and API key
+      const accountDoc = await db.collection("accounts").doc(accountId).get();
+      if (!accountDoc.exists) {
+        throw new Error("ACCOUNT_NOT_FOUND");
+      }
+
+      const apiKey = accountDoc.data()?.integrations?.couriers?.delhivery?.apiKey;
+      if (!apiKey) {
+        throw new Error("API_KEY_MISSING");
+      }
+
+      // Process this chunk of order IDs
+      const endIndex = Math.min(startIndex + MANUAL_CHUNK_SIZE, orderIds.length);
+      const chunkOrderIds = orderIds.slice(startIndex, endIndex);
+
+      const result = await processOrderIdsChunk(accountId, apiKey, chunkOrderIds, requestedBy);
+
+      // Store detailed updates in subcollection
+      if (result.updatedOrdersList.length > 0) {
+        const batch = db.batch();
+        result.updatedOrdersList.forEach((orderInfo) => {
+          const updateRef = jobRef.collection("updates").doc();
+          batch.set(updateRef, {
+            ...orderInfo,
+            chunkIndex,
+            timestamp: FieldValue.serverTimestamp(),
+          });
+        });
+        await batch.commit();
+      }
+
+      // Update job progress (without storing full updatedOrdersList)
+      const updateData: any = {
+        processedOrders: FieldValue.increment(result.processed),
+        updatedOrders: FieldValue.increment(result.updated),
+        skippedOrders: FieldValue.increment(result.skipped),
+        totalChunks: FieldValue.increment(1),
+        lastChunkAt: FieldValue.serverTimestamp(),
+      };
+
+      // Store errors if any
+      if (result.errors.length > 0) {
+        updateData.lastErrors = result.errors.slice(0, 5);
+      }
+
+      await jobRef.update(updateData);
+
+      // Check if more chunks remain
+      const hasMore = endIndex < orderIds.length;
+
+      if (hasMore) {
+        // Queue next chunk
+        await queueManualUpdateChunk(TASKS_SECRET.value() || "", {
+          jobId,
+          accountId,
+          orderIds,
+          requestedBy,
+          chunkIndex: chunkIndex! + 1,
+          startIndex: endIndex,
+        });
+
+        res.json({
+          ok: true,
+          status: "chunk_completed",
+          chunkIndex,
+          processed: result.processed,
+          updated: result.updated,
+          hasMore: true,
+          progress: `${endIndex}/${orderIds.length}`,
+        });
+        return;
+      }
+
+      // Job complete
+      const finalJobData = (await jobRef.get()).data();
+      await jobRef.update({
+        status: "completed",
+        completedAt: FieldValue.serverTimestamp(),
+      });
+
+      res.json({
+        ok: true,
+        status: "job_completed",
+        totalProcessed: finalJobData?.processedOrders || 0,
+        totalUpdated: finalJobData?.updatedOrders || 0,
+        totalSkipped: finalJobData?.skippedOrders || 0,
+        totalChunks: finalJobData?.totalChunks || 0,
+      });
+    } catch (error: any) {
+      console.error("processManualUpdateChunk error:", error);
+
+      // Update job with error
+      const { jobId, accountId } = req.body;
+      if (jobId) {
+        const jobRef = db
+          .collection("accounts")
+          .doc(accountId)
+          .collection("manual_status_updates")
+          .doc(jobId);
+        await jobRef
+          .update({
+            status: "failed",
+            errorMessage: error.message || String(error),
+            failedAt: FieldValue.serverTimestamp(),
+          })
+          .catch((e) => console.error("Failed to update job with error:", e));
+      }
+
+      res.status(500).json({
+        ok: false,
+        error: "chunk_processing_failed",
+        message: error.message || String(error),
+      });
+    }
+  },
+);
+
+// 3. ORDER PROCESSING - Fetches orders and calls Delhivery API
+interface ProcessResult {
+  processed: number;
+  updated: number;
+  skipped: number;
+  updatedOrdersList: any[];
+  errors: string[];
+}
+
+async function processOrderIdsChunk(
+  accountId: string,
+  apiKey: string,
+  orderIds: string[],
+  requestedBy: string = "manual",
+): Promise<ProcessResult> {
+  const excludedStatuses = new Set([
+    "New",
+    "Confirmed",
+    "Ready To Dispatch",
+    "DTO Requested",
+    "Lost",
+    "Closed",
+    "RTO Closed",
+    "RTO Delivered",
+    "DTO Delivered",
+  ]);
+
+  // Fetch orders in batches (Firestore getAll limit is 500)
+  const orderRefs = orderIds.map((id) =>
+    db.collection("accounts").doc(accountId).collection("orders").doc(id),
+  );
+
+  const orderDocs: any[] = [];
+  const fetchBatchSize = 500;
+
+  for (let i = 0; i < orderRefs.length; i += fetchBatchSize) {
+    const batch = orderRefs.slice(i, Math.min(i + fetchBatchSize, orderRefs.length));
+    const docs = await db.getAll(...batch);
+    orderDocs.push(...docs);
+  }
+
+  // Filter to existing Delhivery orders
+  const existingOrders = orderDocs
+    .filter((doc) => doc.exists)
+    .map((doc) => ({ id: doc.id, ref: doc.ref, ...doc.data() }));
+
+  const eligibleOrders = existingOrders.filter(
+    (order: any) =>
+      order.courier === "Delhivery" &&
+      order.awb &&
+      order.customStatus &&
+      !excludedStatuses.has(order.customStatus),
+  );
+
+  if (eligibleOrders.length === 0) {
+    return {
+      processed: orderIds.length,
+      updated: 0,
+      skipped: orderIds.length,
+      updatedOrdersList: [],
+      errors: [],
+    };
+  }
+
+  console.log(`Processing ${eligibleOrders.length} eligible orders for account ${accountId}`);
+
+  // Process in API batches
+  const updatedOrdersList: any[] = [];
+  const errors: string[] = [];
+  let totalUpdated = 0;
+
+  for (let i = 0; i < eligibleOrders.length; i += API_BATCH_SIZE) {
+    const batch = eligibleOrders.slice(i, Math.min(i + API_BATCH_SIZE, eligibleOrders.length));
+    const updates = await fetchAndProcessManualBatch(batch, apiKey, requestedBy, errors);
+
+    // Apply updates using Firestore batch writes
+    if (updates.length > 0) {
+      const writeBatch = db.batch();
+      updates.forEach((update) => {
+        writeBatch.update(update.ref, update.data);
+        updatedOrdersList.push(update.orderInfo);
+      });
+      await writeBatch.commit();
+      totalUpdated += updates.length;
+    }
+
+    // Rate limiting
+    if (i + API_BATCH_SIZE < eligibleOrders.length) {
+      await sleep(150);
+    }
+  }
+
+  return {
+    processed: orderIds.length,
+    updated: totalUpdated,
+    skipped: orderIds.length - totalUpdated,
+    updatedOrdersList,
+    errors,
+  };
+}
+
+// 4. API CALL AND UPDATE PREPARATION
+interface ManualOrderUpdate {
+  ref: DocumentReference;
+  data: any;
+  orderInfo: any;
+}
+
+async function fetchAndProcessManualBatch(
+  orders: any[],
+  apiKey: string,
+  requestedBy: string,
+  errors: string[],
+): Promise<ManualOrderUpdate[]> {
+  const waybills = orders
+    .map((order) => (order.customStatus?.includes("DTO") ? order.awb_reverse : order.awb))
+    .filter(Boolean)
+    .join(",");
+
+  if (!waybills) return [];
+
+  try {
+    const trackingUrl = `https://track.delhivery.com/api/v1/packages/json/?waybill=${waybills}`;
+    const response = await fetch(trackingUrl, {
+      headers: {
+        Authorization: `Token ${apiKey}`,
+        Accept: "application/json",
+      },
+    });
+
+    if (!response.ok) {
+      const errorMsg = `Delhivery API error: ${response.status}`;
+      console.error(errorMsg);
+      errors.push(errorMsg);
+      return [];
+    }
+
+    const trackingData = (await response.json()) as any;
+    const shipments = trackingData.ShipmentData || [];
+
+    return prepareManualUpdates(orders, shipments, requestedBy);
+  } catch (error: any) {
+    console.error("Batch processing error:", error);
+    errors.push(error.message);
+    return [];
+  }
+}
+
+function prepareManualUpdates(
+  orders: any[],
+  shipments: any[],
+  requestedBy: string,
+): ManualOrderUpdate[] {
+  const updates: ManualOrderUpdate[] = [];
+  const ordersByName = new Map(orders.map((o) => [o.name, o]));
+
+  for (const shipmentWrapper of shipments) {
+    const shipment = shipmentWrapper.Shipment;
+    if (!shipment?.ReferenceNo || !shipment.Status) continue;
+
+    const order = ordersByName.get(shipment.ReferenceNo);
+    if (!order) continue;
+
+    const newStatus = determineNewStatus(shipment.Status);
+    if (!newStatus || newStatus === order.customStatus) continue;
+
+    updates.push({
+      ref: order.ref,
+      data: {
+        customStatus: newStatus,
+        lastStatusUpdate: FieldValue.serverTimestamp(),
+        lastManualUpdate: FieldValue.serverTimestamp(),
+        lastUpdateRequestedBy: requestedBy,
+        customStatusesLogs: FieldValue.arrayUnion({
+          status: newStatus,
+          createdAt: Timestamp.now(),
+          remarks: getStatusRemarks(newStatus),
+        }),
+      },
+      orderInfo: {
+        orderId: order.id,
+        orderName: order.name,
+        oldStatus: order.customStatus,
+        newStatus,
+        awb: order.awb,
+      },
+    });
+  }
+
+  return updates;
+}
+
+// 5. HELPER FUNCTIONS
+async function queueManualUpdateChunk(
+  tasksSecret: string,
+  params: {
+    jobId: string;
+    accountId: string;
+    orderIds: string[];
+    requestedBy?: string;
+    chunkIndex: number;
+    startIndex: number;
+  },
+): Promise<void> {
+  const targetUrl = process.env.UPDATE_STATUS_TASK_MANUAL_TARGET_URL;
+
+  await createTask(params, {
+    tasksSecret,
+    url: targetUrl,
+    queue: process.env.STATUS_UPDATE_QUEUE_NAME || "statuses-update-queue",
+    delaySeconds: 2,
+  });
+}
