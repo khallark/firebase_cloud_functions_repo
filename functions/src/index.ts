@@ -60,12 +60,14 @@ export const enqueueShipmentTasks = onRequest(
 
       await batchRef.set({
         shop,
+        courier,
+        pickupName,
+        shippingMode,
         createdAt: FieldValue.serverTimestamp(),
         createdBy: requestedBy, // <-- stamp UID
         total: orders.length,
         queued: orders.length,
         status: "running", // queued | running | complete
-        carrier: courier,
         processing: 0,
         success: 0,
         failed: 0,
@@ -238,7 +240,7 @@ export const processShipmentTask = onRequest(
         await db.runTransaction(async (tx) => {
           const b = await tx.get(batchRef);
           const d = b.data() || {};
-          
+
           // If still marked as processing, decrement it
           if ((d.processing || 0) > 0) {
             tx.update(batchRef, {
@@ -246,9 +248,9 @@ export const processShipmentTask = onRequest(
             });
           }
         });
-        
+
         await maybeCompleteBatch(batchRef);
-        
+
         res.json({ ok: true, dedup: true });
         return;
       }
@@ -650,7 +652,7 @@ export const processShipmentTask2 = onRequest(
         await db.runTransaction(async (tx) => {
           const b = await tx.get(batchRef);
           const d = b.data() || {};
-          
+
           // If still marked as processing, fix the counter
           if ((d.processing || 0) > 0) {
             tx.update(batchRef, {
@@ -658,9 +660,9 @@ export const processShipmentTask2 = onRequest(
             });
           }
         });
-        
+
         await maybeCompleteBatch(batchRef);
-        
+
         return void res.json({ ok: true, dedup: true });
       }
 

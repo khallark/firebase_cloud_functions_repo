@@ -3,7 +3,6 @@ import { db, FieldValue } from "./firebaseAdmin";
 import { Request, Response } from "express";
 import { createTask } from "./cloudTasks";
 
-
 export async function maybeCompleteBatch(batchRef: DocumentReference): Promise<void> {
   await db.runTransaction(async (tx) => {
     const b = await tx.get(batchRef);
@@ -44,96 +43,96 @@ export function requireHeaderSecret(req: Request, header: string, expected: stri
 
 /** Classify Delhivery create-shipment response */
 export function evalDelhiveryResp(carrier: any): {
-    ok: boolean;
-    retryable: boolean;
-    code: string;
-    message: string;
-    carrierShipmentId?: string | null;
+  ok: boolean;
+  retryable: boolean;
+  code: string;
+  message: string;
+  carrierShipmentId?: string | null;
 } {
-    const remarksArr = carrier.packages[0].remarks;
-    let remarks = "";
-    if (Array.isArray(remarksArr)) remarks = remarksArr.join("\n ");
+  const remarksArr = carrier.packages[0].remarks;
+  let remarks = "";
+  if (Array.isArray(remarksArr)) remarks = remarksArr.join("\n ");
 
-    // Success signals seen in Delhivery responses
-    const waybill =
+  // Success signals seen in Delhivery responses
+  const waybill =
     carrier?.shipment_id ?? carrier?.packets?.[0]?.waybill ?? carrier?.waybill ?? null;
 
-    const okFlag = (carrier?.success === true && carrier?.error !== true) || Boolean(waybill);
+  const okFlag = (carrier?.success === true && carrier?.error !== true) || Boolean(waybill);
 
-    if (okFlag) {
+  if (okFlag) {
     return {
-        ok: true,
-        retryable: false,
-        code: "OK",
-        message: "created",
-        carrierShipmentId: waybill,
+      ok: true,
+      retryable: false,
+      code: "OK",
+      message: "created",
+      carrierShipmentId: waybill,
     };
-    }
+  }
 
-    // ----- Known permanent validation/business errors (non-retryable) -----
-    return {
+  // ----- Known permanent validation/business errors (non-retryable) -----
+  return {
     ok: false,
     retryable: false,
     code: "CARRIER_AMBIGUOUS",
     message: remarks,
-    };
+  };
 }
 
 /** Classify Shiprocket create-order response */
 export function evalShiprocketResp(sr: any): {
-    ok: boolean;
-    retryable: boolean;
-    code: string;
-    message: string;
-    orderId?: string | number | null;
-    shipmentId?: string | number | null;
+  ok: boolean;
+  retryable: boolean;
+  code: string;
+  message: string;
+  orderId?: string | number | null;
+  shipmentId?: string | number | null;
 } {
-    const msgFields = [
+  const msgFields = [
     sr?.message,
     sr?.msg,
     sr?.error,
     sr?.error_message,
     sr?.errors ? JSON.stringify(sr?.errors) : "",
-    ]
+  ]
     .filter((x) => typeof x === "string" && x.length)
     .join(" | ");
 
-    const rawMsg = msgFields || "";
+  const rawMsg = msgFields || "";
 
-    // Success shape seen in docs: { order_id, shipment_id, status: "NEW", status_code: 1, ... }
-    const looksSuccess =
+  // Success shape seen in docs: { order_id, shipment_id, status: "NEW", status_code: 1, ... }
+  const looksSuccess =
     "order_id" in (sr ?? {}) &&
     sr.order_id != null &&
     "shipment_id" in (sr ?? {}) &&
     sr.shipment_id != null &&
     sr?.status_code === 1;
 
-    if (looksSuccess) {
+  if (looksSuccess) {
     return {
-        ok: true,
-        retryable: false,
-        code: "OK",
-        message: "created",
-        orderId: sr?.order_id ?? null,
-        shipmentId: sr?.shipment_id ?? null,
+      ok: true,
+      retryable: false,
+      code: "OK",
+      message: "created",
+      orderId: sr?.order_id ?? null,
+      shipmentId: sr?.shipment_id ?? null,
     };
-    }
+  }
 
-    // ----- Known permanent validation/business errors (non-retryable) -----
-    return {
+  // ----- Known permanent validation/business errors (non-retryable) -----
+  return {
     ok: false,
     retryable: false,
     code: "CARRIER_AMBIGUOUS",
     message: rawMsg || "carrier error",
-    };
+  };
 }
 
 /** Decide if an HTTP failure status is retryable */
 export function httpRetryable(status: number) {
-    // transient: throttling / contention / timeouts / early hints
-    if (status === 429 || status === 408 || status === 409 || status === 425) return true;
-    if (status >= 500) return true;
-    return false;
+  // transient: throttling / contention / timeouts / early hints
+  if (status === 429 || status === 408 || status === 409 || status === 425) return true;
+  if (status >= 500) return true;
+  return false;
 }
 
 // Fulfill ONE Shopify order (handles on_hold/scheduled → open)
