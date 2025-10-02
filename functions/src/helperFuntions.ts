@@ -1,6 +1,6 @@
 import { DocumentReference, Timestamp } from "firebase-admin/firestore";
 import { db, FieldValue } from "./firebaseAdmin";
-import { Request, Response } from "express";
+import { Request } from "express";
 import { createTask } from "./cloudTasks";
 
 export async function maybeCompleteBatch(batchRef: DocumentReference): Promise<void> {
@@ -299,7 +299,6 @@ interface OrderUpdate {
 }
 
 const CHUNK_SIZE = 200; // Orders processed per scheduled task
-const MANUAL_CHUNK_SIZE = 100; // Order IDs processed per manual task
 const API_BATCH_SIZE = 50; // Orders per Delhivery API call
 
 export async function processOrderChunk(
