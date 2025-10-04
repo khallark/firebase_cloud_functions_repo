@@ -22,6 +22,130 @@ function requireHeaderSecret(req: Request, header: string, expected: string) {
   if (!got || got !== (expected || "").trim()) throw new Error(`UNAUTH_${header}`);
 }
 
+function capitalizeWords(sentence: string): string {
+  if (!sentence) return sentence;
+  return sentence
+    .split(" ")
+    .map((word) => word.charAt(0).toUpperCase() + word.slice(1).toLowerCase())
+    .join(" ");
+}
+
+async function maybeCompleteBatch(batchRef: DocumentReference): Promise<void> {
+  await db.runTransaction(async (tx) => {
+    const b = await tx.get(batchRef);
+    const d = b.data() || {};
+    const total = Number(d.total || 0);
+    const success = Number(d.success || 0);
+    const failed = Number(d.failed || 0);
+    const processing = Number(d.processing || 0);
+    if (total && success + failed === total && processing === 0) {
+      tx.update(batchRef, {
+        status: "completed",
+        completedAt: FieldValue.serverTimestamp(),
+      });
+    }
+  });
+}
+
+async function handleJobFailure(params: {
+  shop: string;
+  batchRef: DocumentReference;
+  jobRef: DocumentReference;
+  jobId: string;
+  errorCode: string;
+  errorMessage: string;
+  isRetryable: boolean;
+  apiResp?: any;
+}): Promise<{ shouldReturnFailure: boolean; statusCode: number; reason: string }> {
+  const { shop, batchRef, jobRef, jobId, errorCode, errorMessage, isRetryable, apiResp } = params;
+
+  const jobSnap = await jobRef.get();
+  const batchSnap = await batchRef.get();
+  const jobData = jobSnap.data() || {};
+  const batchData = batchSnap.data() || {};
+
+  const attempts = Number(jobData.attempts || 0);
+  const maxAttempts = Number(process.env.SHIPMENT_QUEUE_MAX_ATTEMPTS || 3);
+  const attemptsExhausted = attempts >= maxAttempts;
+
+  // Check if this is a Priority job
+  const isPriority = batchData.courier === "Priority";
+
+  // Priority fallback conditions:
+  // 1. It's a Priority job
+  // 2. Either attempts exhausted OR non-retryable error
+  // 3. Has fallback handler URL configured
+  const shouldAttemptFallback = isPriority && (attemptsExhausted || !isRetryable);
+  const fallbackUrl = process.env.PRIORITY_FALLBACK_HANDLER_URL;
+
+  if (shouldAttemptFallback && fallbackUrl) {
+    try {
+      // Mark job as attempting fallback
+      await jobRef.update({
+        status: "attempting_fallback",
+        lastErrorCode: errorCode,
+        lastErrorMessage: errorMessage.slice(0, 400),
+        lastFailedAt: FieldValue.serverTimestamp(),
+        ...(apiResp && { lastApiResp: apiResp }),
+      });
+
+      // Queue fallback handler task
+      await createTask(
+        { shop, batchId: batchRef.id, jobId },
+        {
+          tasksSecret: TASKS_SECRET.value() || "",
+          url: fallbackUrl,
+          queue: String(process.env.SHIPMENT_QUEUE_NAME) || "shipments-queue",
+          delaySeconds: 2,
+        },
+      );
+
+      console.log(`Priority fallback triggered for job ${jobId} after ${errorCode}`);
+
+      // Don't return failure - fallback handler will decide final outcome
+      // Return 200 to prevent Cloud Tasks from retrying this task
+      return {
+        shouldReturnFailure: false,
+        statusCode: 200,
+        reason: "fallback_queued",
+      };
+    } catch (fallbackError) {
+      console.error("Failed to queue fallback handler:", fallbackError);
+      // Fall through to normal failure handling
+    }
+  }
+
+  // Normal failure handling (non-Priority or fallback failed)
+  const updateData: any = {
+    status: isRetryable ? (attemptsExhausted ? "failed" : "retrying") : "failed",
+    errorCode: isRetryable ? "EXCEPTION" : errorCode,
+    errorMessage: errorMessage.slice(0, 400),
+  };
+
+  if (apiResp) {
+    updateData.apiResp = apiResp;
+  }
+
+  await Promise.all([
+    jobRef.set(updateData, { merge: true }),
+    batchRef.update(
+      isRetryable && !attemptsExhausted
+        ? { processing: FieldValue.increment(-1) }
+        : { processing: FieldValue.increment(-1), failed: FieldValue.increment(1) },
+    ),
+  ]);
+
+  if (!isRetryable || attemptsExhausted) {
+    await maybeCompleteBatch(batchRef);
+  }
+
+  return {
+    shouldReturnFailure: true,
+    statusCode: isRetryable && !attemptsExhausted ? 503 : 200,
+    reason: isRetryable ? "retryable_error" : "permanent_error",
+  };
+}
+
 /** Called by Vercel API to enqueue Cloud Tasks (one per jobId) */
 export const enqueueShipmentTasks = onRequest(
   { cors: true, timeoutSeconds: 60, secrets: [ENQUEUE_FUNCTION_SECRET, TASKS_SECRET] },
@@ -55,6 +179,35 @@ export const enqueueShipmentTasks = onRequest(
         return;
       }
 
+      const shopDoc = (await db.collection("accounts").doc(shop).get()).data();
+      if (!shopDoc) {
+        res.status(400).json({ error: "shop_not_found" });
+        return;
+      }
+
+      const priorityCourier =
+        courier === "Priority"
+          ? shopDoc?.integrations?.couriers?.priorityList?.[0]?.toLowerCase()
+          : null;
+
+      const url = (() => {
+        if (courier === "Delhivery") return String(process.env.SHIPMENT_TASK_TARGET_URL_1);
+        if (courier === "Shiprocket") return String(process.env.SHIPMENT_TASK_TARGET_URL_2);
+
+        if (courier === "Priority") {
+          if (!priorityCourier) {
+            throw new Error("Priority courier not configured in shop settings");
+          }
+          if (priorityCourier === "delhivery")
+            return String(process.env.SHIPMENT_TASK_TARGET_URL_1);
+          if (priorityCourier === "shiprocket")
+            return String(process.env.SHIPMENT_TASK_TARGET_URL_2);
+          throw new Error(`Unsupported priority courier: ${priorityCourier}`);
+        }
+
+        throw new Error(`Unsupported courier: ${courier}`);
+      })();
+
       // 1) Create batch header
       const batchRef = db.collection("accounts").doc(shop).collection("shipment_batches").doc();
 
@@ -75,11 +228,13 @@ export const enqueueShipmentTasks = onRequest(
 
       // 2) Create job docs
       const writer = db.bulkWriter();
+
       for (const o of orders) {
         writer.set(
           batchRef.collection("jobs").doc(String(o.orderId)),
           {
             orderId: String(o.orderId),
+            ...(courier === "Priority" ? { courier: capitalizeWords(priorityCourier) } : {}),
             orderName: o.name,
             status: "queued",
             attempts: 0,
@@ -92,15 +247,10 @@ export const enqueueShipmentTasks = onRequest(
       const batchId = batchRef.id;
       const jobIds = orders.map((o) => String(o.orderId));
 
-      const url =
-        courier === "Delhivery"
-          ? String(process.env.SHIPMENT_TASK_TARGET_URL_1)
-          : String(process.env.SHIPMENT_TASK_TARGET_URL_2);
-
       // Create one Cloud Task per job
       await Promise.all(
         jobIds.map((jobId) =>
-          createTask({ shop, batchId, jobId, courier, pickupName, shippingMode } as any, {
+          createTask({ shop, batchId, courier, jobId, pickupName, shippingMode } as any, {
             tasksSecret: TASKS_SECRET.value() || "",
             url,
             queue: String(process.env.SHIPMENT_QUEUE_NAME) || "shipments-queue",
@@ -122,6 +272,241 @@ export const enqueueShipmentTasks = onRequest(
 // outer catch non-retryable error codes
 const NON_RETRYABLE = new Set(["CARRIER_KEY_MISSING", "ORDER_NOT_FOUND"]);
 
+// ============================================================================
+// PRIORITY FALLBACK HANDLER
+// ============================================================================
+
+/**
+ * Handles Priority courier fallback when a courier fails after exhausting attempts.
+ * Checks if there's a next courier in the priority list and queues a new task for it.
+ */
+export const handlePriorityFallback = onRequest(
+  { cors: true, timeoutSeconds: 60, secrets: [TASKS_SECRET] },
+  async (req: Request, res: Response): Promise<void> => {
+    try {
+      requireHeaderSecret(req, "x-tasks-secret", TASKS_SECRET.value() || "");
+
+      if (req.method !== "POST") {
+        res.status(405).json({ error: "method_not_allowed" });
+        return;
+      }
+
+      const { shop, batchId, jobId } = req.body as {
+        shop?: string;
+        batchId?: string;
+        jobId?: string;
+      };
+
+      if (!shop || !batchId || !jobId) {
+        res.status(400).json({ error: "missing_required_params" });
+        return;
+      }
+
+      const batchRef = db
+        .collection("accounts")
+        .doc(shop)
+        .collection("shipment_batches")
+        .doc(batchId);
+      const jobRef = batchRef.collection("jobs").doc(jobId);
+
+      // Get job, batch, and shop data
+      const [jobSnap, batchSnap, shopSnap] = await Promise.all([
+        jobRef.get(),
+        batchRef.get(),
+        db.collection("accounts").doc(shop).get(),
+      ]);
+
+      if (!jobSnap.exists || !batchSnap.exists || !shopSnap.exists) {
+        res.status(404).json({ error: "documents_not_found" });
+        return;
+      }
+
+      const jobData = jobSnap.data()!;
+      const batchData = batchSnap.data()!;
+      const shopDoc = shopSnap.data()!;
+
+      // Only handle Priority jobs
+      if (batchData.courier !== "Priority") {
+        res.status(400).json({ error: "not_a_priority_job" });
+        return;
+      }
+
+      // Get priority list from shop config
+      const priorityList = shopDoc?.integrations?.couriers?.priorityList || [];
+      if (!Array.isArray(priorityList) || priorityList.length === 0) {
+        // No priority list configured, mark as permanently failed
+        await Promise.all([
+          jobRef.update({
+            status: "failed",
+            errorCode: "PRIORITY_LIST_NOT_CONFIGURED",
+            errorMessage: "Priority courier list not configured in shop settings",
+            finalFailedAt: FieldValue.serverTimestamp(),
+          }),
+          batchRef.update({
+            processing: FieldValue.increment(-1),
+            failed: FieldValue.increment(1),
+          }),
+        ]);
+
+        await maybeCompleteBatch(batchRef);
+        res.status(400).json({ error: "priority_list_not_configured" });
+        return;
+      }
+
+      // Determine current courier and find its index
+      const currentCourier = jobData.courier || capitalizeWords(priorityList[0]);
+      const currentIndex = priorityList.findIndex(
+        (c: string) => capitalizeWords(c) === currentCourier,
+      );
+
+      if (currentIndex === -1) {
+        // Current courier not in list, mark as failed
+        await Promise.all([
+          jobRef.update({
+            status: "failed",
+            errorCode: "COURIER_NOT_IN_PRIORITY_LIST",
+            errorMessage: `Current courier ${currentCourier} not found in priority list`,
+            finalFailedAt: FieldValue.serverTimestamp(),
+          }),
+          batchRef.update({
+            processing: FieldValue.increment(-1),
+            failed: FieldValue.increment(1),
+          }),
+        ]);
+
+        await maybeCompleteBatch(batchRef);
+        res.status(400).json({ error: "current_courier_not_in_priority_list" });
+        return;
+      }
+
+      const nextIndex = currentIndex + 1;
+
+      // Check if there's a next courier available
+      if (nextIndex >= priorityList.length) {
+        // No more fallback couriers, mark as permanently failed
+        await Promise.all([
+          jobRef.update({
+            status: "failed",
+            errorCode: "ALL_PRIORITY_COURIERS_EXHAUSTED",
+            errorMessage: `Failed after trying all ${priorityList.length} priority couriers: ${(jobData.previousCouriers || []).concat(currentCourier).join(", ")}`,
+            finalFailedAt: FieldValue.serverTimestamp(),
+          }),
+          batchRef.update({
+            processing: FieldValue.increment(-1),
+            failed: FieldValue.increment(1),
+          }),
+        ]);
+
+        await maybeCompleteBatch(batchRef);
+
+        res.json({
+          ok: true,
+          action: "no_fallback_available",
+          message: "All priority couriers exhausted",
+          triedCouriers: (jobData.previousCouriers || []).concat(currentCourier),
+        });
+        return;
+      }
+
+      // Get next courier
+      const nextCourier = capitalizeWords(priorityList[nextIndex]);
+
+      // Determine target URL for next courier
+      const url = (() => {
+        const courierLower = priorityList[nextIndex].toLowerCase();
+        if (courierLower === "delhivery") {
+          return String(process.env.SHIPMENT_TASK_TARGET_URL_1);
+        }
+        if (courierLower === "shiprocket") {
+          return String(process.env.SHIPMENT_TASK_TARGET_URL_2);
+        }
+        throw new Error(`Unsupported fallback courier: ${courierLower}`);
+      })();
+
+      // Update job document with fallback info
+      const previousCouriers = jobData.previousCouriers || [];
+      await jobRef.update({
+        status: "fallback_queued",
+        courier: nextCourier,
+        attempts: 0, // Reset attempts for new courier
+        previousCouriers: FieldValue.arrayUnion(currentCourier),
+        fallbackAttempt: (jobData.fallbackAttempt || 0) + 1,
+        lastFallbackAt: FieldValue.serverTimestamp(),
+        // Clear old error fields
+        errorCode: FieldValue.delete(),
+        errorMessage: FieldValue.delete(),
+      });
+
+      // Create new Cloud Task for fallback courier
+      await createTask(
+        {
+          shop,
+          batchId,
+          jobId,
+          pickupName: batchData.pickupName,
+          shippingMode: batchData.shippingMode,
+        } as any,
+        {
+          tasksSecret: TASKS_SECRET.value() || "",
+          url,
+          queue: String(process.env.SHIPMENT_QUEUE_NAME) || "shipments-queue",
+          delaySeconds: 5, // Small delay before retry with new courier
+        },
+      );
+
+      console.log(
+        `Priority fallback: ${currentCourier} → ${nextCourier} for job ${jobId} (attempt ${(jobData.fallbackAttempt || 0) + 1})`,
+      );
+
+      res.json({
+        ok: true,
+        action: "fallback_queued",
+        fromCourier: currentCourier,
+        toCourier: nextCourier,
+        fallbackAttempt: (jobData.fallbackAttempt || 0) + 1,
+        previousCouriers: previousCouriers.concat(currentCourier),
+      });
+    } catch (error: any) {
+      console.error("handlePriorityFallback error:", error);
+
+      // Try to mark job as failed on handler error
+      try {
+        const { shop, batchId, jobId } = req.body;
+        if (shop && batchId && jobId) {
+          const batchRef = db
+            .collection("accounts")
+            .doc(shop)
+            .collection("shipment_batches")
+            .doc(batchId);
+          const jobRef = batchRef.collection("jobs").doc(jobId);
+
+          await Promise.all([
+            jobRef.update({
+              status: "failed",
+              errorCode: "FALLBACK_HANDLER_ERROR",
+              errorMessage: `Fallback handler error: ${error.message || String(error)}`,
+              finalFailedAt: FieldValue.serverTimestamp(),
+            }),
+            batchRef.update({
+              processing: FieldValue.increment(-1),
+              failed: FieldValue.increment(1),
+            }),
+          ]);
+
+          await maybeCompleteBatch(batchRef);
+        }
+      } catch (e) {
+        console.error("Failed to update job after handler error:", e);
+      }
+
+      res.status(500).json({
+        error: "fallback_handler_failed",
+        message: error.message || String(error),
+      });
+    }
+  },
+);
+
 /** Cloud Tasks → processes exactly ONE shipment job */
 export const processShipmentTask = onRequest(
   { cors: true, timeoutSeconds: 60, secrets: [TASKS_SECRET] },
@@ -138,27 +523,6 @@ export const processShipmentTask = onRequest(
       }
     };
 
-    async function maybeCompleteBatch(batchRef: DocumentReference) {
-      await db.runTransaction(async (tx) => {
-        const b = await tx.get(batchRef);
-        const d = b.data() || {};
-        const total = Number(d.total || 0);
-        const success = Number(d.success || 0);
-        const failed = Number(d.failed || 0);
-        const processing = Number(d.processing || 0);
-        if (total && success + failed === total && processing === 0) {
-          tx.update(batchRef, { status: "completed" });
-        }
-      });
-    }
-
-    async function attemptsExhausted(jobRef: DocumentReference) {
-      const snap = await jobRef.get();
-      const data = snap.data() || {};
-      const attempts = Number(data.attempts || 0);
-      return attempts >= Number(process.env.SHIPMENT_QUEUE_MAX_ATTEMPTS) ? true : false;
-    }
-
     /** Classify Delhivery create-shipment response */
     function evalDelhiveryResp(carrier: any): {
       ok: boolean;
@@ -167,7 +531,7 @@ export const processShipmentTask = onRequest(
       message: string;
       carrierShipmentId?: string | null;
     } {
-      const remarksArr = carrier.packages[0].remarks;
+      const remarksArr = carrier.packages?.[0]?.remarks;
       let remarks = "";
       if (Array.isArray(remarksArr)) remarks = remarksArr.join("\n ");
 
@@ -192,7 +556,7 @@ export const processShipmentTask = onRequest(
         ok: false,
         retryable: false,
         code: "CARRIER_AMBIGUOUS",
-        message: remarks,
+        message: remarks || "Unknown carrier error",
       };
     }
 
@@ -324,50 +688,35 @@ export const processShipmentTask = onRequest(
         if (awb && !awbReleased) {
           try {
             await releaseAwb(shop, awb);
+            awbReleased = true;
           } catch (e) {
-            void e;
+            console.error("Failed to release AWB:", e);
           }
         }
-        awbReleased = true;
-        const areAttempsExhausted = await attemptsExhausted(jobRef);
-        if (httpRetryable(resp.status)) {
-          await Promise.all([
-            jobRef.set(
-              {
-                status: areAttempsExhausted ? "failed" : "retrying",
-                errorCode: `HTTP_${resp.status}`,
-                errorMessage: text.slice(0, 400),
-              },
-              { merge: true },
-            ),
-            batchRef.update(
-              areAttempsExhausted
-                ? { processing: FieldValue.increment(-1), failed: FieldValue.increment(1) }
-                : { processing: FieldValue.increment(-1) },
-            ),
-          ]);
-          await maybeCompleteBatch(batchRef);
-          res.status(503).json({ retry: true, reason: `http_${resp.status}` });
-          return;
+
+        const failure = await handleJobFailure({
+          shop,
+          batchRef,
+          jobRef,
+          jobId,
+          errorCode: `HTTP_${resp.status}`,
+          errorMessage: text,
+          isRetryable: httpRetryable(resp.status),
+        });
+
+        if (failure.shouldReturnFailure) {
+          res.status(failure.statusCode).json({
+            ok: false,
+            reason: failure.reason,
+            code: `HTTP_${resp.status}`,
+          });
         } else {
-          await Promise.all([
-            jobRef.set(
-              {
-                status: "failed",
-                errorCode: `HTTP_${resp.status}`,
-                errorMessage: text.slice(0, 400),
-              },
-              { merge: true },
-            ),
-            batchRef.update({
-              processing: FieldValue.increment(-1),
-              failed: FieldValue.increment(1),
-            }),
-          ]);
-          await maybeCompleteBatch(batchRef);
-          res.status(200).json({ ok: false, permanent: true, reason: `http_${resp.status}` });
-          return;
+          res.status(failure.statusCode).json({
+            ok: true,
+            action: failure.reason,
+          });
         }
+        return;
       }
 
       // Parse and evaluate carrier JSON
@@ -378,52 +727,36 @@ export const processShipmentTask = onRequest(
         if (awb && !awbReleased) {
           try {
             await releaseAwb(shop, awb);
+            awbReleased = true;
           } catch (e) {
-            void e;
+            console.error("Failed to release AWB:", e);
           }
         }
-        awbReleased = true;
-        const areAttempsExhausted = await attemptsExhausted(jobRef);
-        if (verdict.retryable) {
-          await Promise.all([
-            jobRef.set(
-              {
-                status: areAttempsExhausted ? "failed" : "retrying",
-                errorCode: verdict.code,
-                errorMessage: verdict.message,
-                apiResp: carrier,
-              },
-              { merge: true },
-            ),
-            batchRef.update(
-              areAttempsExhausted
-                ? { processing: FieldValue.increment(-1), failed: FieldValue.increment(1) }
-                : { processing: FieldValue.increment(-1) },
-            ),
-          ]);
-          await maybeCompleteBatch(batchRef);
-          res.status(503).json({ retry: true, reason: verdict.code });
-          return;
+
+        const failure = await handleJobFailure({
+          shop,
+          batchRef,
+          jobRef,
+          jobId,
+          errorCode: verdict.code,
+          errorMessage: verdict.message,
+          isRetryable: verdict.retryable,
+          apiResp: carrier,
+        });
+
+        if (failure.shouldReturnFailure) {
+          res.status(failure.statusCode).json({
+            ok: false,
+            reason: failure.reason,
+            code: verdict.code,
+          });
         } else {
-          await Promise.all([
-            jobRef.set(
-              {
-                status: "failed",
-                errorCode: verdict.code,
-                errorMessage: verdict.message,
-                apiResp: carrier,
-              },
-              { merge: true },
-            ),
-            batchRef.update({
-              processing: FieldValue.increment(-1),
-              failed: FieldValue.increment(1),
-            }),
-          ]);
-          await maybeCompleteBatch(batchRef);
-          res.status(200).json({ ok: false, permanent: true, reason: verdict.code });
-          return;
+          res.status(failure.statusCode).json({
+            ok: true,
+            action: failure.reason,
+          });
         }
+        return;
       }
 
       // --- Success path ------------------------------------------------------
@@ -437,8 +770,12 @@ export const processShipmentTask = onRequest(
           errorCode: FieldValue.delete(),
           errorMessage: FieldValue.delete(),
           apiResp: carrier,
+          completedAt: FieldValue.serverTimestamp(),
         }),
-        batchRef.update({ processing: FieldValue.increment(-1), success: FieldValue.increment(1) }),
+        batchRef.update({
+          processing: FieldValue.increment(-1),
+          success: FieldValue.increment(1),
+        }),
         orderRef.set(
           {
             awb,
@@ -455,13 +792,7 @@ export const processShipmentTask = onRequest(
         ),
       ]);
 
-      // If batch is done, close it
-      await db.runTransaction(async (tx) => {
-        const b = await tx.get(batchRef);
-        const d = b.data() || {};
-        const done = (d.success || 0) + (d.failed || 0);
-        if (done >= d.total) tx.update(batchRef, { status: "completed" });
-      });
+      await maybeCompleteBatch(batchRef);
 
       res.json({ ok: true, awb, carrierShipmentId: verdict.carrierShipmentId ?? null });
       return;
@@ -477,44 +808,53 @@ export const processShipmentTask = onRequest(
           batchId?: string;
           jobId?: string;
         };
+
         if (shop && batchId && jobId) {
           if (awb && !awbReleased) {
             try {
               await releaseAwb(shop, awb);
+              awbReleased = true;
             } catch (e) {
-              void e;
+              console.error("Failed to release AWB:", e);
             }
           }
+
           const batchRef = db
             .collection("accounts")
             .doc(shop)
             .collection("shipment_batches")
             .doc(batchId);
           const jobRef = batchRef.collection("jobs").doc(String(jobId));
-          const areAttempsExhausted = await attemptsExhausted(jobRef);
-          await Promise.all([
-            jobRef.set(
-              {
-                status: isRetryable ? (areAttempsExhausted ? "failed" : "retrying") : "failed",
-                errorCode: isRetryable ? "EXCEPTION" : code,
-                errorMessage: msg,
-              },
-              { merge: true },
-            ),
-            batchRef.update(
-              isRetryable
-                ? areAttempsExhausted
-                  ? { processing: FieldValue.increment(-1), failed: FieldValue.increment(1) }
-                  : { processing: FieldValue.increment(-1) }
-                : { processing: FieldValue.increment(-1), failed: FieldValue.increment(1) },
-            ),
-          ]);
-          await maybeCompleteBatch(batchRef);
+
+          const failure = await handleJobFailure({
+            shop,
+            batchRef,
+            jobRef,
+            jobId,
+            errorCode: code,
+            errorMessage: msg,
+            isRetryable,
+          });
+
+          if (failure.shouldReturnFailure) {
+            res.status(failure.statusCode).json({
+              error: isRetryable ? "job_failed_transient" : "job_failed_permanent",
+              code,
+              message: msg,
+            });
+          } else {
+            res.status(failure.statusCode).json({
+              ok: true,
+              action: failure.reason,
+            });
+          }
+          return;
         }
-      } catch {
-        /* best-effort */
+      } catch (handlerError) {
+        console.error("Error in failure handler:", handlerError);
       }
 
+      // Fallback if we couldn't use the handler
       if (isRetryable) {
         res.status(503).json({ error: "job_failed_transient", code, message: msg });
       } else {
@@ -541,27 +881,6 @@ export const processShipmentTask2 = onRequest(
         return { raw: t };
       }
     };
-
-    async function maybeCompleteBatch(batchRef: DocumentReference) {
-      await db.runTransaction(async (tx) => {
-        const b = await tx.get(batchRef);
-        const d = b.data() || {};
-        const total = Number(d.total || 0);
-        const success = Number(d.success || 0);
-        const failed = Number(d.failed || 0);
-        const processing = Number(d.processing || 0);
-        if (total && success + failed === total && processing === 0) {
-          tx.update(batchRef, { status: "completed" });
-        }
-      });
-    }
-
-    async function attemptsExhausted(jobRef: DocumentReference) {
-      const snap = await jobRef.get();
-      const data = snap.data() || {};
-      const attempts = Number(data.attempts || 0);
-      return attempts >= Number(process.env.SHIPMENT_QUEUE_MAX_ATTEMPTS) ? true : false;
-    }
 
     /** Decide if an HTTP failure status is retryable */
     function httpRetryable(status: number) {
@@ -749,46 +1068,29 @@ export const processShipmentTask2 = onRequest(
 
         const text = await resp.text();
 
-        // HTTP errors
+        // HTTP errors - NOW USING handleJobFailure
         if (!resp.ok) {
-          const areAttempsExhausted = await attemptsExhausted(jobRef);
-          if (httpRetryable(resp.status)) {
-            await Promise.all([
-              jobRef.set(
-                {
-                  status: areAttempsExhausted ? "failed" : "retrying",
-                  errorCode: `HTTP_${resp.status}`,
-                  errorMessage: text.slice(0, 400),
-                },
-                { merge: true },
-              ),
-              batchRef.update(
-                areAttempsExhausted
-                  ? { processing: FieldValue.increment(-1), failed: FieldValue.increment(1) }
-                  : { processing: FieldValue.increment(-1) },
-              ),
-            ]);
-            await maybeCompleteBatch(batchRef);
-            return void res.status(503).json({ retry: true, reason: `http_${resp.status}` });
+          const failure = await handleJobFailure({
+            shop,
+            batchRef,
+            jobRef,
+            jobId,
+            errorCode: `HTTP_${resp.status}`,
+            errorMessage: text,
+            isRetryable: httpRetryable(resp.status),
+          });
+
+          if (failure.shouldReturnFailure) {
+            return void res.status(failure.statusCode).json({
+              ok: false,
+              reason: failure.reason,
+              code: `HTTP_${resp.status}`,
+            });
           } else {
-            await Promise.all([
-              jobRef.set(
-                {
-                  status: "failed",
-                  errorCode: `HTTP_${resp.status}`,
-                  errorMessage: text.slice(0, 400),
-                },
-                { merge: true },
-              ),
-              batchRef.update({
-                processing: FieldValue.increment(-1),
-                failed: FieldValue.increment(1),
-              }),
-            ]);
-            await maybeCompleteBatch(batchRef);
-            return void res
-              .status(200)
-              .json({ ok: false, permanent: true, reason: `http_${resp.status}` });
+            return void res.status(failure.statusCode).json({
+              ok: true,
+              action: failure.reason,
+            });
           }
         }
 
@@ -797,44 +1099,28 @@ export const processShipmentTask2 = onRequest(
         verdict = v;
 
         if (!v.ok) {
-          const areAttempsExhausted = await attemptsExhausted(jobRef);
-          if (v.retryable) {
-            await Promise.all([
-              jobRef.set(
-                {
-                  status: areAttempsExhausted ? "failed" : "retrying",
-                  errorCode: v.code,
-                  errorMessage: v.message,
-                  apiResp: orderCreateJson,
-                },
-                { merge: true },
-              ),
-              batchRef.update(
-                areAttempsExhausted
-                  ? { processing: FieldValue.increment(-1), failed: FieldValue.increment(1) }
-                  : { processing: FieldValue.increment(-1) },
-              ),
-            ]);
-            await maybeCompleteBatch(batchRef);
-            return void res.status(503).json({ retry: true, reason: v.code });
+          const failure = await handleJobFailure({
+            shop,
+            batchRef,
+            jobRef,
+            jobId,
+            errorCode: v.code,
+            errorMessage: v.message,
+            isRetryable: v.retryable,
+            apiResp: orderCreateJson,
+          });
+
+          if (failure.shouldReturnFailure) {
+            return void res.status(failure.statusCode).json({
+              ok: false,
+              reason: failure.reason,
+              code: v.code,
+            });
           } else {
-            await Promise.all([
-              jobRef.set(
-                {
-                  status: "failed",
-                  errorCode: v.code,
-                  errorMessage: v.message,
-                  apiResp: orderCreateJson,
-                },
-                { merge: true },
-              ),
-              batchRef.update({
-                processing: FieldValue.increment(-1),
-                failed: FieldValue.increment(1),
-              }),
-            ]);
-            await maybeCompleteBatch(batchRef);
-            return void res.status(200).json({ ok: false, permanent: true, reason: v.code });
+            return void res.status(failure.statusCode).json({
+              ok: true,
+              action: failure.reason,
+            });
           }
         }
 
@@ -876,46 +1162,29 @@ export const processShipmentTask2 = onRequest(
 
       const awbText = await awbResp.text();
 
-      // HTTP layer handling
+      // HTTP layer handling - NOW USING handleJobFailure
       if (!awbResp.ok) {
-        const areAttempsExhausted = await attemptsExhausted(jobRef);
-        if (httpRetryable(awbResp.status)) {
-          await Promise.all([
-            jobRef.set(
-              {
-                status: areAttempsExhausted ? "failed" : "retrying",
-                errorCode: `HTTP_${awbResp.status}`,
-                errorMessage: awbText.slice(0, 400),
-              },
-              { merge: true },
-            ),
-            batchRef.update(
-              areAttempsExhausted
-                ? { processing: FieldValue.increment(-1), failed: FieldValue.increment(1) }
-                : { processing: FieldValue.increment(-1) },
-            ),
-          ]);
-          await maybeCompleteBatch(batchRef);
-          return void res.status(503).json({ retry: true, reason: `http_${awbResp.status}` });
+        const failure = await handleJobFailure({
+          shop,
+          batchRef,
+          jobRef,
+          jobId,
+          errorCode: `HTTP_${awbResp.status}`,
+          errorMessage: awbText,
+          isRetryable: httpRetryable(awbResp.status),
+        });
+
+        if (failure.shouldReturnFailure) {
+          return void res.status(failure.statusCode).json({
+            ok: false,
+            reason: failure.reason,
+            code: `HTTP_${awbResp.status}`,
+          });
         } else {
-          await Promise.all([
-            jobRef.set(
-              {
-                status: "failed",
-                errorCode: `HTTP_${awbResp.status}`,
-                errorMessage: awbText.slice(0, 400),
-              },
-              { merge: true },
-            ),
-            batchRef.update({
-              processing: FieldValue.increment(-1),
-              failed: FieldValue.increment(1),
-            }),
-          ]);
-          await maybeCompleteBatch(batchRef);
-          return void res
-            .status(200)
-            .json({ ok: false, permanent: true, reason: `http_${awbResp.status}` });
+          return void res.status(failure.statusCode).json({
+            ok: true,
+            action: failure.reason,
+          });
         }
       }
 
@@ -943,6 +1212,7 @@ export const processShipmentTask2 = onRequest(
             courierCompanyId: courierId ?? null,
             errorCode: FieldValue.delete(),
             errorMessage: FieldValue.delete(),
+            completedAt: FieldValue.serverTimestamp(),
             apiResp: {
               orderCreate: srOrderId ? "persisted" : "fresh",
               awbAssign: awbJson,
@@ -971,13 +1241,7 @@ export const processShipmentTask2 = onRequest(
           ),
         ]);
 
-        // If batch is done, close it
-        await db.runTransaction(async (tx) => {
-          const b = await tx.get(batchRef);
-          const d = b.data() || {};
-          const done = (d.success || 0) + (d.failed || 0);
-          if (done >= d.total) tx.update(batchRef, { status: "completed" });
-        });
+        await maybeCompleteBatch(batchRef);
 
         return void res.json({
           ok: true,
@@ -989,47 +1253,55 @@ export const processShipmentTask2 = onRequest(
 
       // Non-retryable AWB cases (based on typical Shiprocket messages)
       if (errorIfAny) {
-        await Promise.all([
-          jobRef.set(
-            {
-              status: "failed",
-              errorCode: awbJson?.message || "Awb assign failed",
-              errorMessage: awbJson?.message || "Awb assign failed",
-              apiResp: { awbAssign: awbJson },
-            },
-            { merge: true },
-          ),
-          batchRef.update({
-            processing: FieldValue.increment(-1),
-            failed: FieldValue.increment(1),
-          }),
-        ]);
-        await maybeCompleteBatch(batchRef);
-        return void res
-          .status(200)
-          .json({ ok: false, permanent: true, reason: "AWB_ASSIGN_FAILED" });
+        const failure = await handleJobFailure({
+          shop,
+          batchRef,
+          jobRef,
+          jobId,
+          errorCode: "AWB_ASSIGN_FAILED",
+          errorMessage: awbJson?.message || "Awb assign failed",
+          isRetryable: false,
+          apiResp: { awbAssign: awbJson },
+        });
+
+        if (failure.shouldReturnFailure) {
+          return void res.status(failure.statusCode).json({
+            ok: false,
+            reason: failure.reason,
+            code: "AWB_ASSIGN_FAILED",
+          });
+        } else {
+          return void res.status(failure.statusCode).json({
+            ok: true,
+            action: failure.reason,
+          });
+        }
       }
 
-      const areAttempsExhausted = await attemptsExhausted(jobRef);
-      // Ambiguous → retry
-      await Promise.all([
-        jobRef.set(
-          {
-            status: areAttempsExhausted ? "failed" : "retrying",
-            errorCode: "CARRIER_AMBIGUOUS",
-            errorMessage: "carrier error",
-            apiResp: { awbAssign: awbJson },
-          },
-          { merge: true },
-        ),
-        batchRef.update(
-          areAttempsExhausted
-            ? { processing: FieldValue.increment(-1), failed: FieldValue.increment(1) }
-            : { processing: FieldValue.increment(-1) },
-        ),
-      ]);
-      await maybeCompleteBatch(batchRef);
-      return void res.status(503).json({ retry: true, reason: "CARRIER_AMBIGUOUS" });
+      // Ambiguous → retry with handleJobFailure
+      const failure = await handleJobFailure({
+        shop,
+        batchRef,
+        jobRef,
+        jobId,
+        errorCode: "CARRIER_AMBIGUOUS",
+        errorMessage: "carrier error",
+        isRetryable: true,
+        apiResp: { awbAssign: awbJson },
+      });
+
+      if (failure.shouldReturnFailure) {
+        return void res.status(failure.statusCode).json({
+          ok: false,
+          reason: failure.reason,
+          code: "CARRIER_AMBIGUOUS",
+        });
+      } else {
+        return void res.status(failure.statusCode).json({
+          ok: true,
+          action: failure.reason,
+        });
+      }
     } catch (e: any) {
       // Generic failure (network/bug/etc.)
       const msg = e instanceof Error ? e.message : String(e);
@@ -1042,44 +1314,52 @@ export const processShipmentTask2 = onRequest(
           batchId?: string;
           jobId?: string;
         };
+
         if (shop && batchId && jobId) {
           if (awb && !awbReleased) {
             try {
               await releaseAwb(shop, awb);
+              awbReleased = true;
             } catch (e) {
-              void e;
+              console.error("Failed to release AWB:", e);
             }
           }
+
           const batchRef = db
             .collection("accounts")
             .doc(shop)
             .collection("shipment_batches")
             .doc(batchId);
           const jobRef = batchRef.collection("jobs").doc(String(jobId));
-          const areAttempsExhausted = await attemptsExhausted(jobRef);
-          await Promise.all([
-            jobRef.set(
-              {
-                status: isRetryable ? (areAttempsExhausted ? "failed" : "retying") : "failed",
-                errorCode: isRetryable ? "EXCEPTION" : code,
-                errorMessage: code,
-              },
-              { merge: true },
-            ),
-            batchRef.update(
-              isRetryable
-                ? areAttempsExhausted
-                  ? { processing: FieldValue.increment(-1), failed: FieldValue.increment(1) }
-                  : { processing: FieldValue.increment(-1) }
-                : { processing: FieldValue.increment(-1), failed: FieldValue.increment(1) },
-            ),
-          ]);
-          await maybeCompleteBatch(batchRef);
+
+          const failure = await handleJobFailure({
+            shop,
+            batchRef,
+            jobRef,
+            jobId,
+            errorCode: code,
+            errorMessage: msg,
+            isRetryable,
+          });
+
+          if (failure.shouldReturnFailure) {
+            return void res.status(failure.statusCode).json({
+              error: isRetryable ? "job_failed_transient" : "job_failed_permanent",
+              code,
+              message: msg,
+            });
+          } else {
+            return void res.status(failure.statusCode).json({
+              ok: true,
+              action: failure.reason,
+            });
+          }
         }
-      } catch (e) {
-        void e;
+      } catch (handlerError) {
+        console.error("Error in failure handler:", handlerError);
       }
-      // 503 → ask Cloud Tasks to retry the task
+
+      // Fallback if we couldn't use the handler
       return void res
         .status(isRetryable ? 503 : 200)
         .json(
@@ -1375,7 +1655,7 @@ export const processFulfillmentTask = onRequest(
         return;
       }
 
-      const MAX_ATTEMPTS = Number(process.env.FULFILLMENT_QUEUE_MAX_ATTEMPTS) || 3;
+      const MAX_ATTEMPTS = Number(process.env.FULFILLMENT_QUEUE_MAX_ATTEMPTS || 3);
 
       // mark processing + attempt++
       await Promise.all([
@@ -2047,23 +2327,6 @@ async function queueNextChunk(
   });
 }
 
-async function maybeCompleteBatch(batchRef: DocumentReference): Promise<void> {
-  await db.runTransaction(async (tx) => {
-    const b = await tx.get(batchRef);
-    const d = b.data() || {};
-    const total = Number(d.total || 0);
-    const success = Number(d.success || 0);
-    const failed = Number(d.failed || 0);
-    const processing = Number(d.processing || 0);
-    if (total && success + failed === total && processing === 0) {
-      tx.update(batchRef, {
-        status: "completed",
-        completedAt: FieldValue.serverTimestamp(),
-      });
-    }
-  });
-}
-
 async function handleJobError(error: any, body: any): Promise<void> {
   const { batchId, jobId, chunkIndex } = body;
   if (!batchId || !jobId) return;
@@ -2079,7 +2342,7 @@ async function handleJobError(error: any, body: any): Promise<void> {
   try {
     const jobSnap = await jobRef.get();
     const attempts = Number(jobSnap.data()?.attempts || 0);
-    const maxAttempts = Number(process.env.STATUS_UPDATE_QUEUE_MAX_ATTEMPTS || 3);
+    const maxAttempts = Number(process.env.STATUS_UPDATE_QUEUE_MAX_ATTEMPTS || 4);
     const attemptsExhausted = attempts >= maxAttempts;
 
     await Promise.all([
@@ -2305,18 +2568,30 @@ export const processManualUpdateChunk = onRequest(
 
       // Idempotency check
       const jSnap = await jobRef.get();
-      if (jSnap.exists && jSnap.data()?.status === "success") {
+      if (jSnap.exists && jSnap.data()?.status === "completed") {
         res.json({ ok: true, dedup: true });
         return;
       }
 
-      // Mark job as processing on first chunk
-      if (chunkIndex === 0) {
-        await jobRef.update({
-          status: "processing",
-          startedAt: FieldValue.serverTimestamp(),
-        });
-      }
+      // Increment attempts on every execution (using transaction for safety)
+      await db.runTransaction(async (tx) => {
+        const snap = await tx.get(jobRef);
+        const data = snap.data() || {};
+        const prevAttempts = Number(data.attempts || 0);
+
+        const updateData: any = {
+          attempts: prevAttempts + 1,
+          lastAttemptAt: FieldValue.serverTimestamp(),
+        };
+
+        // Only set these on first chunk of first attempt
+        if (chunkIndex === 0 && (prevAttempts === 0 || data.status === "queued")) {
+          updateData.status = "processing";
+          updateData.startedAt = FieldValue.serverTimestamp();
+        }
+
+        tx.update(jobRef, updateData);
+      });
 
       // Get account and API key
       const accountDoc = await db.collection("accounts").doc(accountId).get();
@@ -2409,28 +2684,57 @@ export const processManualUpdateChunk = onRequest(
     } catch (error: any) {
       console.error("processManualUpdateChunk error:", error);
 
-      // Update job with error
-      const { jobId, accountId } = req.body;
-      if (jobId) {
+      const { jobId, accountId, chunkIndex } = req.body;
+      if (!jobId || !accountId) {
+        res.status(500).json({
+          ok: false,
+          error: "chunk_processing_failed",
+          message: error.message || String(error),
+        });
+        return;
+      }
+
+      try {
         const jobRef = db
           .collection("accounts")
           .doc(accountId)
           .collection("manual_status_updates")
           .doc(jobId);
-        await jobRef
-          .update({
-            status: "failed",
-            errorMessage: error.message || String(error),
-            failedAt: FieldValue.serverTimestamp(),
-          })
-          .catch((e) => console.error("Failed to update job with error:", e));
-      }
 
-      res.status(500).json({
-        ok: false,
-        error: "chunk_processing_failed",
-        message: error.message || String(error),
-      });
+        const jobSnap = await jobRef.get();
+        const attempts = Number(jobSnap.data()?.attempts || 0);
+        const maxAttempts = Number(process.env.STATUS_UPDATE_QUEUE_MAX_ATTEMPTS || 4);
+        const attemptsExhausted = attempts >= maxAttempts;
+
+        const msg = error.message || String(error);
+        const code = msg.split(/\s/)[0];
+        const NON_RETRYABLE = ["ACCOUNT_NOT_FOUND", "API_KEY_MISSING"];
+        const isRetryable = !NON_RETRYABLE.includes(code);
+
+        await jobRef.update({
+          status: isRetryable ? (attemptsExhausted ? "failed" : "retrying") : "failed",
+          errorCode: isRetryable ? "EXCEPTION" : code,
+          errorMessage: msg.slice(0, 400),
+          failedAt: FieldValue.serverTimestamp(),
+          failedAtChunk: chunkIndex || 0,
+        });
+
+        // Return appropriate status code for Cloud Tasks retry behavior
+        res.status(isRetryable && !attemptsExhausted ? 503 : 200).json({
+          ok: false,
+          error:
+            isRetryable && !attemptsExhausted ? "chunk_failed_transient" : "chunk_failed_permanent",
+          code,
+          message: msg,
+        });
+      } catch (e) {
+        console.error("Failed to update job with error status:", e);
+        res.status(500).json({
+          ok: false,
+          error: "chunk_processing_failed",
+          message: error.message || String(error),
+        });
+      }
     }
   },
 );
