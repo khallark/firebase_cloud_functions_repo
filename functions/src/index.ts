@@ -89,11 +89,6 @@ async function handleJobFailure(params: {
         ...(apiResp && { lastApiResp: apiResp }),
       });
 
-      // FIX: Decrement processing since job is moving to fallback state
-      await batchRef.update({
-        processing: FieldValue.increment(-1),
-      });
-
       // Queue fallback handler task
       await createTask(
         { shop, batchId: batchRef.id, jobId },
