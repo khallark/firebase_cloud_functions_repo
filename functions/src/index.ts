@@ -392,7 +392,7 @@ export const handlePriorityFallback = onRequest(
         // FIX: Use the actual last error instead of generic message
         const lastError = jobData.lastErrorMessage || jobData.errorMessage || "Unknown error";
         const lastErrorCode = jobData.lastErrorCode || jobData.errorCode || "UNKNOWN";
-        
+
         await Promise.all([
           jobRef.update({
             status: "failed",
@@ -636,12 +636,14 @@ export const processShipmentTask = onRequest(
         const data = snap.data() || {};
         const prevAttempts = Number(data.attempts || 0);
         const jobStatus = data.status;
-        
+
         // FIX: Don't decrement queued if this is a fallback attempt
         // Fallback jobs go: processing → attempting_fallback → fallback_queued → processing
         // They were never re-queued, so don't decrement queued again
-        const isFallbackAttempt = jobStatus === "fallback_queued" || jobStatus === "attempting_fallback";
-        const firstAttempt = (prevAttempts === 0 || jobStatus === "queued" || !jobStatus) && !isFallbackAttempt;
+        const isFallbackAttempt =
+          jobStatus === "fallback_queued" || jobStatus === "attempting_fallback";
+        const firstAttempt =
+          (prevAttempts === 0 || jobStatus === "queued" || !jobStatus) && !isFallbackAttempt;
 
         // move to processing, increment attempts
         tx.set(
@@ -1071,12 +1073,14 @@ export const processShipmentTask2 = onRequest(
         const data = snap.data() || {};
         const prevAttempts = Number(data.attempts || 0);
         const jobStatus = data.status;
-        
+
         // FIX: Don't decrement queued if this is a fallback attempt
         // Fallback jobs go: processing → attempting_fallback → fallback_queued → processing
         // They were never re-queued, so don't decrement queued again
-        const isFallbackAttempt = jobStatus === "fallback_queued" || jobStatus === "attempting_fallback";
-        const firstAttempt = (prevAttempts === 0 || jobStatus === "queued" || !jobStatus) && !isFallbackAttempt;
+        const isFallbackAttempt =
+          jobStatus === "fallback_queued" || jobStatus === "attempting_fallback";
+        const firstAttempt =
+          (prevAttempts === 0 || jobStatus === "queued" || !jobStatus) && !isFallbackAttempt;
 
         // move to processing, increment attempts
         tx.set(
