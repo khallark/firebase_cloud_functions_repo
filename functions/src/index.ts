@@ -89,6 +89,11 @@ async function handleJobFailure(params: {
         ...(apiResp && { lastApiResp: apiResp }),
       });
 
+      // FIX: Decrement processing since job is moving to fallback state
+      await batchRef.update({
+        processing: FieldValue.increment(-1),
+      });
+
       // Queue fallback handler task
       await createTask(
         { shop, batchId: batchRef.id, jobId },
@@ -384,11 +389,17 @@ export const handlePriorityFallback = onRequest(
       // Check if there's a next courier available
       if (nextIndex >= priorityList.length) {
         // No more fallback couriers, mark as permanently failed
+        // FIX: Use the actual last error instead of generic message
+        const lastError = jobData.lastErrorMessage || jobData.errorMessage || "Unknown error";
+        const lastErrorCode = jobData.lastErrorCode || jobData.errorCode || "UNKNOWN";
+        
         await Promise.all([
           jobRef.update({
             status: "failed",
-            errorCode: "ALL_PRIORITY_COURIERS_EXHAUSTED",
-            errorMessage: `Failed after trying all ${priorityList.length} priority couriers: ${(jobData.previousCouriers || []).concat(currentCourier).join(", ")}`,
+            errorCode: lastErrorCode,
+            errorMessage: `${currentCourier}: ${lastError}`,
+            allCouriersExhausted: true,
+            triedCouriers: (jobData.previousCouriers || []).concat(currentCourier),
             finalFailedAt: FieldValue.serverTimestamp(),
           }),
           batchRef.update({
@@ -624,7 +635,13 @@ export const processShipmentTask = onRequest(
         const snap = await tx.get(jobRef);
         const data = snap.data() || {};
         const prevAttempts = Number(data.attempts || 0);
-        const firstAttempt = prevAttempts === 0 || data.status === "queued" || !data.status;
+        const jobStatus = data.status;
+        
+        // FIX: Don't decrement queued if this is a fallback attempt
+        // Fallback jobs go: processing → attempting_fallback → fallback_queued → processing
+        // They were never re-queued, so don't decrement queued again
+        const isFallbackAttempt = jobStatus === "fallback_queued" || jobStatus === "attempting_fallback";
+        const firstAttempt = (prevAttempts === 0 || jobStatus === "queued" || !jobStatus) && !isFallbackAttempt;
 
         // move to processing, increment attempts
         tx.set(
@@ -641,7 +658,6 @@ export const processShipmentTask = onRequest(
         if (firstAttempt) inc.queued = FieldValue.increment(-1);
         tx.update(batchRef, inc);
       });
-      // -----------------------------------------------------------------------
 
       // Allocate AWB
       awb = await allocateAwb(shop);
@@ -1054,7 +1070,13 @@ export const processShipmentTask2 = onRequest(
         const snap = await tx.get(jobRef);
         const data = snap.data() || {};
         const prevAttempts = Number(data.attempts || 0);
-        const firstAttempt = prevAttempts === 0 || data.status === "queued" || !data.status;
+        const jobStatus = data.status;
+        
+        // FIX: Don't decrement queued if this is a fallback attempt
+        // Fallback jobs go: processing → attempting_fallback → fallback_queued → processing
+        // They were never re-queued, so don't decrement queued again
+        const isFallbackAttempt = jobStatus === "fallback_queued" || jobStatus === "attempting_fallback";
+        const firstAttempt = (prevAttempts === 0 || jobStatus === "queued" || !jobStatus) && !isFallbackAttempt;
 
         // move to processing, increment attempts
         tx.set(
@@ -1071,7 +1093,7 @@ export const processShipmentTask2 = onRequest(
         if (firstAttempt) inc.queued = FieldValue.increment(-1);
         tx.update(batchRef, inc);
       });
-      // -----------------------------------------------------------------------
+      // ----------------------------------------------------------------------
 
       // Load order
       const ordSnap = await orderRef.get();
