@@ -14,8 +14,8 @@ import {
 import { defineSecret } from "firebase-functions/params";
 import { setGlobalOptions } from "firebase-functions/options";
 import { DocumentReference, Timestamp, Transaction } from "firebase-admin/firestore";
-import { genkit } from 'genkit';
-import vertexAI from "@genkit-ai/vertexai";
+// import { genkit } from 'genkit';
+// import vertexAI from "@genkit-ai/vertexai";
 import { QueryDocumentSnapshot } from "firebase-functions/firestore";
 
 setGlobalOptions({ region: process.env.LOCATION || "asia-south1" });
@@ -87,9 +87,7 @@ async function handleJobFailure(params: {
   // 3. Has fallback handler URL configured
   // 4. NOT an insufficient balance error (added condition)
   const shouldAttemptFallback =
-    isPriority &&
-    (attemptsExhausted || !isRetryable) &&
-    !isInsufficientBalance;
+    isPriority && (attemptsExhausted || !isRetryable) && !isInsufficientBalance;
   const fallbackUrl = process.env.PRIORITY_FALLBACK_HANDLER_URL;
 
   if (shouldAttemptFallback && fallbackUrl) {
@@ -590,10 +588,10 @@ export const processShipmentTask = onRequest(
         "recharge",
         "add balance",
         "balance low",
-        "no balance"
+        "no balance",
       ];
 
-      const isBalanceError = balanceKeywords.some(keyword => combinedText.includes(keyword));
+      const isBalanceError = balanceKeywords.some((keyword) => combinedText.includes(keyword));
 
       if (isBalanceError) {
         return {
@@ -842,6 +840,7 @@ export const processShipmentTask = onRequest(
             courier: "Delhivery",
             customStatus: "Ready To Dispatch",
             shippingMode,
+            lastStatusUpdate: FieldValue.serverTimestamp(),
             customStatusesLogs: FieldValue.arrayUnion({
               status: "Ready To Dispatch",
               createdAt: Timestamp.now(),
@@ -1007,10 +1006,10 @@ export const processShipmentTask2 = onRequest(
         "balance low",
         "no balance",
         "wallet amount",
-        "credit limit"
+        "credit limit",
       ];
 
-      const isBalanceError = balanceKeywords.some(keyword => lowerMsg.includes(keyword));
+      const isBalanceError = balanceKeywords.some((keyword) => lowerMsg.includes(keyword));
 
       if (isBalanceError) {
         return {
@@ -1409,6 +1408,7 @@ export const processShipmentTask2 = onRequest(
               awb: awbCode,
               courier: `Shiprocket: ${courierName ?? "Unknown"}`,
               customStatus: "Ready To Dispatch",
+              lastStatusUpdate: FieldValue.serverTimestamp(),
               customStatusesLogs: FieldValue.arrayUnion({
                 status: "Ready To Dispatch",
                 createdAt: Timestamp.now(),
@@ -1626,7 +1626,13 @@ export const enqueueReturnShipmentTasks = onRequest(
         requestedBy?: string;
       };
 
-      if (!shop || !pickupName || !shippingMode || !Array.isArray(orderIds) || orderIds.length === 0) {
+      if (
+        !shop ||
+        !pickupName ||
+        !shippingMode ||
+        !Array.isArray(orderIds) ||
+        orderIds.length === 0
+      ) {
         res.status(400).json({ error: "bad_payload" });
         return;
       }
@@ -1720,10 +1726,7 @@ export const enqueueReturnShipmentTasks = onRequest(
             throw new Error(`Unsupported courier for returns: ${normalizedCourier}`);
           }
         } catch (urlError) {
-          console.error(
-            `Failed to map courier ${normalizedCourier} for order ${o}:`,
-            urlError,
-          );
+          console.error(`Failed to map courier ${normalizedCourier} for order ${o}:`, urlError);
 
           writer.set(
             batchRef.collection("jobs").doc(String(o)),
@@ -2098,6 +2101,7 @@ export const processReturnShipmentTask = onRequest(
           {
             awb_reverse: awb,
             customStatus: "DTO Booked",
+            lastStatusUpdate: FieldValue.serverTimestamp(),
             customStatusesLogs: FieldValue.arrayUnion({
               status: "DTO Booked",
               createdAt: Timestamp.now(),
@@ -2494,6 +2498,7 @@ export const processFulfillmentTask = onRequest(
           orderRef.set(
             {
               customStatus: "Dispatched",
+              lastStatusUpdate: FieldValue.serverTimestamp(),
               customStatusesLogs: FieldValue.arrayUnion({
                 status: "Dispatched",
                 createdAt: Timestamp.now(),
@@ -2594,6 +2599,9 @@ function determineNewStatus(status: any): string | null {
     RTO: { DL: "RTO Delivered" },
     DTO: { DL: "DTO Delivered" },
     Lost: { LT: "Lost" },
+    Closed: { CN: "Closed/Cancelled Conditional" },
+    Cancelled: { CN: "Closed/Cancelled Conditional" },
+    Canceled: { CN: "Closed/Cancelled Conditional" },
   };
 
   return statusMap[Status]?.[StatusType] || null;
@@ -3072,8 +3080,43 @@ function prepareOrderUpdates(orders: any[], shipments: any[]): OrderUpdate[] {
     if (!order) continue;
 
     const newStatus = determineNewStatus(shipment.Status);
-    if (!newStatus || newStatus === order.customStatus) continue;
-
+    if (!newStatus) continue;
+    if (newStatus === order.customStatus) continue;
+    if (newStatus === "Closed/Cancelled Conditional") {
+      if (order.customStatus === "DTO Booked") {
+        updates.push({
+          ref: order.ref,
+          data: {
+            customStatus: "Delivered",
+            awb_reverse: FieldValue.delete(),
+            lastStatusUpdate: FieldValue.serverTimestamp(),
+            customStatusesLogs: FieldValue.arrayUnion({
+              status: "Delivered",
+              createdAt: Timestamp.now(),
+              remarks: "This order was Cancelled on DTO, and was changed to 'Delivered' again.",
+            }),
+          },
+        });
+      }
+      if (order.customStatus === "Ready To Dispatch") {
+        updates.push({
+          ref: order.ref,
+          data: {
+            customStatus: "Confirmed",
+            courier: FieldValue.delete(),
+            awb: FieldValue.delete(),
+            lastStatusUpdate: FieldValue.serverTimestamp(),
+            customStatusesLogs: FieldValue.arrayUnion({
+              status: "Confirmed",
+              createdAt: Timestamp.now(),
+              remarks:
+                "This order was Cancelled on by Delhivery, and was changed to 'Confirmed' again.",
+            }),
+          },
+        });
+      }
+      continue;
+    }
     updates.push({
       ref: order.ref,
       data: {
@@ -3184,8 +3227,8 @@ export const closeDeliveredOrdersJob = onSchedule(
   async () => {
     console.log("Starting closeDeliveredOrdersJob");
 
-    const hours144InMs = 144 * 60 * 60 * 1000;
-    const cutoffTime = new Date(Date.now() - hours144InMs);
+    const _360HrsInMs = 360 * 60 * 60 * 1000;
+    const cutoffTime = new Date(Date.now() - _360HrsInMs);
 
     console.log(`Cutoff time: ${cutoffTime.toISOString()}`);
 
@@ -3705,7 +3748,57 @@ function prepareManualUpdates(
     if (!order) continue;
 
     const newStatus = determineNewStatus(shipment.Status);
-    if (!newStatus || newStatus === order.customStatus) continue;
+    if (!newStatus) continue;
+    if (newStatus === order.customStatus) continue;
+    if (newStatus === "Closed/Cancelled Conditional") {
+      if (order.customStatus === "DTO Booked") {
+        updates.push({
+          ref: order.ref,
+          data: {
+            customStatus: "Delivered",
+            awb_reverse: FieldValue.delete(),
+            lastStatusUpdate: FieldValue.serverTimestamp(),
+            customStatusesLogs: FieldValue.arrayUnion({
+              status: "Delivered",
+              createdAt: Timestamp.now(),
+              remarks: "This order was Cancelled on DTO, and was changed to 'Delivered' again.",
+            }),
+          },
+          orderInfo: {
+            orderId: order.id,
+            orderName: order.name,
+            oldStatus: order.customStatus,
+            newStatus,
+            awb: order.awb,
+          },
+        });
+      }
+      if (order.customStatus === "Ready To Dispatch") {
+        updates.push({
+          ref: order.ref,
+          data: {
+            customStatus: "Confirmed",
+            courier: FieldValue.delete(),
+            awb: FieldValue.delete(),
+            lastStatusUpdate: FieldValue.serverTimestamp(),
+            customStatusesLogs: FieldValue.arrayUnion({
+              status: "Confirmed",
+              createdAt: Timestamp.now(),
+              remarks:
+                "This order was Cancelled on by Delhivery, and was changed to 'Confirmed' again.",
+            }),
+          },
+          orderInfo: {
+            orderId: order.id,
+            orderName: order.name,
+            oldStatus: order.customStatus,
+            newStatus,
+            awb: order.awb,
+          },
+        });
+      }
+      continue;
+    }
 
     updates.push({
       ref: order.ref,
@@ -3754,3 +3847,614 @@ async function queueManualUpdateChunk(
     delaySeconds: 2,
   });
 }
+
+// // ============================================================================
+// // AI CONFIGURATION - Using Vertex AI
+// // ============================================================================
+// const ai = genkit({
+//   plugins: [
+//     vertexAI({
+//       projectId: process.env.GOOGLE_CLOUD_PROJECT ||
+//                  process.env.GCLOUD_PROJECT ||
+//                  process.env.GCP_PROJECT ||
+//                  'orderflow-jnig7', // Fallback
+//       location: 'asia-southeast1', // Singapore - closest to asia-south1
+//     })
+//   ],
+//   model: 'vertexai/gemini-2.0-flash-exp',
+// });
+
+// // Cache for AI results to reduce API calls
+// const addressCache = new Map<string, boolean>();
+
+// // ============================================================================
+// // CONFIGURATION
+// // ============================================================================
+// const GOOD_ADDRESS_KEYWORDS = [
+//   'apartment', 'apt', 'suite', 'unit', 'floor', 'building', 'tower',
+//   'block', 'flat', 'room', '#', 'house', 'street', 'road', 'avenue', 'nagar', 'chowk', 'shop'
+// ];
+
+// // ============================================================================
+// // TYPES
+// // ============================================================================
+// interface OrderData {
+//   customStatus: string;
+//   tags_new?: string[];
+//   raw: {
+//     id: string | number;
+//     total_price: string | number;
+//     total_outstanding: string | number;
+//     customer?: {
+//       id?: string | number;
+//       email?: string;
+//       phone?: string;
+//     };
+//     shipping_address?: {
+//       address1?: string;
+//       address2?: string;
+//     };
+//     line_items?: Array<{
+//       variant_id?: string | number;
+//     }>;
+//   };
+// }
+
+// interface GroupedOrders {
+//   goodAddress: QueryDocumentSnapshot[];
+//   badAddress: QueryDocumentSnapshot[];
+// }
+
+// // ============================================================================
+// // MAIN SCHEDULED FUNCTION
+// // ============================================================================
+// export const processNewOrdersScheduled = onSchedule(
+//   {
+//     schedule: "0 0 * * *", // Daily at 12 AM IST
+//     timeZone: "Asia/Kolkata",
+//     region: process.env.LOCATION || "asia-south1",
+//     memory: "1GiB",
+//     timeoutSeconds: 540,
+//     // No secrets needed - Vertex AI uses Application Default Credentials
+//   },
+//   async () => {
+//     console.log("Starting processNewOrders job");
+
+//     try {
+//       // Process orders for each account
+//       const accountsSnapshot = await db.collection("accounts").get();
+
+//       for (const accountDoc of accountsSnapshot.docs) {
+//         const accountId = accountDoc.id;
+//         console.log(`Processing account: ${accountId}`);
+
+//         try {
+//           await processAccountOrders(accountId);
+//         } catch (error) {
+//           console.error(`Error processing account ${accountId}:`, error);
+//           // Continue with other accounts
+//         }
+//       }
+
+//       console.log("Job completed successfully");
+//     } catch (error) {
+//       console.error("processNewOrders job failed:", error);
+//       throw error;
+//     }
+//   }
+// );
+
+// // ============================================================================
+// // PROCESS ORDERS FOR A SINGLE ACCOUNT
+// // ============================================================================
+// async function processAccountOrders(accountId: string): Promise<void> {
+//   // 1. Fetch eligible orders for this account
+//   const eligibleOrders = await fetchEligibleOrders(accountId);
+
+//   if (eligibleOrders.length === 0) {
+//     console.log(`No eligible orders found for account ${accountId}`);
+//     return;
+//   }
+
+//   console.log(`Found ${eligibleOrders.length} eligible orders for account ${accountId}`);
+
+//   // 2. Split by address quality
+//   const { goodAddress, badAddress } = await splitByAddressQuality(eligibleOrders);
+//   console.log(`Account ${accountId} - Good addresses: ${goodAddress.length}, Bad addresses: ${badAddress.length}`);
+
+//   // 3. Process good address orders
+//   await processGoodAddressOrders(goodAddress, accountId);
+
+//   // 4. Process bad address orders
+//   await processBadAddressOrders(badAddress, accountId);
+// }
+
+// // ============================================================================
+// // STEP 1: FETCH ELIGIBLE ORDERS
+// // ============================================================================
+// async function fetchEligibleOrders(accountId: string): Promise<QueryDocumentSnapshot[]> {
+//   try {
+//     const snapshot = await db
+//       .collection("accounts")
+//       .doc(accountId)
+//       .collection("orders")
+//       .where("customStatus", "==", "New")
+//       .get();
+
+//     // Filter for total_price == total_outstanding
+//     const eligible = snapshot.docs.filter((doc: QueryDocumentSnapshot) => {
+//       try {
+//         const data = doc.data() as OrderData;
+//         const totalPrice = parseFloat(String(data.raw?.total_price || 0));
+//         const totalOutstanding = parseFloat(String(data.raw?.total_outstanding || 0));
+//         return totalPrice === totalOutstanding && totalPrice > 0;
+//       } catch (error) {
+//         console.error(`Error parsing prices for order ${doc.id}:`, error);
+//         return false;
+//       }
+//     });
+
+//     return eligible;
+//   } catch (error) {
+//     console.error(`Error fetching orders for account ${accountId}:`, error);
+//     throw new Error(`Failed to fetch orders: ${error}`);
+//   }
+// }
+
+// // ============================================================================
+// // STEP 2: SPLIT BY ADDRESS QUALITY (AI-POWERED)
+// // ============================================================================
+// async function splitByAddressQuality(orders: QueryDocumentSnapshot[]): Promise<GroupedOrders> {
+//   const goodAddress: QueryDocumentSnapshot[] = [];
+//   const badAddress: QueryDocumentSnapshot[] = [];
+
+//   // Process addresses with some concurrency control
+//   const BATCH_SIZE = 10; // Process 10 addresses at a time to avoid rate limits
+
+//   for (let i = 0; i < orders.length; i += BATCH_SIZE) {
+//     const batch = orders.slice(i, i + BATCH_SIZE);
+
+//     await Promise.all(
+//       batch.map(async (doc: QueryDocumentSnapshot) => {
+//         try {
+//           const data = doc.data() as OrderData;
+//           const address1 = data.raw?.shipping_address?.address1?.toLowerCase() || "";
+//           const address2 = data.raw?.shipping_address?.address2?.toLowerCase() || "";
+//           const fullAddress = `${address1} ${address2}`.trim();
+
+//           const isGood = await isGoodAddress(fullAddress);
+
+//           if (isGood) {
+//             goodAddress.push(doc);
+//           } else {
+//             badAddress.push(doc);
+//           }
+//         } catch (error) {
+//           console.error(`Error evaluating address for order ${doc.id}:`, error);
+//           badAddress.push(doc); // Default to bad address on error
+//         }
+//       })
+//     );
+//   }
+
+//   return { goodAddress, badAddress };
+// }
+
+// // Helper function to get customer identifier
+// function getCustomerIdentifier(data: OrderData): string {
+//   // Try customer ID first (most reliable)
+//   if (data.raw?.customer?.id) {
+//     return `customer_${data.raw.customer.id}`;
+//   }
+
+//   // Fallback to email
+//   if (data.raw?.customer?.email) {
+//     return `email_${data.raw.customer.email.toLowerCase()}`;
+//   }
+
+//   // Fallback to phone (normalize it)
+//   if (data.raw?.customer?.phone) {
+//     const phone = data.raw.customer.phone.replace(/\D/g, ''); // Remove non-digits
+//     return `phone_${phone}`;
+//   }
+
+//   // No customer info - treat each order as unique customer
+//   return `unknown_${data.raw.id}`;
+// }
+
+// async function isGoodAddress(address: string): Promise<boolean> {
+//   if (!address || address.length < 10) return false;
+
+//   // Check cache first
+//   if (addressCache.has(address)) {
+//     return addressCache.get(address)!;
+//   }
+
+//   try {
+//     // Use Vertex AI to evaluate address quality
+//     const { text } = await ai.generate({
+//       model: 'vertexai/gemini-2.0-flash-exp',
+//       prompt: `You are an address quality evaluator for an e-commerce fulfillment system.
+
+// Analyze this shipping address and determine if it's sufficiently detailed for delivery:
+
+// Address: "${address}"
+
+// A GOOD address should have:
+// - Specific building/house number
+// - Clear location identifiers (apartment, suite, floor, etc.)
+// - Street/road name
+// - Enough detail for a delivery person to find the location
+
+// A BAD address is:
+// - Vague or incomplete
+// - Missing building/house numbers
+// - Only has area/locality without specific location
+// - Too short or generic
+
+// Respond with ONLY one word: "GOOD" or "BAD"`,
+//     });
+
+//     const result = text.trim().toUpperCase();
+//     const isGood = result === "GOOD";
+
+//     // Cache the result
+//     addressCache.set(address, isGood);
+
+//     return isGood;
+//   } catch (error) {
+//     console.error(`AI address evaluation failed for "${address}":`, error);
+
+//     // Fallback to keyword-based logic if AI fails
+//     return fallbackAddressCheck(address);
+//   }
+// }
+
+// // Fallback function if AI fails
+// function fallbackAddressCheck(address: string): boolean {
+//   if (!address || address.length < 10) return false;
+
+//   // Check for good address indicators
+//   const hasGoodKeyword = GOOD_ADDRESS_KEYWORDS.some((keyword) =>
+//     address.includes(keyword.toLowerCase())
+//   );
+
+//   // Check for numbers (house/building numbers)
+//   const hasNumbers = /\d/.test(address);
+
+//   // Check minimum length and structure
+//   const hasMinimumWords = address.split(/\s+/).length >= 3;
+
+//   return hasGoodKeyword && hasNumbers && hasMinimumWords;
+// }
+
+// // ============================================================================
+// // STEP 3: PROCESS GOOD ADDRESS ORDERS
+// // ============================================================================
+// async function processGoodAddressOrders(
+//   orders: QueryDocumentSnapshot[],
+//   accountId: string
+// ): Promise<void> {
+//   if (orders.length === 0) return;
+
+//   console.log(`Processing ${orders.length} good address orders for account ${accountId}`);
+
+//   try {
+//     const groups = groupOrdersByVariantId(orders);
+//     console.log(`Good address: Created ${groups.length} groups`);
+
+//     for (const group of groups) {
+//       try {
+//         if (group.length === 1) {
+//           // Single order: Confirm it
+//           await updateOrderStatus(group[0], "Confirmed");
+//           console.log(`Confirmed single order: ${group[0].id}`);
+//         } else {
+//           // Multiple orders: Keep latest, cancel rest
+//           const sorted = sortByOrderId(group);
+//           const latest = sorted[0];
+//           const toCancel = sorted.slice(1);
+
+//           await updateOrderStatus(latest, "Confirmed");
+//           console.log(`Confirmed latest order: ${latest.id}`);
+
+//           await cancelOrdersOnShopify(toCancel, accountId);
+//         }
+//       } catch (error) {
+//         console.error(`Error processing good address group:`, error);
+//       }
+//     }
+//   } catch (error) {
+//     console.error("Error in processGoodAddressOrders:", error);
+//     throw error;
+//   }
+// }
+
+// // ============================================================================
+// // STEP 4: PROCESS BAD ADDRESS ORDERS
+// // ============================================================================
+// async function processBadAddressOrders(
+//   orders: QueryDocumentSnapshot[],
+//   accountId: string
+// ): Promise<void> {
+//   if (orders.length === 0) return;
+
+//   console.log(`Processing ${orders.length} bad address orders for account ${accountId}`);
+
+//   try {
+//     const groups = groupOrdersByVariantId(orders);
+//     console.log(`Bad address: Created ${groups.length} groups`);
+
+//     for (const group of groups) {
+//       try {
+//         if (group.length === 1) {
+//           // Single order: Add L3 tag
+//           await addTagToOrder(group[0], "L3");
+//           console.log(`Added L3 tag to order: ${group[0].id}`);
+//         } else {
+//           // Multiple orders: Add L1 to latest, cancel rest
+//           const sorted = sortByOrderId(group);
+//           const latest = sorted[0];
+//           const toCancel = sorted.slice(1);
+
+//           await addTagToOrder(latest, "L1");
+//           console.log(`Added L1 tag to order: ${latest.id}`);
+
+//           await cancelOrdersOnShopify(toCancel, accountId);
+//         }
+//       } catch (error) {
+//         console.error(`Error processing bad address group:`, error);
+//       }
+//     }
+//   } catch (error) {
+//     console.error("Error in processBadAddressOrders:", error);
+//     throw error;
+//   }
+// }
+
+// // ============================================================================
+// // UTILITY: GROUP BY CUSTOMER, THEN BY VARIANT_ID (UNION-FIND)
+// // ============================================================================
+// function groupOrdersByVariantId(orders: QueryDocumentSnapshot[]): QueryDocumentSnapshot[][] {
+//   if (orders.length === 0) return [];
+
+//   // STEP 1: Group orders by customer first
+//   const ordersByCustomer = new Map<string, QueryDocumentSnapshot[]>();
+
+//   orders.forEach((doc: QueryDocumentSnapshot) => {
+//     const data = doc.data() as OrderData;
+//     const customerId = getCustomerIdentifier(data);
+
+//     if (!ordersByCustomer.has(customerId)) {
+//       ordersByCustomer.set(customerId, []);
+//     }
+//     ordersByCustomer.get(customerId)!.push(doc);
+//   });
+
+//   console.log(`Found ${ordersByCustomer.size} unique customers in ${orders.length} orders`);
+
+//   // STEP 2: For each customer, group their orders by shared variants
+//   const allGroups: QueryDocumentSnapshot[][] = [];
+
+//   ordersByCustomer.forEach((customerOrders: QueryDocumentSnapshot[], customerId: string) => {
+//     if (customerOrders.length === 1) {
+//       // Single order for this customer - no grouping needed
+//       allGroups.push(customerOrders);
+//       return;
+//     }
+
+//     console.log(`Customer ${customerId} has ${customerOrders.length} orders - checking for duplicates`);
+
+//     // Group this customer's orders by variant_id
+//     const customerGroups = groupCustomerOrdersByVariants(customerOrders);
+//     allGroups.push(...customerGroups);
+//   });
+
+//   return allGroups;
+// }
+
+// // Helper function to group a single customer's orders by shared variants
+// function groupCustomerOrdersByVariants(orders: QueryDocumentSnapshot[]): QueryDocumentSnapshot[][] {
+//   if (orders.length === 0) return [];
+//   if (orders.length === 1) return [orders];
+
+//   const variantToIndices = new Map<string, number[]>();
+
+//   orders.forEach((doc: QueryDocumentSnapshot, idx: number) => {
+//     try {
+//       const data = doc.data() as OrderData;
+//       const lineItems = data.raw?.line_items || [];
+
+//       lineItems.forEach((item) => {
+//         const variantId = item.variant_id;
+//         if (variantId) {
+//           const key = String(variantId);
+//           if (!variantToIndices.has(key)) {
+//             variantToIndices.set(key, []);
+//           }
+//           variantToIndices.get(key)!.push(idx);
+//         }
+//       });
+//     } catch (error) {
+//       console.error(`Error processing line items for order ${doc.id}:`, error);
+//     }
+//   });
+
+//   // Union-Find to group orders with shared variants
+//   const parent = Array.from({ length: orders.length }, (_: any, i: number) => i);
+
+//   function find(x: number): number {
+//     if (parent[x] !== x) {
+//       parent[x] = find(parent[x]);
+//     }
+//     return parent[x];
+//   }
+
+//   function union(x: number, y: number): void {
+//     const rootX = find(x);
+//     const rootY = find(y);
+//     if (rootX !== rootY) {
+//       parent[rootY] = rootX;
+//     }
+//   }
+
+//   variantToIndices.forEach((indices: number[]) => {
+//     for (let i = 1; i < indices.length; i++) {
+//       union(indices[0], indices[i]);
+//     }
+//   });
+
+//   // Group by root
+//   const groups = new Map<number, QueryDocumentSnapshot[]>();
+//   orders.forEach((doc: QueryDocumentSnapshot, idx: number) => {
+//     const root = find(idx);
+//     if (!groups.has(root)) {
+//       groups.set(root, []);
+//     }
+//     groups.get(root)!.push(doc);
+//   });
+
+//   return Array.from(groups.values());
+// }
+
+// // ============================================================================
+// // UTILITY: SORT BY ORDER ID (LATEST FIRST)
+// // ============================================================================
+// function sortByOrderId(orders: QueryDocumentSnapshot[]): QueryDocumentSnapshot[] {
+//   return [...orders].sort((a: QueryDocumentSnapshot, b: QueryDocumentSnapshot) => {
+//     try {
+//       const aId = (a.data() as OrderData).raw.id;
+//       const bId = (b.data() as OrderData).raw.id;
+//       return Number(bId) - Number(aId); // Descending (latest first)
+//     } catch (error) {
+//       console.error("Error sorting orders:", error);
+//       return 0;
+//     }
+//   });
+// }
+
+// // ============================================================================
+// // UTILITY: UPDATE ORDER STATUS
+// // ============================================================================
+// async function updateOrderStatus(
+//   doc: QueryDocumentSnapshot,
+//   newStatus: string
+// ): Promise<void> {
+//   try {
+//     await doc.ref.update({
+//       customStatus: newStatus,
+//       lastStatusUpdate: FieldValue.serverTimestamp(),
+//       customStatusesLogs: FieldValue.arrayUnion({
+//         status: newStatus,
+//         createdAt: Timestamp.now(),
+//         remarks: `Status changed to ${newStatus} by automated grouping`,
+//       }),
+//     });
+//   } catch (error) {
+//     console.error(`Failed to update status for order ${doc.id}:`, error);
+//     throw error;
+//   }
+// }
+
+// // ============================================================================
+// // UTILITY: ADD TAG TO ORDER
+// // ============================================================================
+// async function addTagToOrder(
+//   doc: QueryDocumentSnapshot,
+//   tag: string
+// ): Promise<void> {
+//   try {
+//     const data = doc.data() as OrderData;
+//     const existingTags = data.tags_new || [];
+
+//     if (!existingTags.includes(tag)) {
+//       await doc.ref.update({
+//         tags_new: FieldValue.arrayUnion(tag),
+//         lastTagUpdate: FieldValue.serverTimestamp(),
+//       });
+//     }
+//   } catch (error) {
+//     console.error(`Failed to add tag to order ${doc.id}:`, error);
+//     throw error;
+//   }
+// }
+
+// // ============================================================================
+// // UTILITY: CANCEL ORDERS ON SHOPIFY
+// // ============================================================================
+// async function cancelOrdersOnShopify(
+//   orders: QueryDocumentSnapshot[],
+//   accountId: string
+// ): Promise<void> {
+//   if (orders.length === 0) return;
+
+//   console.log(`Cancelling ${orders.length} orders on Shopify`);
+
+//   try {
+//     // Get account credentials once for all orders
+//     const accountDoc = await db.collection("accounts").doc(accountId).get();
+
+//     if (!accountDoc.exists) {
+//       throw new Error(`Account ${accountId} not found`);
+//     }
+
+//     const accountData = accountDoc.data();
+//     const accessToken = accountData?.accessToken;
+//     const shop = accountId; // The accountId is typically the shop domain
+
+//     if (!accessToken || !shop) {
+//       throw new Error(`Shopify not configured for account ${accountId}`);
+//     }
+
+//     // Cancel each order
+//     for (const doc of orders) {
+//       try {
+//         const data = doc.data() as OrderData;
+//         const shopifyOrderId = data.raw.id;
+
+//         // Cancel order via Shopify API using fetch
+//         const response = await fetch(
+//           `https://${shop}/admin/api/2024-10/orders/${shopifyOrderId}/cancel.json`,
+//           {
+//             method: 'POST',
+//             headers: {
+//               'X-Shopify-Access-Token': accessToken,
+//               'Content-Type': 'application/json',
+//             },
+//             body: JSON.stringify({
+//               reason: 'fraud',
+//               email: false,
+//               refund: false,
+//             }),
+//           }
+//         );
+
+//         if (!response.ok) {
+//           const errorText = await response.text();
+//           throw new Error(`Shopify API error ${response.status}: ${errorText}`);
+//         }
+
+//         // Update Firestore
+//         await doc.ref.update({
+//           customStatus: "Cancelled",
+//           cancelledAt: FieldValue.serverTimestamp(),
+//           cancelReason: "Duplicate order - automated cancellation",
+//           lastStatusUpdate: FieldValue.serverTimestamp(),
+//           customStatusesLogs: FieldValue.arrayUnion({
+//             status: "Cancelled",
+//             createdAt: Timestamp.now(),
+//             remarks: "Duplicate order - automated cancellation",
+//           }),
+//         });
+
+//         console.log(`Cancelled order ${doc.id} (Shopify ID: ${shopifyOrderId})`);
+//       } catch (error) {
+//         console.error(`Failed to cancel order ${doc.id}:`, error);
+//         // Continue with other orders even if one fails
+//       }
+//     }
+//   } catch (error) {
+//     console.error(`Error getting account credentials for ${accountId}:`, error);
+//     throw error;
+//   }
+// }
