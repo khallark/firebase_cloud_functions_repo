@@ -3263,7 +3263,7 @@ export const closeDeliveredOrdersJob = onSchedule(
             customStatusesLogs: FieldValue.arrayUnion({
               status: "Closed",
               createdAt: Timestamp.now(),
-              remarks: "This order Closed after approximately 144 hrs of being Delivered.",
+              remarks: "This order Closed after approximately 15 days of being Delivered.",
             }),
           });
         });
