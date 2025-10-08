@@ -6,10 +6,17 @@ import fetch from "node-fetch";
 import { db, FieldValue } from "./firebaseAdmin";
 import { createTask } from "./cloudTasks";
 import { allocateAwb, releaseAwb } from "./awb";
-import { buildDelhiveryPayload, buildShiprocketPayload } from "./buildPayload";
+import {
+  buildDelhiveryPayload,
+  buildDelhiveryReturnPayload,
+  buildShiprocketPayload,
+} from "./buildPayload";
 import { defineSecret } from "firebase-functions/params";
 import { setGlobalOptions } from "firebase-functions/options";
-import { DocumentReference, Timestamp } from "firebase-admin/firestore";
+import { DocumentReference, Timestamp, Transaction } from "firebase-admin/firestore";
+import { genkit } from 'genkit';
+import vertexAI from "@genkit-ai/vertexai";
+import { QueryDocumentSnapshot } from "firebase-functions/firestore";
 
 setGlobalOptions({ region: process.env.LOCATION || "asia-south1" });
 
@@ -31,7 +38,7 @@ function capitalizeWords(sentence: string): string {
 }
 
 async function maybeCompleteBatch(batchRef: DocumentReference): Promise<void> {
-  await db.runTransaction(async (tx) => {
+  await db.runTransaction(async (tx: Transaction) => {
     const b = await tx.get(batchRef);
     const d = b.data() || {};
     const total = Number(d.total || 0);
@@ -71,11 +78,18 @@ async function handleJobFailure(params: {
   // Check if this is a Priority job
   const isPriority = batchData.courier === "Priority";
 
+  // Check if this is an insufficient balance error - should not trigger fallback
+  const isInsufficientBalance = errorCode === "INSUFFICIENT_BALANCE";
+
   // Priority fallback conditions:
   // 1. It's a Priority job
   // 2. Either attempts exhausted OR non-retryable error
   // 3. Has fallback handler URL configured
-  const shouldAttemptFallback = isPriority && (attemptsExhausted || !isRetryable);
+  // 4. NOT an insufficient balance error (added condition)
+  const shouldAttemptFallback =
+    isPriority &&
+    (attemptsExhausted || !isRetryable) &&
+    !isInsufficientBalance;
   const fallbackUrl = process.env.PRIORITY_FALLBACK_HANDLER_URL;
 
   if (shouldAttemptFallback && fallbackUrl) {
@@ -87,6 +101,11 @@ async function handleJobFailure(params: {
         lastErrorMessage: errorMessage.slice(0, 400),
         lastFailedAt: FieldValue.serverTimestamp(),
         ...(apiResp && { lastApiResp: apiResp }),
+      });
+
+      // **FIX: Decrement processing counter when moving to fallback**
+      await batchRef.update({
+        processing: FieldValue.increment(-1),
       });
 
       // Queue fallback handler task
@@ -115,7 +134,7 @@ async function handleJobFailure(params: {
     }
   }
 
-  // Normal failure handling (non-Priority or fallback failed)
+  // Normal failure handling (non-Priority or fallback failed or insufficient balance)
   const updateData: any = {
     status: isRetryable ? (attemptsExhausted ? "failed" : "retrying") : "failed",
     errorCode: isRetryable ? "EXCEPTION" : errorCode,
@@ -343,7 +362,6 @@ export const handlePriorityFallback = onRequest(
             finalFailedAt: FieldValue.serverTimestamp(),
           }),
           batchRef.update({
-            processing: FieldValue.increment(-1),
             failed: FieldValue.increment(1),
           }),
         ]);
@@ -369,7 +387,6 @@ export const handlePriorityFallback = onRequest(
             finalFailedAt: FieldValue.serverTimestamp(),
           }),
           batchRef.update({
-            processing: FieldValue.increment(-1),
             failed: FieldValue.increment(1),
           }),
         ]);
@@ -398,7 +415,6 @@ export const handlePriorityFallback = onRequest(
             finalFailedAt: FieldValue.serverTimestamp(),
           }),
           batchRef.update({
-            processing: FieldValue.increment(-1),
             failed: FieldValue.increment(1),
           }),
         ]);
@@ -557,6 +573,37 @@ export const processShipmentTask = onRequest(
         };
       }
 
+      // Check for insufficient balance error
+      const lowerRemarks = remarks.toLowerCase();
+      const lowerError = String(carrier?.error || carrier?.message || "").toLowerCase();
+      const combinedText = `${lowerRemarks} ${lowerError}`;
+
+      const balanceKeywords = [
+        "insufficient",
+        "wallet",
+        "balance",
+        "insufficient balance",
+        "low balance",
+        "wallet balance",
+        "insufficient wallet",
+        "insufficient fund",
+        "recharge",
+        "add balance",
+        "balance low",
+        "no balance"
+      ];
+
+      const isBalanceError = balanceKeywords.some(keyword => combinedText.includes(keyword));
+
+      if (isBalanceError) {
+        return {
+          ok: false,
+          retryable: false,
+          code: "INSUFFICIENT_BALANCE",
+          message: remarks || "Insufficient balance in carrier account",
+        };
+      }
+
       // ----- Known permanent validation/business errors (non-retryable) -----
       return {
         ok: false,
@@ -607,7 +654,7 @@ export const processShipmentTask = onRequest(
       const jSnap = await jobRef.get();
       if (jSnap.exists && jSnap.data()?.status === "success") {
         // Fix any inconsistent batch counters
-        await db.runTransaction(async (tx) => {
+        await db.runTransaction(async (tx: Transaction) => {
           const b = await tx.get(batchRef);
           const d = b.data() || {};
 
@@ -626,7 +673,7 @@ export const processShipmentTask = onRequest(
       }
 
       // --- Start bookkeeping (transaction) -----------------------------------
-      await db.runTransaction(async (tx) => {
+      await db.runTransaction(async (tx: Transaction) => {
         const snap = await tx.get(jobRef);
         const data = snap.data() || {};
         const prevAttempts = Number(data.attempts || 0);
@@ -943,6 +990,37 @@ export const processShipmentTask2 = onRequest(
         };
       }
 
+      // Check for insufficient balance error
+      const lowerMsg = rawMsg.toLowerCase();
+
+      const balanceKeywords = [
+        "insufficient",
+        "balance",
+        "wallet",
+        "insufficient balance",
+        "low balance",
+        "wallet balance",
+        "insufficient wallet",
+        "insufficient fund",
+        "recharge",
+        "add balance",
+        "balance low",
+        "no balance",
+        "wallet amount",
+        "credit limit"
+      ];
+
+      const isBalanceError = balanceKeywords.some(keyword => lowerMsg.includes(keyword));
+
+      if (isBalanceError) {
+        return {
+          ok: false,
+          retryable: false,
+          code: "INSUFFICIENT_BALANCE",
+          message: rawMsg || "Insufficient balance in carrier account",
+        };
+      }
+
       // ----- Known permanent validation/business errors (non-retryable) -----
       return {
         ok: false,
@@ -1045,7 +1123,7 @@ export const processShipmentTask2 = onRequest(
       const jSnap = await jobRef.get();
       if (jSnap.exists && jSnap.data()?.status === "success") {
         // Ensure batch counters are consistent on retry
-        await db.runTransaction(async (tx) => {
+        await db.runTransaction(async (tx: Transaction) => {
           const b = await tx.get(batchRef);
           const d = b.data() || {};
 
@@ -1063,7 +1141,7 @@ export const processShipmentTask2 = onRequest(
       }
 
       // --- Start bookkeeping (transaction) -----------------------------------
-      await db.runTransaction(async (tx) => {
+      await db.runTransaction(async (tx: Transaction) => {
         const snap = await tx.get(jobRef);
         const data = snap.data() || {};
         const prevAttempts = Number(data.attempts || 0);
@@ -1475,6 +1553,626 @@ export const processShipmentTask2 = onRequest(
   },
 );
 
+// ============================================================================
+// RETURN SHIPMENT ERROR HANDLER (No Priority Fallback)
+// ============================================================================
+
+async function handleReturnJobFailure(params: {
+  shop: string;
+  batchRef: DocumentReference;
+  jobRef: DocumentReference;
+  jobId: string;
+  errorCode: string;
+  errorMessage: string;
+  isRetryable: boolean;
+  apiResp?: any;
+}): Promise<{ shouldReturnFailure: boolean; statusCode: number; reason: string }> {
+  const { batchRef, jobRef, errorCode, errorMessage, isRetryable, apiResp } = params;
+
+  const jobSnap = await jobRef.get();
+  const jobData = jobSnap.data() || {};
+
+  const attempts = Number(jobData.attempts || 0);
+  const maxAttempts = Number(process.env.RETURN_SHIPMENT_QUEUE_MAX_ATTEMPTS || 3);
+  const attemptsExhausted = attempts >= maxAttempts;
+
+  const updateData: any = {
+    status: isRetryable ? (attemptsExhausted ? "failed" : "retrying") : "failed",
+    errorCode: isRetryable ? "EXCEPTION" : errorCode,
+    errorMessage: errorMessage.slice(0, 400),
+  };
+
+  if (apiResp) {
+    updateData.apiResp = apiResp;
+  }
+
+  await Promise.all([
+    jobRef.set(updateData, { merge: true }),
+    batchRef.update(
+      isRetryable && !attemptsExhausted
+        ? { processing: FieldValue.increment(-1) }
+        : { processing: FieldValue.increment(-1), failed: FieldValue.increment(1) },
+    ),
+  ]);
+
+  if (!isRetryable || attemptsExhausted) {
+    await maybeCompleteBatch(batchRef);
+  }
+
+  return {
+    shouldReturnFailure: true,
+    statusCode: isRetryable && !attemptsExhausted ? 503 : 200,
+    reason: isRetryable ? "retryable_error" : "permanent_error",
+  };
+}
+
+/** Called by Vercel API to enqueue return shipment Cloud Tasks (one per jobId) */
+export const enqueueReturnShipmentTasks = onRequest(
+  { cors: true, timeoutSeconds: 60, secrets: [ENQUEUE_FUNCTION_SECRET, TASKS_SECRET] },
+  async (req: Request, res: Response): Promise<void> => {
+    try {
+      requireHeaderSecret(req, "x-api-key", ENQUEUE_FUNCTION_SECRET.value() || "");
+
+      if (req.method !== "POST") {
+        res.status(405).json({ error: "method_not_allowed" });
+        return;
+      }
+
+      const { shop, orderIds, pickupName, shippingMode, requestedBy } = (req.body || {}) as {
+        shop?: string;
+        orderIds?: string[];
+        pickupName?: string;
+        shippingMode?: string;
+        requestedBy?: string;
+      };
+
+      if (!shop || !pickupName || !shippingMode || !Array.isArray(orderIds) || orderIds.length === 0) {
+        res.status(400).json({ error: "bad_payload" });
+        return;
+      }
+
+      const shopDoc = (await db.collection("accounts").doc(shop).get()).data();
+      if (!shopDoc) {
+        res.status(400).json({ error: "shop_not_found" });
+        return;
+      }
+
+      // Validate orders
+      const orderRefs = orderIds.map((o) =>
+        db.collection("accounts").doc(shop).collection("orders").doc(String(o)),
+      );
+
+      const orderSnapshots = await db.getAll(...orderRefs);
+      const orderDataMap = new Map<string, any>();
+
+      for (let i = 0; i < orderSnapshots.length; i++) {
+        const snap = orderSnapshots[i];
+        if (!snap.exists) {
+          res.status(400).json({
+            error: "order_not_found",
+            orderId: orderIds[i],
+          });
+          return;
+        }
+
+        const orderData = snap.data()!;
+
+        // Validate courier exists
+        if (!orderData.courier) {
+          res.status(400).json({
+            error: "order_missing_courier",
+            orderId: orderIds[i],
+            message: "Cannot create return for order without courier",
+          });
+          return;
+        }
+
+        // Validate customStatus is either "Delivered" or "DTO Requested"
+        const status = orderData.customStatus;
+        if (status !== "Delivered" && status !== "DTO Requested") {
+          res.status(400).json({
+            error: "invalid_order_status",
+            orderId: orderIds[i],
+            currentStatus: status,
+            message: 'Order status must be "Delivered" or "DTO Requested" to create return',
+          });
+          return;
+        }
+
+        orderDataMap.set(String(orderIds[i]), orderData);
+      }
+
+      // Create batch header
+      const batchRef = db.collection("accounts").doc(shop).collection("book_return_batches").doc();
+
+      await batchRef.set({
+        shop,
+        pickupName,
+        shippingMode,
+        createdAt: FieldValue.serverTimestamp(),
+        createdBy: requestedBy,
+        total: orderIds.length,
+        queued: orderIds.length,
+        status: "queued",
+        processing: 0,
+        success: 0,
+        failed: 0,
+      });
+
+      // Create job docs with courier info
+      const writer = db.bulkWriter();
+      const taskPromises: Promise<any>[] = [];
+
+      for (const o of orderIds) {
+        const orderData = orderDataMap.get(String(o))!;
+        const courier = orderData.courier;
+
+        const normalizedCourier = courier.split(":")[0].trim();
+
+        // Map courier to return booking URL
+        let taskUrl: string;
+        try {
+          if (normalizedCourier === "Delhivery") {
+            taskUrl = String(process.env.RETURN_TASK_TARGET_URL_1);
+          } else if (normalizedCourier === "Shiprocket") {
+            taskUrl = String(process.env.RETURN_TASK_TARGET_URL_2);
+          } else {
+            throw new Error(`Unsupported courier for returns: ${normalizedCourier}`);
+          }
+        } catch (urlError) {
+          console.error(
+            `Failed to map courier ${normalizedCourier} for order ${o}:`,
+            urlError,
+          );
+
+          writer.set(
+            batchRef.collection("jobs").doc(String(o)),
+            {
+              orderId: String(o),
+              orderName: orderData.name,
+              courier: normalizedCourier,
+              status: "failed",
+              errorCode: "UNSUPPORTED_COURIER",
+              errorMessage: `Courier ${normalizedCourier} is not supported for returns`,
+              attempts: 0,
+            },
+            { merge: true },
+          );
+
+          continue;
+        }
+
+        // Create job document
+        writer.set(
+          batchRef.collection("jobs").doc(String(o)),
+          {
+            orderId: String(o),
+            orderName: orderData.name,
+            courier: normalizedCourier,
+            status: "queued",
+            attempts: 0,
+          },
+          { merge: true },
+        );
+
+        // Queue Cloud Task (NO variantIds in payload)
+        taskPromises.push(
+          createTask(
+            {
+              shop,
+              batchId: batchRef.id,
+              jobId: String(o),
+              pickupName,
+              shippingMode,
+            } as any,
+            {
+              tasksSecret: TASKS_SECRET.value() || "",
+              url: taskUrl,
+              queue: String(process.env.RETURN_SHIPMENT_QUEUE_NAME) || "return-shipments-queue",
+            },
+          ).catch((taskError) => {
+            console.error(`Failed to create task for order ${o}:`, taskError);
+            return batchRef
+              .collection("jobs")
+              .doc(String(o))
+              .update({
+                status: "failed",
+                errorCode: "TASK_CREATION_FAILED",
+                errorMessage: taskError.message || String(taskError),
+              });
+          }),
+        );
+      }
+
+      await writer.close();
+      await Promise.allSettled(taskPromises);
+
+      // Recalculate batch counters
+      const jobsSnap = await batchRef.collection("jobs").get();
+      let queuedCount = 0;
+      let failedCount = 0;
+
+      jobsSnap.forEach((jobDoc: QueryDocumentSnapshot) => {
+        const jobData = jobDoc.data();
+        if (jobData.status === "queued") {
+          queuedCount++;
+        } else if (jobData.status === "failed") {
+          failedCount++;
+        }
+      });
+
+      await batchRef.update({
+        status:
+          queuedCount > 0 ? "running" : failedCount === orderIds.length ? "completed" : "running",
+        queued: queuedCount,
+        failed: failedCount,
+      });
+
+      res.status(202).json({
+        collectionName: "book_return_batches",
+        batchId: batchRef.id,
+        queued: queuedCount,
+        failed: failedCount,
+      });
+      return;
+    } catch (e: any) {
+      console.error("enqueue return error:", e);
+      res.status(500).json({
+        error: "start_return_batch_failed",
+        details: String(e?.message ?? e),
+      });
+      return;
+    }
+  },
+);
+
+// ============================================================================
+// RETURN SHIPMENT TASK PROCESSOR (DELHIVERY)
+// ============================================================================
+
+// Non-retryable error codes for returns
+const RETURN_NON_RETRYABLE = new Set([
+  "CARRIER_KEY_MISSING",
+  "ORDER_NOT_FOUND",
+  "NO_ITEMS_MATCH_RETURN_VARIANT_IDS",
+  "NO_LINE_ITEMS_IN_ORDER",
+  "NO_AWB_AVAILABLE",
+  "INVALID_ORDER_STATUS",
+]);
+
+/** Cloud Tasks → processes exactly ONE return shipment job (Delhivery) */
+export const processReturnShipmentTask = onRequest(
+  { cors: true, timeoutSeconds: 60, secrets: [TASKS_SECRET] },
+  async (req: Request, res: Response): Promise<void> => {
+    let awb: string | undefined;
+    let awbReleased = false;
+
+    // --- helpers -------------------------------------------------------------
+    const parseJson = (t: string) => {
+      try {
+        return JSON.parse(t);
+      } catch {
+        return { raw: t };
+      }
+    };
+
+    /** Classify Delhivery return response */
+    function evalDelhiveryReturnResp(carrier: any): {
+      ok: boolean;
+      retryable: boolean;
+      code: string;
+      message: string;
+      carrierShipmentId?: string | null;
+    } {
+      const remarksArr = carrier.packages?.[0]?.remarks;
+      let remarks = "";
+      if (Array.isArray(remarksArr)) remarks = remarksArr.join("\n ");
+
+      const okFlag = carrier?.success === true && carrier?.error !== true;
+
+      if (okFlag) {
+        return {
+          ok: true,
+          retryable: false,
+          code: "OK",
+          message: "return created",
+          carrierShipmentId: null,
+        };
+      }
+
+      // Known permanent validation/business errors (non-retryable)
+      return {
+        ok: false,
+        retryable: false,
+        code: "CARRIER_AMBIGUOUS",
+        message: remarks || "Unknown carrier error",
+      };
+    }
+
+    /** Decide if an HTTP failure status is retryable */
+    function httpRetryable(status: number) {
+      if (status === 429 || status === 408 || status === 409 || status === 425) return true;
+      if (status >= 500) return true;
+      return false;
+    }
+
+    // -------------------------------------------------------------------------
+
+    try {
+      requireHeaderSecret(req, "x-tasks-secret", TASKS_SECRET.value() || "");
+      if (req.method !== "POST") {
+        res.status(405).json({ error: "method_not_allowed" });
+        return;
+      }
+
+      const { shop, batchId, jobId, pickupName, shippingMode } = (req.body || {}) as {
+        shop?: string;
+        batchId?: string;
+        jobId?: string;
+        pickupName?: string;
+        shippingMode?: string;
+      };
+
+      if (!shop || !batchId || !jobId || !pickupName) {
+        res.status(400).json({ error: "bad_payload" });
+        return;
+      }
+
+      const batchRef = db
+        .collection("accounts")
+        .doc(shop)
+        .collection("book_return_batches")
+        .doc(batchId);
+      const jobRef = batchRef.collection("jobs").doc(String(jobId));
+      const orderRef = db.collection("accounts").doc(shop).collection("orders").doc(String(jobId));
+      const accountRef = db.collection("accounts").doc(shop);
+
+      // Idempotency: if already success, just ack
+      const jSnap = await jobRef.get();
+      if (jSnap.exists && jSnap.data()?.status === "success") {
+        // Fix any inconsistent batch counters
+        await db.runTransaction(async (tx: Transaction) => {
+          const b = await tx.get(batchRef);
+          const d = b.data() || {};
+
+          if ((d.processing || 0) > 0) {
+            tx.update(batchRef, {
+              processing: FieldValue.increment(-1),
+            });
+          }
+        });
+
+        await maybeCompleteBatch(batchRef);
+
+        res.json({ ok: true, dedup: true });
+        return;
+      }
+
+      // --- Start bookkeeping (transaction) -----------------------------------
+      await db.runTransaction(async (tx: Transaction) => {
+        const snap = await tx.get(jobRef);
+        const data = snap.data() || {};
+        const prevAttempts = Number(data.attempts || 0);
+        const firstAttempt = prevAttempts === 0 || !data.status || data.status === "queued";
+
+        tx.set(
+          jobRef,
+          {
+            status: "processing",
+            attempts: (prevAttempts || 0) + 1,
+            lastAttemptAt: new Date(),
+          },
+          { merge: true },
+        );
+
+        const inc: any = { processing: FieldValue.increment(1) };
+        if (firstAttempt) inc.queued = FieldValue.increment(-1);
+        tx.update(batchRef, inc);
+      });
+
+      // Allocate AWB
+      awb = await allocateAwb(shop);
+
+      // Load order
+      const ordSnap = await orderRef.get();
+      if (!ordSnap.exists) throw new Error("ORDER_NOT_FOUND");
+      const order = ordSnap.data();
+
+      // ✅ Validate order status before processing
+      const status = order?.customStatus;
+      if (status !== "Delivered" && status !== "DTO Requested") {
+        throw new Error("INVALID_ORDER_STATUS");
+      }
+
+      // Build payload for Delhivery return
+      const payload = buildDelhiveryReturnPayload({
+        orderId: String(jobId),
+        awb,
+        order,
+        pickupName,
+        shippingMode,
+      });
+
+      // Carrier API key
+      const accSnap = await accountRef.get();
+      const apiKey = accSnap.data()?.integrations?.couriers?.delhivery?.apiKey as
+        | string
+        | undefined;
+      if (!apiKey) throw new Error("CARRIER_KEY_MISSING");
+
+      // Call Delhivery
+      const base = "https://track.delhivery.com";
+      const path = "/api/cmu/create.json";
+      const body = new URLSearchParams({ format: "json", data: JSON.stringify(payload) });
+      const resp = await fetch(`${base}${path}`, {
+        method: "POST",
+        headers: {
+          Authorization: `Token ${apiKey}`,
+          Accept: "application/json",
+          "Content-Type": "application/x-www-form-urlencoded",
+        },
+        body,
+      });
+
+      const text = await resp.text();
+
+      // Handle HTTP layer errors (non-2xx)
+      if (!resp.ok) {
+        if (awb && !awbReleased) {
+          try {
+            await releaseAwb(shop, awb);
+            awbReleased = true;
+          } catch (e) {
+            console.error("Failed to release AWB:", e);
+          }
+        }
+
+        const failure = await handleReturnJobFailure({
+          shop,
+          batchRef,
+          jobRef,
+          jobId,
+          errorCode: `HTTP_${resp.status}`,
+          errorMessage: text,
+          isRetryable: httpRetryable(resp.status),
+        });
+
+        res.status(failure.statusCode).json({
+          ok: false,
+          reason: failure.reason,
+          code: `HTTP_${resp.status}`,
+        });
+        return;
+      }
+
+      // Parse and evaluate carrier JSON
+      const carrier = parseJson(text);
+      const verdict = evalDelhiveryReturnResp(carrier);
+
+      if (!verdict.ok) {
+        if (awb && !awbReleased) {
+          try {
+            await releaseAwb(shop, awb);
+            awbReleased = true;
+          } catch (e) {
+            console.error("Failed to release AWB:", e);
+          }
+        }
+
+        const failure = await handleReturnJobFailure({
+          shop,
+          batchRef,
+          jobRef,
+          jobId,
+          errorCode: verdict.code,
+          errorMessage: verdict.message,
+          isRetryable: verdict.retryable,
+          apiResp: carrier,
+        });
+
+        res.status(failure.statusCode).json({
+          ok: false,
+          reason: failure.reason,
+          code: verdict.code,
+        });
+        return;
+      }
+
+      // --- Success path ------------------------------------------------------
+      awbReleased = true; // guard: DO NOT release a used AWB
+
+      await Promise.all([
+        jobRef.update({
+          status: "success",
+          awb,
+          errorCode: FieldValue.delete(),
+          errorMessage: FieldValue.delete(),
+          apiResp: carrier,
+          completedAt: FieldValue.serverTimestamp(),
+        }),
+        batchRef.update({
+          processing: FieldValue.increment(-1),
+          success: FieldValue.increment(1),
+        }),
+        orderRef.set(
+          {
+            awb_reverse: awb,
+            customStatus: "DTO Booked",
+            customStatusesLogs: FieldValue.arrayUnion({
+              status: "DTO Booked",
+              createdAt: Timestamp.now(),
+              remarks: `Return shipment was successfully booked on Delhivery (AWB: ${awb})`,
+            }),
+          },
+          { merge: true },
+        ),
+      ]);
+
+      await maybeCompleteBatch(batchRef);
+
+      res.json({ ok: true, awb });
+      return;
+    } catch (e: any) {
+      // Generic failure (network/bug/etc.)
+      const msg = e instanceof Error ? e.message : String(e);
+      const code = msg.split(/\s/)[0];
+      const isRetryable = !RETURN_NON_RETRYABLE.has(code);
+
+      try {
+        const { shop, batchId, jobId } = (req.body || {}) as {
+          shop?: string;
+          batchId?: string;
+          jobId?: string;
+        };
+
+        if (shop && batchId && jobId) {
+          if (awb && !awbReleased) {
+            try {
+              await releaseAwb(shop, awb);
+              awbReleased = true;
+            } catch (e) {
+              console.error("Failed to release AWB:", e);
+            }
+          }
+
+          const batchRef = db
+            .collection("accounts")
+            .doc(shop)
+            .collection("book_return_batches")
+            .doc(batchId);
+          const jobRef = batchRef.collection("jobs").doc(String(jobId));
+
+          const failure = await handleReturnJobFailure({
+            shop,
+            batchRef,
+            jobRef,
+            jobId,
+            errorCode: code,
+            errorMessage: msg,
+            isRetryable,
+          });
+
+          res.status(failure.statusCode).json({
+            error: isRetryable ? "job_failed_transient" : "job_failed_permanent",
+            code,
+            message: msg,
+          });
+          return;
+        }
+      } catch (handlerError) {
+        console.error("Error in failure handler:", handlerError);
+      }
+
+      // Fallback if we couldn't use the handler
+      if (isRetryable) {
+        res.status(503).json({ error: "job_failed_transient", code, message: msg });
+      } else {
+        res.status(200).json({ ok: false, permanent: true, reason: code, message: msg });
+      }
+    }
+  },
+);
+
 /** Vercel → starts a fulfillment batch and enqueues one task per orderId */
 export const enqueueOrdersFulfillmentTasks = onRequest(
   { cors: true, timeoutSeconds: 60, secrets: [ENQUEUE_FUNCTION_SECRET, TASKS_SECRET] },
@@ -1868,7 +2566,7 @@ export const processFulfillmentTask = onRequest(
 );
 
 async function maybeCompleteSummary(summaryRef: DocumentReference) {
-  await db.runTransaction(async (tx) => {
+  await db.runTransaction(async (tx: Transaction) => {
     const snap = await tx.get(summaryRef);
     if (!snap.exists) return;
     const d = snap.data() as any;
@@ -2111,7 +2809,7 @@ export const updateDelhiveryStatusesJob = onRequest(
           throw new Error("NO_VALID_USERS_FOR_ACCOUNT");
         }
 
-        await db.runTransaction(async (tx) => {
+        await db.runTransaction(async (tx: Transaction) => {
           const snap = await tx.get(jobRef);
           const data = snap.data() || {};
           const prevAttempts = Number(data.attempts || 0);
@@ -2265,7 +2963,7 @@ async function processOrderChunk(
   }
 
   const eligibleOrders = snapshot.docs
-    .map((doc) => ({ id: doc.id, ref: doc.ref, ...doc.data() }))
+    .map((doc: QueryDocumentSnapshot) => ({ id: doc.id, ref: doc.ref, ...doc.data() }))
     .filter(
       (order: any) => order.awb && order.customStatus && !excludedStatuses.has(order.customStatus),
     );
@@ -2515,7 +3213,7 @@ export const closeDeliveredOrdersJob = onSchedule(
         }
 
         const batch = db.batch();
-        ordersToClose.docs.forEach((doc) => {
+        ordersToClose.docs.forEach((doc: QueryDocumentSnapshot) => {
           batch.update(doc.ref, {
             customStatus: "Closed",
             lastStatusUpdate: FieldValue.serverTimestamp(),
@@ -2678,7 +3376,7 @@ export const processManualUpdateChunk = onRequest(
       }
 
       // Increment attempts on every execution (using transaction for safety)
-      await db.runTransaction(async (tx) => {
+      await db.runTransaction(async (tx: Transaction) => {
         const snap = await tx.get(jobRef);
         const data = snap.data() || {};
         const prevAttempts = Number(data.attempts || 0);
