@@ -10,6 +10,7 @@ import {
   buildDelhiveryPayload,
   buildDelhiveryReturnPayload,
   buildShiprocketPayload,
+  buildXpressbeesPayload,
 } from "./buildPayload";
 import { defineSecret } from "firebase-functions/params";
 import { setGlobalOptions } from "firebase-functions/options";
@@ -210,6 +211,7 @@ export const enqueueShipmentTasks = onRequest(
       const url = (() => {
         if (courier === "Delhivery") return String(process.env.SHIPMENT_TASK_TARGET_URL_1);
         if (courier === "Shiprocket") return String(process.env.SHIPMENT_TASK_TARGET_URL_2);
+        if (courier === "Xpressbees") return String(process.env.SHIPMENT_TASK_TARGET_URL_3);
 
         if (courier === "Priority") {
           if (!priorityCourier) {
@@ -219,6 +221,8 @@ export const enqueueShipmentTasks = onRequest(
             return String(process.env.SHIPMENT_TASK_TARGET_URL_1);
           if (priorityCourier === "shiprocket")
             return String(process.env.SHIPMENT_TASK_TARGET_URL_2);
+          if (priorityCourier === "xpressbees")
+            return String(process.env.SHIPMENT_TASK_TARGET_URL_3);
           throw new Error(`Unsupported priority courier: ${priorityCourier}`);
         }
 
@@ -439,6 +443,9 @@ export const handlePriorityFallback = onRequest(
         }
         if (courierLower === "shiprocket") {
           return String(process.env.SHIPMENT_TASK_TARGET_URL_2);
+        }
+        if (courierLower === "xpressbees") {
+          return String(process.env.SHIPMENT_TASK_TARGET_URL_3);
         }
         throw new Error(`Unsupported fallback courier: ${courierLower}`);
       })();
@@ -1549,6 +1556,483 @@ export const processShipmentTask2 = onRequest(
             ? { error: "job_failed_transient", details: String(e?.message ?? e) }
             : { ok: false, permanent: true, reason: code },
         );
+    }
+  },
+);
+
+/** Cloud Tasks → processes exactly ONE Xpressbees shipment job */
+export const processShipmentTask3 = onRequest(
+  { cors: true, timeoutSeconds: 60, secrets: [TASKS_SECRET] },
+  async (req: Request, res: Response): Promise<void> => {
+    // --- helpers -------------------------------------------------------------
+    const parseJson = (t: string) => {
+      try {
+        return JSON.parse(t);
+      } catch {
+        return { raw: t };
+      }
+    };
+
+    /** Classify Xpressbees shipment response (handles both success and error) */
+    function evalXpressbeesResp(xb: any): {
+      ok: boolean;
+      retryable: boolean;
+      code: string;
+      message: string;
+      awbNumber?: string | null;
+      shipmentId?: string | number | null;
+      orderId?: string | number | null;
+      courierName?: string | null;
+    } {
+      // Success: { status: true, data: { ... } }
+      if (xb?.status === true && xb?.data) {
+        const data = xb.data;
+        return {
+          ok: true,
+          retryable: false,
+          code: "OK",
+          message: "created",
+          awbNumber: data?.awb_number ?? null,
+          shipmentId: data?.shipment_id ?? null,
+          orderId: data?.order_id ?? null,
+          courierName: data?.courier_name ?? null,
+        };
+      }
+
+      // Error: { status: false, message: "..." }
+      const errorMessage = xb?.message || "Unknown Xpressbees error";
+
+      // Check for insufficient balance error
+      const lowerMsg = String(errorMessage).toLowerCase();
+      const balanceKeywords = [
+        "insufficient",
+        "balance",
+        "wallet",
+        "recharge",
+        "add balance",
+        "low balance",
+      ];
+
+      const isBalanceError = balanceKeywords.some((keyword) => lowerMsg.includes(keyword));
+
+      if (isBalanceError) {
+        return {
+          ok: false,
+          retryable: false,
+          code: "INSUFFICIENT_BALANCE",
+          message: errorMessage,
+        };
+      }
+
+      // Other errors are non-retryable (validation errors, etc.)
+      return {
+        ok: false,
+        retryable: false,
+        code: "CARRIER_ERROR",
+        message: errorMessage,
+      };
+    }
+
+    /** Decide if an HTTP failure status is retryable */
+    function httpRetryable(status: number) {
+      if (status === 429 || status === 408 || status === 409 || status === 425) return true;
+      if (status >= 500) return true;
+      return false;
+    }
+
+    /**
+     * Fetch Xpressbees courier list and select appropriate courier based on mode and weight
+     */
+    async function selectCourier(
+      token: string,
+      shippingMode: string,
+      totalQuantity: number,
+    ): Promise<string> {
+      try {
+        const resp = await fetch("https://shipment.xpressbees.com/api/courier", {
+          headers: {
+            Authorization: `Bearer ${token}`,
+          },
+        });
+
+        if (!resp.ok) {
+          throw new Error(`Failed to fetch couriers: HTTP ${resp.status}`);
+        }
+
+        const result = (await resp.json()) as any;
+        if (!result?.status || !Array.isArray(result?.data)) {
+          throw new Error("Invalid courier list response");
+        }
+
+        const couriers = result.data as Array<{ id: string; name: string }>;
+
+        // For Express mode: Select "Air Xpressbees 0.5 K.G"
+        if (shippingMode === "Express") {
+          const airCourier = couriers.find((c) => c.name.toLowerCase().includes("air"));
+          if (airCourier) return airCourier.id;
+          throw new Error("No Air courier found for Express mode");
+        }
+
+        // For Surface mode: Calculate weight and select based on weight
+        const totalWeightGrams = totalQuantity * 250;
+        const totalWeightKg = totalWeightGrams / 1000;
+
+        // Extract weight from courier names and sort by weight
+        // Expected format: "Surface Xpressbees 0.5 K.G", "Xpressbees 1 K.G", etc.
+        const surfaceCouriers = couriers
+          .filter((c) => {
+            const nameLower = c.name.toLowerCase();
+            return (
+              (nameLower.includes("surface") || nameLower.includes("xpressbees")) &&
+              !nameLower.includes("air") &&
+              !nameLower.includes("express") &&
+              !nameLower.includes("reverse") &&
+              !nameLower.includes("same day") &&
+              !nameLower.includes("next day")
+            );
+          })
+          .map((c) => {
+            // Extract weight value from name (e.g., "0.5", "1", "2", "5", "10")
+            const weightMatch = c.name.match(/(\d+(?:\.\d+)?)\s*k\.?g/i);
+            const weight = weightMatch ? parseFloat(weightMatch[1]) : 0;
+            return { ...c, weight };
+          })
+          .filter((c) => c.weight > 0)
+          .sort((a, b) => a.weight - b.weight);
+
+        if (surfaceCouriers.length === 0) {
+          throw new Error("No Surface couriers found");
+        }
+
+        // Select the smallest courier that can handle the weight
+        // If weight exceeds all options, select the largest
+        let selectedCourier = surfaceCouriers[surfaceCouriers.length - 1]; // default to largest
+
+        for (const courier of surfaceCouriers) {
+          if (totalWeightKg <= courier.weight) {
+            selectedCourier = courier;
+            break;
+          }
+        }
+
+        return selectedCourier.id;
+      } catch (error) {
+        console.error("Courier selection error:", error);
+        throw new Error(
+          `COURIER_SELECTION_FAILED: ${error instanceof Error ? error.message : String(error)}`,
+        );
+      }
+    }
+
+    // -------------------------------------------------------------------------
+
+    try {
+      requireHeaderSecret(req, "x-tasks-secret", TASKS_SECRET.value() || "");
+      if (req.method !== "POST") {
+        res.status(405).json({ error: "method_not_allowed" });
+        return;
+      }
+
+      const { shop, batchId, jobId, pickupName, shippingMode } = (req.body || {}) as {
+        shop?: string;
+        batchId?: string;
+        jobId?: string;
+        pickupName?: string;
+        shippingMode?: string;
+      };
+
+      if (!shop || !batchId || !jobId || !pickupName || !shippingMode) {
+        res.status(400).json({ error: "bad_payload" });
+        return;
+      }
+
+      const batchRef = db
+        .collection("accounts")
+        .doc(shop)
+        .collection("shipment_batches")
+        .doc(batchId);
+      const jobRef = batchRef.collection("jobs").doc(String(jobId));
+      const orderRef = db.collection("accounts").doc(shop).collection("orders").doc(String(jobId));
+      const accountRef = db.collection("accounts").doc(shop);
+
+      // Idempotency: if already success, just ack
+      const jSnap = await jobRef.get();
+      if (jSnap.exists && jSnap.data()?.status === "success") {
+        await db.runTransaction(async (tx: Transaction) => {
+          const b = await tx.get(batchRef);
+          const d = b.data() || {};
+          if ((d.processing || 0) > 0) {
+            tx.update(batchRef, {
+              processing: FieldValue.increment(-1),
+            });
+          }
+        });
+
+        await maybeCompleteBatch(batchRef);
+        res.json({ ok: true, dedup: true });
+        return;
+      }
+
+      // --- Start bookkeeping (transaction) -----------------------------------
+      await db.runTransaction(async (tx: Transaction) => {
+        const snap = await tx.get(jobRef);
+        const data = snap.data() || {};
+        const prevAttempts = Number(data.attempts || 0);
+        const jobStatus = data.status;
+
+        const isFallbackAttempt =
+          jobStatus === "fallback_queued" || jobStatus === "attempting_fallback";
+        const firstAttempt =
+          (prevAttempts === 0 || jobStatus === "queued" || !jobStatus) && !isFallbackAttempt;
+
+        tx.set(
+          jobRef,
+          {
+            status: "processing",
+            attempts: (prevAttempts || 0) + 1,
+            lastAttemptAt: new Date(),
+          },
+          { merge: true },
+        );
+
+        const inc: any = { processing: FieldValue.increment(1) };
+        if (firstAttempt) inc.queued = FieldValue.increment(-1);
+        tx.update(batchRef, inc);
+      });
+
+      // Load order
+      const ordSnap = await orderRef.get();
+      if (!ordSnap.exists) throw new Error("ORDER_NOT_FOUND");
+      const order = ordSnap.data();
+
+      // Get Xpressbees API key
+      const accSnap = await accountRef.get();
+      const xpressbeesCfg = accSnap.data()?.integrations?.couriers?.xpressbees || {};
+      const apiKey = xpressbeesCfg?.apiKey || xpressbeesCfg?.token;
+
+      if (!apiKey) throw new Error("CARRIER_KEY_MISSING");
+
+      // Select courier based on mode and weight
+      const items =
+        (Array.isArray(order?.raw?.line_items) && order.raw.line_items) || order?.lineItems || [];
+
+      // Calculate total quantity (consider item quantities)
+      const totalQuantity = items.reduce((sum: number, item: any) => {
+        return sum + Number(item?.quantity ?? 1);
+      }, 0);
+
+      let courierId: string;
+      try {
+        courierId = await selectCourier(apiKey, shippingMode, totalQuantity);
+      } catch (error) {
+        const msg = error instanceof Error ? error.message : String(error);
+        const failure = await handleJobFailure({
+          shop,
+          batchRef,
+          jobRef,
+          jobId,
+          errorCode: "COURIER_SELECTION_FAILED",
+          errorMessage: msg,
+          isRetryable: false,
+        });
+
+        if (failure.shouldReturnFailure) {
+          res.status(failure.statusCode).json({
+            ok: false,
+            reason: failure.reason,
+            code: "COURIER_SELECTION_FAILED",
+          });
+        } else {
+          res.status(failure.statusCode).json({
+            ok: true,
+            action: failure.reason,
+          });
+        }
+        return;
+      }
+
+      // Build payload for Xpressbees
+      const payload = buildXpressbeesPayload({
+        orderId: String(jobId),
+        order,
+        pickupName,
+        shippingMode,
+        courierId,
+      });
+
+      // Call Xpressbees API
+      const base = "https://shipment.xpressbees.com";
+      const path = "/api/shipments2";
+
+      const resp = await fetch(`${base}${path}`, {
+        method: "POST",
+        headers: {
+          Authorization: `Bearer ${apiKey}`,
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify(payload),
+      });
+
+      const text = await resp.text();
+      const carrier = parseJson(text);
+
+      // Handle network/gateway errors (non-JSON responses with non-2xx status)
+      if (!resp.ok && !carrier?.status) {
+        // This is a network/gateway error (502, 503, etc.) - not a proper Xpressbees API response
+        const failure = await handleJobFailure({
+          shop,
+          batchRef,
+          jobRef,
+          jobId,
+          errorCode: `HTTP_${resp.status}`,
+          errorMessage: text.slice(0, 400) || `HTTP ${resp.status} error`,
+          isRetryable: httpRetryable(resp.status),
+        });
+
+        if (failure.shouldReturnFailure) {
+          res.status(failure.statusCode).json({
+            ok: false,
+            reason: failure.reason,
+            code: `HTTP_${resp.status}`,
+          });
+        } else {
+          res.status(failure.statusCode).json({
+            ok: true,
+            action: failure.reason,
+          });
+        }
+        return;
+      }
+
+      // Evaluate response (works for both success and error responses)
+      const verdict = evalXpressbeesResp(carrier);
+
+      // Handle API errors (proper Xpressbees error responses)
+      if (!verdict.ok) {
+        const failure = await handleJobFailure({
+          shop,
+          batchRef,
+          jobRef,
+          jobId,
+          errorCode: verdict.code,
+          errorMessage: verdict.message,
+          isRetryable: verdict.retryable,
+          apiResp: carrier,
+        });
+
+        if (failure.shouldReturnFailure) {
+          res.status(failure.statusCode).json({
+            ok: false,
+            reason: failure.reason,
+            code: verdict.code,
+          });
+        } else {
+          res.status(failure.statusCode).json({
+            ok: true,
+            action: failure.reason,
+          });
+        }
+        return;
+      }
+
+      // --- Success path ------------------------------------------------------
+      await Promise.all([
+        jobRef.update({
+          status: "success",
+          awb: verdict.awbNumber ?? null,
+          carrierShipmentId: verdict.shipmentId ?? null,
+          xpressbeesOrderId: verdict.orderId ?? null,
+          courierName: verdict.courierName ?? null,
+          errorCode: FieldValue.delete(),
+          errorMessage: FieldValue.delete(),
+          apiResp: carrier,
+          completedAt: FieldValue.serverTimestamp(),
+        }),
+        batchRef.update({
+          processing: FieldValue.increment(-1),
+          success: FieldValue.increment(1),
+        }),
+        orderRef.set(
+          {
+            awb: verdict.awbNumber ?? null,
+            courier: `Xpressbees: ${verdict.courierName ?? "Unknown"}`,
+            customStatus: "Ready To Dispatch",
+            shippingMode,
+            lastStatusUpdate: FieldValue.serverTimestamp(),
+            customStatusesLogs: FieldValue.arrayUnion({
+              status: "Ready To Dispatch",
+              createdAt: Timestamp.now(),
+              remarks: `The order's shipment was successfully made on Xpressbees (${shippingMode}) (AWB: ${verdict.awbNumber})`,
+            }),
+          },
+          { merge: true },
+        ),
+      ]);
+
+      await maybeCompleteBatch(batchRef);
+
+      res.json({
+        ok: true,
+        awb: verdict.awbNumber ?? null,
+        carrierShipmentId: verdict.shipmentId ?? null,
+        xpressbeesOrderId: verdict.orderId ?? null,
+      });
+      return;
+    } catch (e: any) {
+      // Generic failure (network/bug/etc.)
+      const msg = e instanceof Error ? e.message : String(e);
+      const code = msg.split(/\s/)[0]; // first token
+      const isRetryable = !NON_RETRYABLE.has(code);
+
+      try {
+        const { shop, batchId, jobId } = (req.body || {}) as {
+          shop?: string;
+          batchId?: string;
+          jobId?: string;
+        };
+
+        if (shop && batchId && jobId) {
+          const batchRef = db
+            .collection("accounts")
+            .doc(shop)
+            .collection("shipment_batches")
+            .doc(batchId);
+          const jobRef = batchRef.collection("jobs").doc(String(jobId));
+
+          const failure = await handleJobFailure({
+            shop,
+            batchRef,
+            jobRef,
+            jobId,
+            errorCode: code,
+            errorMessage: msg,
+            isRetryable,
+          });
+
+          if (failure.shouldReturnFailure) {
+            res.status(failure.statusCode).json({
+              error: isRetryable ? "job_failed_transient" : "job_failed_permanent",
+              code,
+              message: msg,
+            });
+          } else {
+            res.status(failure.statusCode).json({
+              ok: true,
+              action: failure.reason,
+            });
+          }
+          return;
+        }
+      } catch (handlerError) {
+        console.error("Error in failure handler:", handlerError);
+      }
+
+      // Fallback if we couldn't use the handler
+      if (isRetryable) {
+        res.status(503).json({ error: "job_failed_transient", code, message: msg });
+      } else {
+        res.status(200).json({ ok: false, permanent: true, reason: code, message: msg });
+      }
     }
   },
 );
