@@ -79,16 +79,19 @@ async function handleJobFailure(params: {
   // Check if this is a Priority job
   const isPriority = batchData.courier === "Priority";
 
-  // Check if this is an insufficient balance error - should not trigger fallback
-  const isInsufficientBalance = errorCode === "INSUFFICIENT_BALANCE";
+  // Errors that should not trigger fallback (business logic errors, not carrier issues)
+  const isExceptionError =
+    errorCode === "INSUFFICIENT_BALANCE" ||
+    errorCode === "ORDER_ALREADY_SHIPPED" ||
+    errorCode === "ORDER_NOT_FOUND";
 
   // Priority fallback conditions:
   // 1. It's a Priority job
   // 2. Either attempts exhausted OR non-retryable error
   // 3. Has fallback handler URL configured
-  // 4. NOT an insufficient balance error (added condition)
+  // 4. NOT an exception error (insufficient balance, order issues, etc.)
   const shouldAttemptFallback =
-    isPriority && (attemptsExhausted || !isRetryable) && !isInsufficientBalance;
+    isPriority && (attemptsExhausted || !isRetryable) && !isExceptionError;
   const fallbackUrl = process.env.PRIORITY_FALLBACK_HANDLER_URL;
 
   if (shouldAttemptFallback && fallbackUrl) {
@@ -133,7 +136,7 @@ async function handleJobFailure(params: {
     }
   }
 
-  // Normal failure handling (non-Priority or fallback failed or insufficient balance)
+  // Normal failure handling (non-Priority or fallback failed or exception errors)
   const updateData: any = {
     status: isRetryable ? (attemptsExhausted ? "failed" : "retrying") : "failed",
     errorCode: isRetryable ? "EXCEPTION" : errorCode,
@@ -677,6 +680,38 @@ export const processShipmentTask = onRequest(
         return;
       }
 
+      // Load order first to check status
+      const ordSnap = await orderRef.get();
+      if (!ordSnap.exists) throw new Error("ORDER_NOT_FOUND");
+      const order = ordSnap.data();
+
+      // Check if order is in correct status for shipping
+      if (order?.customStatus !== "Confirmed") {
+        const failure = await handleJobFailure({
+          shop,
+          batchRef,
+          jobRef,
+          jobId,
+          errorCode: "ORDER_ALREADY_SHIPPED",
+          errorMessage: `Order status is '${order?.customStatus}' - not 'Confirmed'. Order may already be shipped.`,
+          isRetryable: false,
+        });
+
+        if (failure.shouldReturnFailure) {
+          res.status(failure.statusCode).json({
+            ok: false,
+            reason: failure.reason,
+            code: "ORDER_ALREADY_SHIPPED",
+          });
+        } else {
+          res.status(failure.statusCode).json({
+            ok: true,
+            action: failure.reason,
+          });
+        }
+        return;
+      }
+
       // --- Start bookkeeping (transaction) -----------------------------------
       await db.runTransaction(async (tx: Transaction) => {
         const snap = await tx.get(jobRef);
@@ -711,10 +746,27 @@ export const processShipmentTask = onRequest(
       // Allocate AWB
       awb = await allocateAwb(shop);
 
-      // Load order
-      const ordSnap = await orderRef.get();
-      if (!ordSnap.exists) throw new Error("ORDER_NOT_FOUND");
-      const order = ordSnap.data();
+      // Carrier API key
+      const accSnap = await accountRef.get();
+
+      // Cache data to avoid repeated lookups
+      const batchData = (await batchRef.get()).data();
+      const accountData = accSnap.data();
+
+      // Determine if this is a priority shipment
+      const isPriority = batchData?.courier === "Priority";
+
+      // Get shipping mode
+      const payloadShippingMode = (() => {
+        if (!isPriority) return shippingMode; // Use default shipping mode
+
+        const priorityCouriers = accountData?.integrations?.couriers?.priorityList;
+        const delhiveryConfig = priorityCouriers?.find(
+          (courier: any) => courier.name === "delhivery",
+        );
+
+        return delhiveryConfig?.mode ?? "Surface"; // Default to Surface if not configured
+      })();
 
       // Build payload for Delhivery
       const payload = buildDelhiveryPayload({
@@ -722,11 +774,9 @@ export const processShipmentTask = onRequest(
         awb,
         order,
         pickupName,
-        shippingMode,
+        shippingMode: payloadShippingMode,
       });
 
-      // Carrier API key
-      const accSnap = await accountRef.get();
       const apiKey = accSnap.data()?.integrations?.couriers?.delhivery?.apiKey as
         | string
         | undefined;
@@ -935,7 +985,6 @@ export const processShipmentTask2 = onRequest(
   { cors: true, timeoutSeconds: 60, secrets: [TASKS_SECRET] },
   async (req: Request, res: Response): Promise<void> => {
     // NOTE: Shiprocket order creation does NOT allocate an AWB from your pool.
-    // We keep `awb` only to mirror your generic catch/finalization shape.
     let awb: string | undefined;
     let awbReleased = false;
 
@@ -956,14 +1005,11 @@ export const processShipmentTask2 = onRequest(
       return false;
     }
 
-    /** Classify Shiprocket create-order response */
-    function evalShiprocketResp(sr: any): {
-      ok: boolean;
-      retryable: boolean;
+    /** Extract error info from Shiprocket error response (non-2xx only) */
+    function extractShiprocketError(sr: any): {
       code: string;
       message: string;
-      orderId?: string | number | null;
-      shipmentId?: string | number | null;
+      isInsufficientBalance: boolean;
     } {
       const msgFields = [
         sr?.message,
@@ -975,28 +1021,7 @@ export const processShipmentTask2 = onRequest(
         .filter((x) => typeof x === "string" && x.length)
         .join(" | ");
 
-      const rawMsg = msgFields || "";
-
-      // Success shape seen in docs: { order_id, shipment_id, status: "NEW", status_code: 1, ... }
-      const looksSuccess =
-        "order_id" in (sr ?? {}) &&
-        sr.order_id != null &&
-        "shipment_id" in (sr ?? {}) &&
-        sr.shipment_id != null &&
-        sr?.status_code === 1;
-
-      if (looksSuccess) {
-        return {
-          ok: true,
-          retryable: false,
-          code: "OK",
-          message: "created",
-          orderId: sr?.order_id ?? null,
-          shipmentId: sr?.shipment_id ?? null,
-        };
-      }
-
-      // Check for insufficient balance error
+      const rawMsg = msgFields || "carrier error";
       const lowerMsg = rawMsg.toLowerCase();
 
       const balanceKeywords = [
@@ -1016,23 +1041,12 @@ export const processShipmentTask2 = onRequest(
         "credit limit",
       ];
 
-      const isBalanceError = balanceKeywords.some((keyword) => lowerMsg.includes(keyword));
+      const isInsufficientBalance = balanceKeywords.some((keyword) => lowerMsg.includes(keyword));
 
-      if (isBalanceError) {
-        return {
-          ok: false,
-          retryable: false,
-          code: "INSUFFICIENT_BALANCE",
-          message: rawMsg || "Insufficient balance in carrier account",
-        };
-      }
-
-      // ----- Known permanent validation/business errors (non-retryable) -----
       return {
-        ok: false,
-        retryable: false,
-        code: "CARRIER_AMBIGUOUS",
-        message: rawMsg || "carrier error",
+        code: isInsufficientBalance ? "INSUFFICIENT_BALANCE" : "CARRIER_ERROR",
+        message: rawMsg,
+        isInsufficientBalance,
       };
     }
 
@@ -1059,25 +1073,17 @@ export const processShipmentTask2 = onRequest(
         const pickupText = await pickupResp.text();
         const pickupJson = parseJson(pickupText);
 
-        // Check for error response format: { message: "...", status_code: 400 }
-        if (pickupJson?.status_code && pickupJson.status_code >= 400) {
-          return {
-            success: false,
-            error: pickupJson.message || `Error ${pickupJson.status_code}`,
-            data: pickupJson,
-          };
-        }
-
-        // HTTP layer errors
+        // Check for non-2xx responses
         if (!pickupResp.ok) {
+          const errorInfo = extractShiprocketError(pickupJson);
           return {
             success: false,
-            error: pickupJson?.message || `HTTP ${pickupResp.status}: ${pickupText}`,
+            error: errorInfo.message || `HTTP ${pickupResp.status}`,
             data: pickupJson,
           };
         }
 
-        // Success response has pickup_status: 1
+        // For 2xx responses, check for success indicator
         if (pickupJson?.pickup_status === 1) {
           return {
             success: true,
@@ -1085,7 +1091,7 @@ export const processShipmentTask2 = onRequest(
           };
         }
 
-        // Ambiguous response - no clear error but no success either
+        // 2xx but no success indicator - treat as failure
         return {
           success: false,
           error: pickupJson?.message || "Unknown pickup error",
@@ -1146,6 +1152,37 @@ export const processShipmentTask2 = onRequest(
         return void res.json({ ok: true, dedup: true });
       }
 
+      // Load order first to check status
+      const ordSnap = await orderRef.get();
+      if (!ordSnap.exists) throw new Error("ORDER_NOT_FOUND");
+      const order = ordSnap.data();
+
+      // Check if order is in correct status for shipping
+      if (order?.customStatus !== "Confirmed") {
+        const failure = await handleJobFailure({
+          shop,
+          batchRef,
+          jobRef,
+          jobId,
+          errorCode: "ORDER_ALREADY_SHIPPED",
+          errorMessage: `Order status is '${order?.customStatus}' - not 'Confirmed'. Order may already be shipped.`,
+          isRetryable: false,
+        });
+
+        if (failure.shouldReturnFailure) {
+          return void res.status(failure.statusCode).json({
+            ok: false,
+            reason: failure.reason,
+            code: "ORDER_ALREADY_SHIPPED",
+          });
+        } else {
+          return void res.status(failure.statusCode).json({
+            ok: true,
+            action: failure.reason,
+          });
+        }
+      }
+
       // --- Start bookkeeping (transaction) -----------------------------------
       await db.runTransaction(async (tx: Transaction) => {
         const snap = await tx.get(jobRef);
@@ -1154,8 +1191,6 @@ export const processShipmentTask2 = onRequest(
         const jobStatus = data.status;
 
         // FIX: Don't decrement queued if this is a fallback attempt
-        // Fallback jobs go: processing → attempting_fallback → fallback_queued → processing
-        // They were never re-queued, so don't decrement queued again
         const isFallbackAttempt =
           jobStatus === "fallback_queued" || jobStatus === "attempting_fallback";
         const firstAttempt =
@@ -1178,14 +1213,11 @@ export const processShipmentTask2 = onRequest(
       });
       // ----------------------------------------------------------------------
 
-      // Load order
-      const ordSnap = await orderRef.get();
-      if (!ordSnap.exists) throw new Error("ORDER_NOT_FOUND");
-      const order = ordSnap.data();
-
       // Carrier token/config
       const accSnap = await accountRef.get();
-      const shiprocketCfg = accSnap.data()?.integrations?.couriers?.shiprocket || {};
+      const accountData = accSnap.data();
+
+      const shiprocketCfg = accountData?.integrations?.couriers?.shiprocket || {};
       const srToken =
         shiprocketCfg?.accessToken ||
         shiprocketCfg?.token ||
@@ -1194,32 +1226,39 @@ export const processShipmentTask2 = onRequest(
 
       if (!srToken) throw new Error("CARRIER_KEY_MISSING");
 
-      // ---- Create payload (minimal/defensive) ----
+      // Cache data to avoid repeated lookups
+      const batchData = (await batchRef.get()).data();
+
+      // Determine if this is a priority shipment
+      const isPriority = batchData?.courier === "Priority";
+
+      // Get shipping mode
+      const payloadShippingMode = (() => {
+        if (!isPriority) return shippingMode;
+
+        const priorityCouriers = accountData?.integrations?.couriers?.priorityList;
+        const shiprocketConfig = priorityCouriers?.find(
+          (courier: any) => courier.name === "shiprocket",
+        );
+
+        return shiprocketConfig?.mode ?? "Surface";
+      })();
+
+      // ---- Create payload ----
       const payload = buildShiprocketPayload({
         orderId: String(jobId),
         order,
         pickupName,
-        shippingMode,
+        shippingMode: payloadShippingMode,
       });
 
-      // --- Idempotency: reuse previously created Shiprocket IDs on retry ----
-      const prior = jSnap.data() || {};
-      let srOrderId: string | number | undefined = prior.shiprocketOrderId;
-      let srShipmentId: string | number | undefined = prior.shiprocketShipmentId;
-
-      // If we already created the SR order earlier, skip creation
-      type SRVerdict = ReturnType<typeof evalShiprocketResp>;
-      let verdict: SRVerdict;
+      // --- Idempotency: Check if order was already created in Shiprocket ---
+      let srOrderId: string | number | undefined;
+      let srShipmentId: string | number | undefined = order?.shiprocketShipmentId;
 
       if (srShipmentId) {
-        verdict = {
-          ok: true,
-          retryable: false,
-          code: "OK",
-          message: "created",
-          orderId: srOrderId ?? null,
-          shipmentId: srShipmentId,
-        };
+        // Order already created, skip to AWB assignment
+        console.log(`Reusing existing Shiprocket shipment ${srShipmentId} for job ${jobId}`);
       } else {
         // ---- Shiprocket Create Order ----
         const base = "https://apiv2.shiprocket.in";
@@ -1236,46 +1275,19 @@ export const processShipmentTask2 = onRequest(
         });
 
         const text = await resp.text();
-
-        // HTTP errors - NOW USING handleJobFailure
-        if (!resp.ok) {
-          const failure = await handleJobFailure({
-            shop,
-            batchRef,
-            jobRef,
-            jobId,
-            errorCode: `HTTP_${resp.status}`,
-            errorMessage: text,
-            isRetryable: httpRetryable(resp.status),
-          });
-
-          if (failure.shouldReturnFailure) {
-            return void res.status(failure.statusCode).json({
-              ok: false,
-              reason: failure.reason,
-              code: `HTTP_${resp.status}`,
-            });
-          } else {
-            return void res.status(failure.statusCode).json({
-              ok: true,
-              action: failure.reason,
-            });
-          }
-        }
-
         const orderCreateJson = parseJson(text);
-        const v = evalShiprocketResp(orderCreateJson);
-        verdict = v;
 
-        if (!v.ok) {
+        // Handle non-2xx responses
+        if (!resp.ok) {
+          const errorInfo = extractShiprocketError(orderCreateJson);
           const failure = await handleJobFailure({
             shop,
             batchRef,
             jobRef,
             jobId,
-            errorCode: v.code,
-            errorMessage: v.message,
-            isRetryable: v.retryable,
+            errorCode: errorInfo.code,
+            errorMessage: errorInfo.message,
+            isRetryable: httpRetryable(resp.status) && !errorInfo.isInsufficientBalance,
             apiResp: orderCreateJson,
           });
 
@@ -1283,7 +1295,7 @@ export const processShipmentTask2 = onRequest(
             return void res.status(failure.statusCode).json({
               ok: false,
               reason: failure.reason,
-              code: v.code,
+              code: errorInfo.code,
             });
           } else {
             return void res.status(failure.statusCode).json({
@@ -1293,23 +1305,56 @@ export const processShipmentTask2 = onRequest(
           }
         }
 
-        // Persist IDs immediately so retries can skip creation
-        srOrderId = v.orderId ?? srOrderId;
-        srShipmentId = v.shipmentId ?? srShipmentId;
-        await jobRef.set(
+        // 2xx response - extract data directly
+        srOrderId = orderCreateJson?.order_id;
+        srShipmentId = orderCreateJson?.shipment_id;
+
+        if (!srShipmentId) {
+          // This shouldn't happen with 2xx, but handle gracefully
+          const failure = await handleJobFailure({
+            shop,
+            batchRef,
+            jobRef,
+            jobId,
+            errorCode: "MISSING_SHIPMENT_ID",
+            errorMessage: "Shiprocket returned 2xx but missing shipment_id",
+            isRetryable: true,
+            apiResp: orderCreateJson,
+          });
+
+          if (failure.shouldReturnFailure) {
+            return void res.status(failure.statusCode).json({
+              ok: false,
+              reason: failure.reason,
+              code: "MISSING_SHIPMENT_ID",
+            });
+          } else {
+            return void res.status(failure.statusCode).json({
+              ok: true,
+              action: failure.reason,
+            });
+          }
+        }
+
+        // Persist shipment ID to order document immediately
+        await orderRef.set(
           {
             shiprocketOrderId: srOrderId ?? null,
-            shiprocketShipmentId: srShipmentId ?? null,
+            shiprocketShipmentId: srShipmentId,
+          },
+          { merge: true },
+        );
+
+        // Also store in job for tracking
+        await jobRef.set(
+          {
             stage: "order_created",
           },
           { merge: true },
         );
 
-        // Wait for a second
-        function sleep(ms: number): Promise<void> {
-          return new Promise((resolve) => setTimeout(resolve, ms));
-        }
-        await sleep(1000);
+        // Wait a second before AWB assignment
+        await new Promise((resolve) => setTimeout(resolve, 500));
       }
 
       // ---- Shiprocket Assign AWB ----
@@ -1324,30 +1369,32 @@ export const processShipmentTask2 = onRequest(
           "Content-Type": "application/json",
         },
         body: JSON.stringify({
-          shipment_id: verdict.shipmentId, // required
-          // courier_id: <number>, // optional if you want to force a courier
+          shipment_id: srShipmentId,
         }),
       });
 
       const awbText = await awbResp.text();
+      const awbJson = parseJson(awbText);
 
-      // HTTP layer handling - NOW USING handleJobFailure
+      // Handle non-2xx responses
       if (!awbResp.ok) {
+        const errorInfo = extractShiprocketError(awbJson);
         const failure = await handleJobFailure({
           shop,
           batchRef,
           jobRef,
           jobId,
-          errorCode: `HTTP_${awbResp.status}`,
-          errorMessage: awbText,
-          isRetryable: httpRetryable(awbResp.status),
+          errorCode: errorInfo.code,
+          errorMessage: errorInfo.message,
+          isRetryable: httpRetryable(awbResp.status) && !errorInfo.isInsufficientBalance,
+          apiResp: awbJson,
         });
 
         if (failure.shouldReturnFailure) {
           return void res.status(failure.statusCode).json({
             ok: false,
             reason: failure.reason,
-            code: `HTTP_${awbResp.status}`,
+            code: errorInfo.code,
           });
         } else {
           return void res.status(failure.statusCode).json({
@@ -1357,107 +1404,30 @@ export const processShipmentTask2 = onRequest(
         }
       }
 
-      // ---- Parse and extract according to Shiprocket structure ----
-      const awbJson = parseJson(awbText) ?? {};
-      // Most Shiprocket success payloads: { awb_assign_status, response: { data: { ... } } }
-      const node = awbJson?.response?.data ?? awbJson?.data ?? awbJson?.response ?? awbJson; // fallbacks for odd variants
-      // Build a readable error message from common fields (top-level & nested)
-      const errorIfAny = (awbJson?.message || "").toLowerCase();
-
-      // Correct fields per your example JSON
+      // 2xx response - extract AWB data directly
+      const node = awbJson?.response?.data ?? awbJson?.data ?? awbJson?.response ?? awbJson;
       const awbCode = node?.awb_code ?? null;
       const courierName = node?.courier_name ?? null;
       const courierId = node?.courier_company_id ?? null;
 
-      // Success → we have an AWB
-      if (awbCode) {
-        // --- Request Shiprocket Pickup (best effort) ---
-        let pickupResult: { success: boolean; error?: string; data?: any } = {
-          success: false,
-        };
-
-        try {
-          pickupResult = await requestShiprocketPickup(srToken, verdict.shipmentId!);
-
-          if (!pickupResult.success) {
-            console.warn(`Pickup request failed for job ${jobId}:`, pickupResult.error);
-          }
-        } catch (pickupError) {
-          console.error(`Pickup request error for job ${jobId}:`, pickupError);
-          pickupResult = {
-            success: false,
-            error: pickupError instanceof Error ? pickupError.message : String(pickupError),
-          };
-        }
-
-        await Promise.all([
-          jobRef.update({
-            status: "success",
-            awb: awbCode,
-            carrierShipmentId: verdict.shipmentId ?? null,
-            carrier: "Shiprocket",
-            courierName: courierName ?? null,
-            courierCompanyId: courierId ?? null,
-            errorCode: FieldValue.delete(),
-            errorMessage: FieldValue.delete(),
-            completedAt: FieldValue.serverTimestamp(),
-            apiResp: {
-              orderCreate: srOrderId ? "persisted" : "fresh",
-              awbAssign: awbJson,
-            },
-          }),
-          batchRef.update({
-            processing: FieldValue.increment(-1),
-            success: FieldValue.increment(1),
-          }),
-          orderRef.set(
-            {
-              awb: awbCode,
-              courier: `Shiprocket: ${courierName ?? "Unknown"}`,
-              customStatus: "Ready To Dispatch",
-              lastStatusUpdate: FieldValue.serverTimestamp(),
-              customStatusesLogs: FieldValue.arrayUnion({
-                status: "Ready To Dispatch",
-                createdAt: Timestamp.now(),
-                remarks: `The order's shipment was successfully made on ${courierName} via Shiprocket (AWB: ${awbCode})`,
-              }),
-
-              // Persist Shiprocket IDs for future reference
-              shiprocketOrderId: srOrderId ?? null,
-              shiprocketShipmentId: verdict.shipmentId ?? null,
-            },
-            { merge: true },
-          ),
-        ]);
-
-        await maybeCompleteBatch(batchRef);
-
-        return void res.json({
-          ok: true,
-          awb: awbCode,
-          carrierShipmentId: verdict.shipmentId ?? null,
-          shiprocketOrderId: srOrderId ?? null,
-        });
-      }
-
-      // Non-retryable AWB cases (based on typical Shiprocket messages)
-      if (errorIfAny) {
+      if (!awbCode) {
+        // This shouldn't happen with 2xx, but handle gracefully
         const failure = await handleJobFailure({
           shop,
           batchRef,
           jobRef,
           jobId,
-          errorCode: "AWB_ASSIGN_FAILED",
-          errorMessage: awbJson?.message || "Awb assign failed",
-          isRetryable: false,
-          apiResp: { awbAssign: awbJson },
+          errorCode: "MISSING_AWB_CODE",
+          errorMessage: "Shiprocket returned 2xx but missing AWB code",
+          isRetryable: true,
+          apiResp: awbJson,
         });
 
         if (failure.shouldReturnFailure) {
           return void res.status(failure.statusCode).json({
             ok: false,
             reason: failure.reason,
-            code: "AWB_ASSIGN_FAILED",
+            code: "MISSING_AWB_CODE",
           });
         } else {
           return void res.status(failure.statusCode).json({
@@ -1467,30 +1437,76 @@ export const processShipmentTask2 = onRequest(
         }
       }
 
-      // Ambiguous → retry with handleJobFailure
-      const failure = await handleJobFailure({
-        shop,
-        batchRef,
-        jobRef,
-        jobId,
-        errorCode: "CARRIER_AMBIGUOUS",
-        errorMessage: "carrier error",
-        isRetryable: true,
-        apiResp: { awbAssign: awbJson },
-      });
+      // --- Request Shiprocket Pickup (best effort) ---
+      let pickupErrorMessage: string | undefined;
 
-      if (failure.shouldReturnFailure) {
-        return void res.status(failure.statusCode).json({
-          ok: false,
-          reason: failure.reason,
-          code: "CARRIER_AMBIGUOUS",
-        });
-      } else {
-        return void res.status(failure.statusCode).json({
-          ok: true,
-          action: failure.reason,
-        });
+      try {
+        const pickupResult = await requestShiprocketPickup(srToken, srShipmentId!);
+
+        if (!pickupResult.success) {
+          console.warn(`Pickup request failed for job ${jobId}:`, pickupResult.error);
+          pickupErrorMessage =
+            "Shiprocket: Pickup Request failed, please do it manually on shiprocket";
+        }
+      } catch (pickupError) {
+        console.error(`Pickup request error for job ${jobId}:`, pickupError);
+        pickupErrorMessage =
+          "Shiprocket: Pickup Request failed, please do it manually on shiprocket";
       }
+
+      // Mark job as success
+      const jobUpdate: any = {
+        status: "success",
+        awb: awbCode,
+        carrierShipmentId: srShipmentId ?? null,
+        carrier: "Shiprocket",
+        courierName: courierName ?? null,
+        courierCompanyId: courierId ?? null,
+        errorCode: FieldValue.delete(),
+        completedAt: FieldValue.serverTimestamp(),
+        apiResp: {
+          orderCreate: srOrderId ? "persisted" : "reused",
+          awbAssign: awbJson,
+        },
+      };
+
+      // Set or delete errorMessage based on pickup result
+      if (pickupErrorMessage) {
+        jobUpdate.errorMessage = pickupErrorMessage;
+      } else {
+        jobUpdate.errorMessage = FieldValue.delete();
+      }
+
+      await Promise.all([
+        jobRef.update(jobUpdate),
+        batchRef.update({
+          processing: FieldValue.increment(-1),
+          success: FieldValue.increment(1),
+        }),
+        orderRef.set(
+          {
+            awb: awbCode,
+            courier: `Shiprocket: ${courierName ?? "Unknown"}`,
+            customStatus: "Ready To Dispatch",
+            lastStatusUpdate: FieldValue.serverTimestamp(),
+            customStatusesLogs: FieldValue.arrayUnion({
+              status: "Ready To Dispatch",
+              createdAt: Timestamp.now(),
+              remarks: `The order's shipment was successfully made on ${courierName} via Shiprocket (AWB: ${awbCode})`,
+            }),
+          },
+          { merge: true },
+        ),
+      ]);
+
+      await maybeCompleteBatch(batchRef);
+
+      return void res.json({
+        ok: true,
+        awb: awbCode,
+        carrierShipmentId: srShipmentId ?? null,
+        shiprocketOrderId: srOrderId ?? null,
+      });
     } catch (e: any) {
       // Generic failure (network/bug/etc.)
       const msg = e instanceof Error ? e.message : String(e);
@@ -1773,6 +1789,38 @@ export const processShipmentTask3 = onRequest(
         return;
       }
 
+      // Load order first to check status
+      const ordSnap = await orderRef.get();
+      if (!ordSnap.exists) throw new Error("ORDER_NOT_FOUND");
+      const order = ordSnap.data();
+
+      // Check if order is in correct status for shipping
+      if (order?.customStatus !== "Confirmed") {
+        const failure = await handleJobFailure({
+          shop,
+          batchRef,
+          jobRef,
+          jobId,
+          errorCode: "ORDER_ALREADY_SHIPPED",
+          errorMessage: `Order status is '${order?.customStatus}' - not 'Confirmed'. Order may already be shipped.`,
+          isRetryable: false,
+        });
+
+        if (failure.shouldReturnFailure) {
+          res.status(failure.statusCode).json({
+            ok: false,
+            reason: failure.reason,
+            code: "ORDER_ALREADY_SHIPPED",
+          });
+        } else {
+          res.status(failure.statusCode).json({
+            ok: true,
+            action: failure.reason,
+          });
+        }
+        return;
+      }
+
       // --- Start bookkeeping (transaction) -----------------------------------
       await db.runTransaction(async (tx: Transaction) => {
         const snap = await tx.get(jobRef);
@@ -1800,13 +1848,9 @@ export const processShipmentTask3 = onRequest(
         tx.update(batchRef, inc);
       });
 
-      // Load order
-      const ordSnap = await orderRef.get();
-      if (!ordSnap.exists) throw new Error("ORDER_NOT_FOUND");
-      const order = ordSnap.data();
-
       // Get Xpressbees API key
       const accSnap = await accountRef.get();
+      const accountData = accSnap.data();
       const xpressbeesCfg = accSnap.data()?.integrations?.couriers?.xpressbees || {};
       const apiKey = xpressbeesCfg?.apiKey || xpressbeesCfg?.token;
 
@@ -1821,9 +1865,27 @@ export const processShipmentTask3 = onRequest(
         return sum + Number(item?.quantity ?? 1);
       }, 0);
 
+      // Get batch data
+      const batchData = (await batchRef.get()).data();
+
+      // Determine if this is a priority shipment
+      const isPriority = batchData?.courier === "Priority";
+
+      // Get shipping mode
+      const payloadShippingMode = (() => {
+        if (!isPriority) return shippingMode; // Use default shipping mode
+
+        const priorityCouriers = accountData?.integrations?.couriers?.priorityList;
+        const xpressbeesConfig = priorityCouriers?.find(
+          (courier: any) => courier.name === "xpressbees",
+        );
+
+        return xpressbeesConfig?.mode ?? "Surface"; // Default to Surface if not configured
+      })();
+
       let courierId: string;
       try {
-        courierId = await selectCourier(apiKey, shippingMode, totalQuantity);
+        courierId = await selectCourier(apiKey, payloadShippingMode, totalQuantity);
       } catch (error) {
         const msg = error instanceof Error ? error.message : String(error);
         const failure = await handleJobFailure({
@@ -1856,8 +1918,8 @@ export const processShipmentTask3 = onRequest(
         orderId: String(jobId),
         order,
         pickupName,
-        shippingMode,
         courierId,
+        shippingMode: payloadShippingMode,
       });
 
       // Call Xpressbees API

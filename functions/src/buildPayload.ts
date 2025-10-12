@@ -182,7 +182,7 @@ export function buildShiprocketPayload(opts: {
   }
 
   return {
-    order_id: String(orderId), // make order_id == jobId for idempotency
+    order_id: String(order?.name || orderId), // make order_id == jobId for idempotency
     order_date: new Date().toISOString().slice(0, 16).replace("T", " "), // "YYYY-MM-DD HH:mm"
     pickup_location: pickupName ? "Majime Productions 2" : "Majime Productions 2",
     comment: order?.note || "",
