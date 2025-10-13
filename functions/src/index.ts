@@ -67,46 +67,82 @@ async function handleJobFailure(params: {
 }): Promise<{ shouldReturnFailure: boolean; statusCode: number; reason: string }> {
   const { shop, batchRef, jobRef, jobId, errorCode, errorMessage, isRetryable, apiResp } = params;
 
-  const jobSnap = await jobRef.get();
-  const batchSnap = await batchRef.get();
-  const jobData = jobSnap.data() || {};
-  const batchData = batchSnap.data() || {};
+  // FIX: Use transaction for atomic updates
+  const result = await db.runTransaction(async (tx: Transaction) => {
+    const jobSnap = await tx.get(jobRef);
+    const batchSnap = await tx.get(batchRef);
+    const jobData = jobSnap.data() || {};
+    const batchData = batchSnap.data() || {};
 
-  const attempts = Number(jobData.attempts || 0);
-  const maxAttempts = Number(process.env.SHIPMENT_QUEUE_MAX_ATTEMPTS || 3);
-  const attemptsExhausted = attempts >= maxAttempts;
+    // FIX: Check if already in terminal state
+    if (jobData.status === "success" || jobData.status === "failed") {
+      return { alreadyTerminal: true };
+    }
 
-  // Check if this is a Priority job
-  const isPriority = batchData.courier === "Priority";
+    const attempts = Number(jobData.attempts || 0);
+    const maxAttempts = Number(process.env.SHIPMENT_QUEUE_MAX_ATTEMPTS || 3);
+    const attemptsExhausted = attempts >= maxAttempts;
+    const isPriority = batchData.courier === "Priority";
 
-  // Errors that should not trigger fallback (business logic errors, not carrier issues)
-  const isExceptionError =
-    errorCode === "INSUFFICIENT_BALANCE" ||
-    errorCode === "ORDER_ALREADY_SHIPPED" ||
-    errorCode === "ORDER_NOT_FOUND" ||
-    errorCode === "COURIER_SELECTION_FAILED";
+    const isExceptionError =
+      errorCode === "INSUFFICIENT_BALANCE" ||
+      errorCode === "ORDER_ALREADY_SHIPPED" ||
+      errorCode === "ORDER_NOT_FOUND" ||
+      errorCode === "COURIER_SELECTION_FAILED";
 
-  // Priority fallback conditions:
-  // 1. It's a Priority job
-  // 2. Either attempts exhausted OR non-retryable error
-  // 3. Has fallback handler URL configured
-  // 4. NOT an exception error (insufficient balance, order issues, etc.)
-  const shouldAttemptFallback =
-    isPriority && (attemptsExhausted || !isRetryable) && !isExceptionError;
-  const fallbackUrl = process.env.PRIORITY_FALLBACK_HANDLER_URL;
+    const shouldAttemptFallback =
+      isPriority && (attemptsExhausted || !isRetryable) && !isExceptionError;
+    const fallbackUrl = process.env.PRIORITY_FALLBACK_HANDLER_URL;
 
-  if (shouldAttemptFallback && fallbackUrl) {
-    try {
-      // Mark job as attempting fallback
-      await jobRef.update({
+    if (shouldAttemptFallback && fallbackUrl) {
+      tx.update(jobRef, {
         status: "attempting_fallback",
         lastErrorCode: errorCode,
         lastErrorMessage: errorMessage.slice(0, 400),
         lastFailedAt: FieldValue.serverTimestamp(),
         ...(apiResp && { lastApiResp: apiResp }),
       });
+      tx.update(batchRef, {
+        processing: FieldValue.increment(-1),
+      });
+      return { shouldAttemptFallback: true };
+    }
 
-      // Queue fallback handler task
+    // Normal failure handling
+    const updateData: any = {
+      status: isRetryable ? (attemptsExhausted ? "failed" : "retrying") : "failed",
+      errorCode: isRetryable ? "EXCEPTION" : errorCode,
+      errorMessage: errorMessage.slice(0, 400),
+    };
+    if (apiResp) updateData.apiResp = apiResp;
+
+    tx.set(jobRef, updateData, { merge: true });
+
+    if (isRetryable && !attemptsExhausted) {
+      tx.update(batchRef, { processing: FieldValue.increment(-1) });
+    } else {
+      tx.update(batchRef, {
+        processing: FieldValue.increment(-1),
+        failed: FieldValue.increment(1),
+      });
+    }
+
+    return {
+      shouldAttemptFallback: false,
+      isRetryable,
+      attemptsExhausted,
+      isPermanent: !isRetryable || attemptsExhausted,
+    };
+  });
+
+  // Handle transaction results
+  if (result.alreadyTerminal) {
+    return { shouldReturnFailure: false, statusCode: 200, reason: "already_terminal" };
+  }
+
+  if (result.shouldAttemptFallback) {
+    try {
+      const fallbackUrl = process.env.PRIORITY_FALLBACK_HANDLER_URL!;
       await createTask(
         { shop, batchId: batchRef.id, jobId },
         {
@@ -116,55 +152,20 @@ async function handleJobFailure(params: {
           delaySeconds: 2,
         },
       );
-
-      // **FIX: Decrement processing counter when moving to fallback**
-      await batchRef.update({
-        processing: FieldValue.increment(-1),
-      });
-
-      console.log(`Priority fallback triggered for job ${jobId} after ${errorCode}`);
-
-      // Don't return failure - fallback handler will decide final outcome
-      // Return 200 to prevent Cloud Tasks from retrying this task
-      return {
-        shouldReturnFailure: false,
-        statusCode: 200,
-        reason: "fallback_queued",
-      };
+      return { shouldReturnFailure: false, statusCode: 200, reason: "fallback_queued" };
     } catch (fallbackError) {
-      console.error("Failed to queue fallback handler:", fallbackError);
-      // Fall through to normal failure handling
+      console.error("Failed to queue fallback:", fallbackError);
     }
   }
 
-  // Normal failure handling (non-Priority or fallback failed or exception errors)
-  const updateData: any = {
-    status: isRetryable ? (attemptsExhausted ? "failed" : "retrying") : "failed",
-    errorCode: isRetryable ? "EXCEPTION" : errorCode,
-    errorMessage: errorMessage.slice(0, 400),
-  };
-
-  if (apiResp) {
-    updateData.apiResp = apiResp;
-  }
-
-  await Promise.all([
-    jobRef.set(updateData, { merge: true }),
-    batchRef.update(
-      isRetryable && !attemptsExhausted
-        ? { processing: FieldValue.increment(-1) }
-        : { processing: FieldValue.increment(-1), failed: FieldValue.increment(1) },
-    ),
-  ]);
-
-  if (!isRetryable || attemptsExhausted) {
+  if (result.isPermanent) {
     await maybeCompleteBatch(batchRef);
   }
 
   return {
     shouldReturnFailure: true,
-    statusCode: isRetryable && !attemptsExhausted ? 503 : 200,
-    reason: isRetryable ? "retryable_error" : "permanent_error",
+    statusCode: result.isRetryable && !result.attemptsExhausted ? 503 : 200,
+    reason: result.isRetryable ? "retryable_error" : "permanent_error",
   };
 }
 
@@ -310,18 +311,12 @@ export const handlePriorityFallback = onRequest(
   async (req: Request, res: Response): Promise<void> => {
     try {
       requireHeaderSecret(req, "x-tasks-secret", TASKS_SECRET.value() || "");
-
       if (req.method !== "POST") {
         res.status(405).json({ error: "method_not_allowed" });
         return;
       }
 
-      const { shop, batchId, jobId } = req.body as {
-        shop?: string;
-        batchId?: string;
-        jobId?: string;
-      };
-
+      const { shop, batchId, jobId } = req.body;
       if (!shop || !batchId || !jobId) {
         res.status(400).json({ error: "missing_required_params" });
         return;
@@ -334,213 +329,161 @@ export const handlePriorityFallback = onRequest(
         .doc(batchId);
       const jobRef = batchRef.collection("jobs").doc(jobId);
 
-      // Get job, batch, and shop data
-      const [jobSnap, batchSnap, shopSnap] = await Promise.all([
-        jobRef.get(),
-        batchRef.get(),
-        db.collection("accounts").doc(shop).get(),
-      ]);
+      // FIX: Atomic status check and update inside transaction
+      const fallbackInfo = await db.runTransaction(async (tx: Transaction) => {
+        const [jobSnap, batchSnap, shopSnap] = await Promise.all([
+          tx.get(jobRef),
+          tx.get(batchRef),
+          tx.get(db.collection("accounts").doc(shop)),
+        ]);
 
-      if (!jobSnap.exists || !batchSnap.exists || !shopSnap.exists) {
-        res.status(404).json({ error: "documents_not_found" });
-        return;
-      }
+        if (!jobSnap.exists || !batchSnap.exists || !shopSnap.exists) {
+          throw new Error("DOCUMENTS_NOT_FOUND");
+        }
 
-      const jobData = jobSnap.data()!;
+        const jobData = jobSnap.data()!;
+        const batchData = batchSnap.data()!;
+        const shopDoc = shopSnap.data()!;
 
-      // **ADD THIS CHECK:**
-      // If job is already processing or completed, don't queue another fallback
-      if (
-        jobData.status === "processing" ||
-        jobData.status === "success" ||
-        jobData.status === "failed"
-      ) {
-        res.json({
-          ok: true,
-          action: "already_handled",
-          message: `Job already in ${jobData.status} state`,
-        });
-        return;
-      }
+        // FIX: Check terminal states atomically
+        if (["processing", "success", "failed"].includes(jobData.status)) {
+          return { action: "already_handled", status: jobData.status };
+        }
 
-      const batchData = batchSnap.data()!;
-      const shopDoc = shopSnap.data()!;
+        // Only handle attempting_fallback status
+        if (jobData.status !== "attempting_fallback") {
+          return { action: "invalid_state", status: jobData.status };
+        }
 
-      // Only handle Priority jobs
-      if (batchData.courier !== "Priority") {
-        res.status(400).json({ error: "not_a_priority_job" });
-        return;
-      }
+        if (batchData.courier !== "Priority") {
+          throw new Error("NOT_PRIORITY_JOB");
+        }
 
-      // Get priority list from shop config
-      const priorityList = shopDoc?.integrations?.couriers?.priorityList || [];
-      if (!Array.isArray(priorityList) || priorityList.length === 0) {
-        // No priority list configured, mark as permanently failed
-        await Promise.all([
-          jobRef.update({
+        const priorityList = shopDoc?.integrations?.couriers?.priorityList || [];
+        if (!Array.isArray(priorityList) || priorityList.length === 0) {
+          tx.update(jobRef, {
             status: "failed",
             errorCode: "PRIORITY_LIST_NOT_CONFIGURED",
-            errorMessage: "Priority courier list not configured in shop settings",
+            errorMessage: "Priority list not configured",
             finalFailedAt: FieldValue.serverTimestamp(),
-          }),
-          batchRef.update({
-            failed: FieldValue.increment(1),
-          }),
-        ]);
+          });
+          tx.update(batchRef, { failed: FieldValue.increment(1) });
+          return { action: "no_priority_list" };
+        }
 
-        await maybeCompleteBatch(batchRef);
-        res.status(400).json({ error: "priority_list_not_configured" });
-        return;
-      }
+        const currentCourier = jobData.courier || capitalizeWords(priorityList[0]?.name);
+        const currentIndex = priorityList.findIndex(
+          (c: any) => capitalizeWords(c?.name) === currentCourier,
+        );
 
-      // Determine current courier and find its index
-      const currentCourier = jobData.courier || capitalizeWords(priorityList[0]?.name);
-      const currentIndex = priorityList.findIndex(
-        (c: any) => capitalizeWords(c?.name) === currentCourier,
-      );
+        if (currentIndex === -1 || currentIndex >= priorityList.length - 1) {
+          // No more fallback options
+          const lastError = jobData.lastErrorMessage || jobData.errorMessage || "Unknown error";
+          const lastErrorCode = jobData.lastErrorCode || jobData.errorCode || "UNKNOWN";
 
-      if (currentIndex === -1) {
-        // Current courier not in list, mark as failed
-        await Promise.all([
-          jobRef.update({
-            status: "failed",
-            errorCode: "COURIER_NOT_IN_PRIORITY_LIST",
-            errorMessage: `Current courier ${currentCourier} not found in priority list`,
-            finalFailedAt: FieldValue.serverTimestamp(),
-          }),
-          batchRef.update({
-            failed: FieldValue.increment(1),
-          }),
-        ]);
-
-        await maybeCompleteBatch(batchRef);
-        res.status(400).json({ error: "current_courier_not_in_priority_list" });
-        return;
-      }
-
-      const nextIndex = currentIndex + 1;
-
-      // Check if there's a next courier available
-      if (nextIndex >= priorityList.length) {
-        // No more fallback couriers, mark as permanently failed
-        // FIX: Use the actual last error instead of generic message
-        const lastError = jobData.lastErrorMessage || jobData.errorMessage || "Unknown error";
-        const lastErrorCode = jobData.lastErrorCode || jobData.errorCode || "UNKNOWN";
-
-        await Promise.all([
-          jobRef.update({
+          tx.update(jobRef, {
             status: "failed",
             errorCode: lastErrorCode,
             errorMessage: `${currentCourier}: ${lastError}`,
             allCouriersExhausted: true,
             triedCouriers: (jobData.previousCouriers || []).concat(currentCourier),
             finalFailedAt: FieldValue.serverTimestamp(),
-          }),
-          batchRef.update({
-            failed: FieldValue.increment(1),
-          }),
-        ]);
+          });
+          tx.update(batchRef, { failed: FieldValue.increment(1) });
 
-        await maybeCompleteBatch(batchRef);
+          return {
+            action: "no_fallback_available",
+            triedCouriers: (jobData.previousCouriers || []).concat(currentCourier),
+          };
+        }
 
-        res.json({
-          ok: true,
-          action: "no_fallback_available",
-          message: "All priority couriers exhausted",
-          triedCouriers: (jobData.previousCouriers || []).concat(currentCourier),
-        });
-        return;
-      }
-
-      // Get next courier
-      const nextCourier = capitalizeWords(priorityList[nextIndex]?.name);
-
-      // Determine target URL for next courier
-      const url = (() => {
+        // Queue next courier
+        const nextIndex = currentIndex + 1;
+        const nextCourier = capitalizeWords(priorityList[nextIndex]?.name);
         const courierLower = priorityList[nextIndex]?.name.toLowerCase();
-        if (courierLower === "delhivery") {
-          return String(process.env.SHIPMENT_TASK_TARGET_URL_1);
-        }
-        if (courierLower === "shiprocket") {
-          return String(process.env.SHIPMENT_TASK_TARGET_URL_2);
-        }
-        if (courierLower === "xpressbees") {
-          return String(process.env.SHIPMENT_TASK_TARGET_URL_3);
-        }
-        throw new Error(`Unsupported fallback courier: ${courierLower}`);
-      })();
 
-      // // Update job document with fallback info
-      // await jobRef.update({
-      //   status: "fallback_queued",
-      //   courier: nextCourier,
-      //   attempts: 0, // Reset attempts for new courier
-      //   previousCouriers: FieldValue.arrayUnion(currentCourier),
-      //   fallbackAttempt: (jobData.fallbackAttempt || 0) + 1,
-      //   lastFallbackAt: FieldValue.serverTimestamp(),
-      //   // Clear old error fields
-      //   errorCode: FieldValue.delete(),
-      //   errorMessage: FieldValue.delete(),
-      // });
-
-      const previousCouriers = jobData.previousCouriers || [];
-
-      // In handlePriorityFallback, before creating new task:
-      await db.runTransaction(async (tx: Transaction) => {
-        const currentJob = await tx.get(jobRef);
-        const currentData = currentJob.data();
-
-        // Only proceed if job is in expected state
-        if (currentData?.status !== "attempting_fallback") {
-          throw new Error("Job not in expected state for fallback");
-        }
-
-        // Update job status atomically
         tx.update(jobRef, {
           status: "fallback_queued",
           courier: nextCourier,
           attempts: 0,
           previousCouriers: FieldValue.arrayUnion(currentCourier),
-          fallbackAttempt: (currentData.fallbackAttempt || 0) + 1,
+          fallbackAttempt: (jobData.fallbackAttempt || 0) + 1,
           lastFallbackAt: FieldValue.serverTimestamp(),
           errorCode: FieldValue.delete(),
           errorMessage: FieldValue.delete(),
         });
-      });
 
-      // Create task AFTER atomic status update
-      await createTask(
-        {
-          shop,
-          batchId,
-          jobId,
+        return {
+          action: "queue_fallback",
+          nextCourier,
+          courierLower,
+          currentCourier,
           pickupName: batchData.pickupName,
           shippingMode: batchData.shippingMode,
-        } as any,
-        {
-          tasksSecret: TASKS_SECRET.value() || "",
-          url,
-          queue: String(process.env.SHIPMENT_QUEUE_NAME) || "shipments-queue",
-          delaySeconds: 5, // Small delay before retry with new courier
-        },
-      );
-
-      console.log(
-        `Priority fallback: ${currentCourier} → ${nextCourier} for job ${jobId} (attempt ${(jobData.fallbackAttempt || 0) + 1})`,
-      );
-
-      res.json({
-        ok: true,
-        action: "fallback_queued",
-        fromCourier: currentCourier,
-        toCourier: nextCourier,
-        fallbackAttempt: (jobData.fallbackAttempt || 0) + 1,
-        previousCouriers: previousCouriers.concat(currentCourier),
+        };
       });
+
+      // Handle transaction results
+      if (fallbackInfo.action === "already_handled") {
+        res.json({ ok: true, action: "already_handled", status: fallbackInfo.status });
+        return;
+      }
+
+      if (
+        fallbackInfo.action === "no_priority_list" ||
+        fallbackInfo.action === "no_fallback_available"
+      ) {
+        await maybeCompleteBatch(batchRef);
+        res.json({
+          ok: true,
+          action: fallbackInfo.action,
+          triedCouriers: fallbackInfo.triedCouriers,
+        });
+        return;
+      }
+
+      if (fallbackInfo.action === "queue_fallback") {
+        // Determine target URL
+        const url = (() => {
+          if (fallbackInfo.courierLower === "delhivery") {
+            return String(process.env.SHIPMENT_TASK_TARGET_URL_1);
+          }
+          if (fallbackInfo.courierLower === "shiprocket") {
+            return String(process.env.SHIPMENT_TASK_TARGET_URL_2);
+          }
+          if (fallbackInfo.courierLower === "xpressbees") {
+            return String(process.env.SHIPMENT_TASK_TARGET_URL_3);
+          }
+          throw new Error(`Unsupported fallback courier: ${fallbackInfo.courierLower}`);
+        })();
+
+        await createTask(
+          {
+            shop,
+            batchId,
+            jobId,
+            pickupName: fallbackInfo.pickupName,
+            shippingMode: fallbackInfo.shippingMode,
+          } as any,
+          {
+            tasksSecret: TASKS_SECRET.value() || "",
+            url,
+            queue: String(process.env.SHIPMENT_QUEUE_NAME) || "shipments-queue",
+            delaySeconds: 5,
+          },
+        );
+
+        res.json({
+          ok: true,
+          action: "fallback_queued",
+          fromCourier: fallbackInfo.currentCourier,
+          toCourier: fallbackInfo.nextCourier,
+        });
+      }
     } catch (error: any) {
       console.error("handlePriorityFallback error:", error);
 
-      // Try to mark job as failed on handler error
+      // Mark job as failed on handler error
       try {
         const { shop, batchId, jobId } = req.body;
         if (shop && batchId && jobId) {
@@ -551,18 +494,22 @@ export const handlePriorityFallback = onRequest(
             .doc(batchId);
           const jobRef = batchRef.collection("jobs").doc(jobId);
 
-          await Promise.all([
-            jobRef.update({
-              status: "failed",
-              errorCode: "FALLBACK_HANDLER_ERROR",
-              errorMessage: `Fallback handler error: ${error.message || String(error)}`,
-              finalFailedAt: FieldValue.serverTimestamp(),
-            }),
-            batchRef.update({
-              processing: FieldValue.increment(-1),
-              failed: FieldValue.increment(1),
-            }),
-          ]);
+          // FIX: Use transaction for cleanup
+          await db.runTransaction(async (tx: Transaction) => {
+            const job = await tx.get(jobRef);
+            if (job.data()?.status !== "failed") {
+              tx.update(jobRef, {
+                status: "failed",
+                errorCode: "FALLBACK_HANDLER_ERROR",
+                errorMessage: `Fallback handler error: ${error.message}`,
+                finalFailedAt: FieldValue.serverTimestamp(),
+              });
+              tx.update(batchRef, {
+                processing: FieldValue.increment(-1),
+                failed: FieldValue.increment(1),
+              });
+            }
+          });
 
           await maybeCompleteBatch(batchRef);
         }
@@ -699,24 +646,55 @@ export const processShipmentTask = onRequest(
       const orderRef = db.collection("accounts").doc(shop).collection("orders").doc(String(jobId));
       const accountRef = db.collection("accounts").doc(shop);
 
-      // Idempotency: if already success, just ack
-      const jSnap = await jobRef.get();
-      if (jSnap.exists && jSnap.data()?.status === "success") {
-        // Fix any inconsistent batch counters
-        await db.runTransaction(async (tx: Transaction) => {
-          const b = await tx.get(batchRef);
-          const d = b.data() || {};
+      // FIX: Atomic idempotency check and status update
+      const shouldProceed = await db.runTransaction(async (tx: Transaction) => {
+        const job = await tx.get(jobRef);
+        const jobData = job.data();
 
-          // If still marked as processing, decrement it
-          if ((d.processing || 0) > 0) {
+        // Check terminal states atomically
+        if (jobData?.status === "success") {
+          const batch = await tx.get(batchRef);
+          const batchData = batch.data() || {};
+          if ((batchData.processing || 0) > 0) {
             tx.update(batchRef, {
               processing: FieldValue.increment(-1),
             });
           }
-        });
+          return false;
+        }
 
+        if (jobData?.status === "failed") {
+          return false; // Already failed, don't reprocess
+        }
+
+        // Proceed with processing
+        const prevAttempts = Number(jobData?.attempts || 0);
+        const jobStatus = jobData?.status;
+
+        const isFallbackAttempt =
+          jobStatus === "fallback_queued" || jobStatus === "attempting_fallback";
+        const firstAttempt =
+          (prevAttempts === 0 || jobStatus === "queued" || !jobStatus) && !isFallbackAttempt;
+
+        tx.set(
+          jobRef,
+          {
+            status: "processing",
+            attempts: (prevAttempts || 0) + 1,
+            lastAttemptAt: new Date(),
+          },
+          { merge: true },
+        );
+
+        const inc: any = { processing: FieldValue.increment(1) };
+        if (firstAttempt) inc.queued = FieldValue.increment(-1);
+        tx.update(batchRef, inc);
+
+        return true;
+      });
+
+      if (!shouldProceed) {
         await maybeCompleteBatch(batchRef);
-
         res.json({ ok: true, dedup: true });
         return;
       }
@@ -752,37 +730,6 @@ export const processShipmentTask = onRequest(
         }
         return;
       }
-
-      // --- Start bookkeeping (transaction) -----------------------------------
-      await db.runTransaction(async (tx: Transaction) => {
-        const snap = await tx.get(jobRef);
-        const data = snap.data() || {};
-        const prevAttempts = Number(data.attempts || 0);
-        const jobStatus = data.status;
-
-        // FIX: Don't decrement queued if this is a fallback attempt
-        // Fallback jobs go: processing → attempting_fallback → fallback_queued → processing
-        // They were never re-queued, so don't decrement queued again
-        const isFallbackAttempt =
-          jobStatus === "fallback_queued" || jobStatus === "attempting_fallback";
-        const firstAttempt =
-          (prevAttempts === 0 || jobStatus === "queued" || !jobStatus) && !isFallbackAttempt;
-
-        // move to processing, increment attempts
-        tx.set(
-          jobRef,
-          {
-            status: "processing",
-            attempts: (prevAttempts || 0) + 1,
-            lastAttemptAt: new Date(),
-          },
-          { merge: true },
-        );
-
-        const inc: any = { processing: FieldValue.increment(1) };
-        if (firstAttempt) inc.queued = FieldValue.increment(-1);
-        tx.update(batchRef, inc);
-      });
 
       // Allocate AWB
       awb = await allocateAwb(shop);
@@ -916,10 +863,20 @@ export const processShipmentTask = onRequest(
       }
 
       // --- Success path ------------------------------------------------------
-      awbReleased = true; // guard: DO NOT release a used AWB if anything throws after this
+      // FIX: Atomic success update
+      awbReleased = true;
 
-      await Promise.all([
-        jobRef.update({
+      await db.runTransaction(async (tx: Transaction) => {
+        const job = await tx.get(jobRef);
+        const jobData = job.data();
+
+        // Prevent double-counting
+        if (jobData?.status === "success") {
+          return; // Already processed
+        }
+
+        // Update atomically
+        tx.update(jobRef, {
           status: "success",
           awb,
           carrierShipmentId: verdict.carrierShipmentId ?? null,
@@ -927,15 +884,18 @@ export const processShipmentTask = onRequest(
           errorMessage: FieldValue.delete(),
           apiResp: carrier,
           completedAt: FieldValue.serverTimestamp(),
-        }),
-        batchRef.update({
+        });
+
+        tx.update(batchRef, {
           processing: FieldValue.increment(-1),
           success: FieldValue.increment(1),
-        }),
-        orderRef.set(
+        });
+
+        tx.set(
+          orderRef,
           {
             awb,
-            courier: "Delhivery",
+            courier: "Delhivery", // Change to "Shiprocket" or "Xpressbees" as appropriate
             customStatus: "Ready To Dispatch",
             shippingMode,
             lastStatusUpdate: FieldValue.serverTimestamp(),
@@ -946,8 +906,8 @@ export const processShipmentTask = onRequest(
             }),
           },
           { merge: true },
-        ),
-      ]);
+        );
+      });
 
       await maybeCompleteBatch(batchRef);
 
@@ -1202,33 +1162,62 @@ export const processShipmentTask2 = onRequest(
       const orderRef = db.collection("accounts").doc(shop).collection("orders").doc(String(jobId));
       const accountRef = db.collection("accounts").doc(shop);
 
-      // Idempotency: if already success, just ack
-      const jSnap = await jobRef.get();
-      if (jSnap.exists && jSnap.data()?.status === "success") {
-        // Ensure batch counters are consistent on retry
-        await db.runTransaction(async (tx: Transaction) => {
-          const b = await tx.get(batchRef);
-          const d = b.data() || {};
+      // FIX: Atomic idempotency check inside transaction
+      const shouldProceed = await db.runTransaction(async (tx: Transaction) => {
+        const job = await tx.get(jobRef);
+        const jobData = job.data();
 
-          // If still marked as processing, fix the counter
-          if ((d.processing || 0) > 0) {
+        // Check terminal states atomically
+        if (jobData?.status === "success") {
+          const batch = await tx.get(batchRef);
+          const batchData = batch.data() || {};
+          if ((batchData.processing || 0) > 0) {
             tx.update(batchRef, {
               processing: FieldValue.increment(-1),
             });
           }
-        });
+          return false;
+        }
 
+        if (jobData?.status === "failed") {
+          return false;
+        }
+
+        const prevAttempts = Number(jobData?.attempts || 0);
+        const jobStatus = jobData?.status;
+
+        const isFallbackAttempt =
+          jobStatus === "fallback_queued" || jobStatus === "attempting_fallback";
+        const firstAttempt =
+          (prevAttempts === 0 || jobStatus === "queued" || !jobStatus) && !isFallbackAttempt;
+
+        tx.set(
+          jobRef,
+          {
+            status: "processing",
+            attempts: (prevAttempts || 0) + 1,
+            lastAttemptAt: new Date(),
+          },
+          { merge: true },
+        );
+
+        const inc: any = { processing: FieldValue.increment(1) };
+        if (firstAttempt) inc.queued = FieldValue.increment(-1);
+        tx.update(batchRef, inc);
+
+        return true;
+      });
+
+      if (!shouldProceed) {
         await maybeCompleteBatch(batchRef);
-
         return void res.json({ ok: true, dedup: true });
       }
 
-      // Load order first to check status
+      // Load order to check status
       const ordSnap = await orderRef.get();
       if (!ordSnap.exists) throw new Error("ORDER_NOT_FOUND");
       const order = ordSnap.data();
 
-      // Check if order is in correct status for shipping
       if (order?.customStatus !== "Confirmed") {
         const failure = await handleJobFailure({
           shop,
@@ -1253,35 +1242,6 @@ export const processShipmentTask2 = onRequest(
           });
         }
       }
-
-      // --- Start bookkeeping (transaction) -----------------------------------
-      await db.runTransaction(async (tx: Transaction) => {
-        const snap = await tx.get(jobRef);
-        const data = snap.data() || {};
-        const prevAttempts = Number(data.attempts || 0);
-        const jobStatus = data.status;
-
-        // FIX: Don't decrement queued if this is a fallback attempt
-        const isFallbackAttempt =
-          jobStatus === "fallback_queued" || jobStatus === "attempting_fallback";
-        const firstAttempt =
-          (prevAttempts === 0 || jobStatus === "queued" || !jobStatus) && !isFallbackAttempt;
-
-        // move to processing, increment attempts
-        tx.set(
-          jobRef,
-          {
-            status: "processing",
-            attempts: (prevAttempts || 0) + 1,
-            lastAttemptAt: new Date(),
-          },
-          { merge: true },
-        );
-
-        const inc: any = { processing: FieldValue.increment(1) };
-        if (firstAttempt) inc.queued = FieldValue.increment(-1);
-        tx.update(batchRef, inc);
-      });
       // ----------------------------------------------------------------------
 
       // Carrier token/config
@@ -1537,36 +1497,45 @@ export const processShipmentTask2 = onRequest(
           "Shiprocket: Pickup Request failed, please do it manually on shiprocket";
       }
 
-      // Mark job as success
-      const jobUpdate: any = {
-        status: "success",
-        awb: awbCode,
-        carrierShipmentId: srShipmentId ?? null,
-        carrier: "Shiprocket",
-        courierName: courierName ?? null,
-        courierCompanyId: courierId ?? null,
-        errorCode: FieldValue.delete(),
-        completedAt: FieldValue.serverTimestamp(),
-        apiResp: {
-          orderCreate: srOrderId ? "persisted" : "reused",
-          awbAssign: awbJson,
-        },
-      };
+      // FIX: Atomic success update
+      await db.runTransaction(async (tx: Transaction) => {
+        const job = await tx.get(jobRef);
+        const jobData = job.data();
 
-      // Set or delete errorMessage based on pickup result
-      if (pickupErrorMessage) {
-        jobUpdate.errorMessage = pickupErrorMessage;
-      } else {
-        jobUpdate.errorMessage = FieldValue.delete();
-      }
+        if (jobData?.status === "success") {
+          return; // Already processed
+        }
 
-      await Promise.all([
-        jobRef.update(jobUpdate),
-        batchRef.update({
+        const jobUpdate: any = {
+          status: "success",
+          awb: awbCode,
+          carrierShipmentId: srShipmentId ?? null,
+          carrier: "Shiprocket",
+          courierName: courierName ?? null,
+          courierCompanyId: courierId ?? null,
+          errorCode: FieldValue.delete(),
+          completedAt: FieldValue.serverTimestamp(),
+          apiResp: {
+            orderCreate: srOrderId ? "persisted" : "reused",
+            awbAssign: awbJson,
+          },
+        };
+
+        if (pickupErrorMessage) {
+          jobUpdate.errorMessage = pickupErrorMessage;
+        } else {
+          jobUpdate.errorMessage = FieldValue.delete();
+        }
+
+        tx.update(jobRef, jobUpdate);
+
+        tx.update(batchRef, {
           processing: FieldValue.increment(-1),
           success: FieldValue.increment(1),
-        }),
-        orderRef.set(
+        });
+
+        tx.set(
+          orderRef,
           {
             awb: awbCode,
             courier: `Shiprocket: ${courierName ?? "Unknown"}`,
@@ -1579,8 +1548,8 @@ export const processShipmentTask2 = onRequest(
             }),
           },
           { merge: true },
-        ),
-      ]);
+        );
+      });
 
       await maybeCompleteBatch(batchRef);
 
@@ -1854,30 +1823,62 @@ export const processShipmentTask3 = onRequest(
       const orderRef = db.collection("accounts").doc(shop).collection("orders").doc(String(jobId));
       const accountRef = db.collection("accounts").doc(shop);
 
-      // Idempotency: if already success, just ack
-      const jSnap = await jobRef.get();
-      if (jSnap.exists && jSnap.data()?.status === "success") {
-        await db.runTransaction(async (tx: Transaction) => {
-          const b = await tx.get(batchRef);
-          const d = b.data() || {};
-          if ((d.processing || 0) > 0) {
+      // FIX: Atomic idempotency check inside transaction
+      const shouldProceed = await db.runTransaction(async (tx: Transaction) => {
+        const job = await tx.get(jobRef);
+        const jobData = job.data();
+
+        if (jobData?.status === "success") {
+          const batch = await tx.get(batchRef);
+          const batchData = batch.data() || {};
+          if ((batchData.processing || 0) > 0) {
             tx.update(batchRef, {
               processing: FieldValue.increment(-1),
             });
           }
-        });
+          return false;
+        }
 
+        if (jobData?.status === "failed") {
+          return false;
+        }
+
+        const prevAttempts = Number(jobData?.attempts || 0);
+        const jobStatus = jobData?.status;
+
+        const isFallbackAttempt =
+          jobStatus === "fallback_queued" || jobStatus === "attempting_fallback";
+        const firstAttempt =
+          (prevAttempts === 0 || jobStatus === "queued" || !jobStatus) && !isFallbackAttempt;
+
+        tx.set(
+          jobRef,
+          {
+            status: "processing",
+            attempts: (prevAttempts || 0) + 1,
+            lastAttemptAt: new Date(),
+          },
+          { merge: true },
+        );
+
+        const inc: any = { processing: FieldValue.increment(1) };
+        if (firstAttempt) inc.queued = FieldValue.increment(-1);
+        tx.update(batchRef, inc);
+
+        return true;
+      });
+
+      if (!shouldProceed) {
         await maybeCompleteBatch(batchRef);
         res.json({ ok: true, dedup: true });
         return;
       }
 
-      // Load order first to check status
+      // Load order to check status
       const ordSnap = await orderRef.get();
       if (!ordSnap.exists) throw new Error("ORDER_NOT_FOUND");
       const order = ordSnap.data();
 
-      // Check if order is in correct status for shipping
       if (order?.customStatus !== "Confirmed") {
         const failure = await handleJobFailure({
           shop,
@@ -1903,33 +1904,6 @@ export const processShipmentTask3 = onRequest(
         }
         return;
       }
-
-      // --- Start bookkeeping (transaction) -----------------------------------
-      await db.runTransaction(async (tx: Transaction) => {
-        const snap = await tx.get(jobRef);
-        const data = snap.data() || {};
-        const prevAttempts = Number(data.attempts || 0);
-        const jobStatus = data.status;
-
-        const isFallbackAttempt =
-          jobStatus === "fallback_queued" || jobStatus === "attempting_fallback";
-        const firstAttempt =
-          (prevAttempts === 0 || jobStatus === "queued" || !jobStatus) && !isFallbackAttempt;
-
-        tx.set(
-          jobRef,
-          {
-            status: "processing",
-            attempts: (prevAttempts || 0) + 1,
-            lastAttemptAt: new Date(),
-          },
-          { merge: true },
-        );
-
-        const inc: any = { processing: FieldValue.increment(1) };
-        if (firstAttempt) inc.queued = FieldValue.increment(-1);
-        tx.update(batchRef, inc);
-      });
 
       // Get Xpressbees API key
       const accSnap = await accountRef.get();
@@ -2081,8 +2055,16 @@ export const processShipmentTask3 = onRequest(
       }
 
       // --- Success path ------------------------------------------------------
-      await Promise.all([
-        jobRef.update({
+      // FIX: Atomic success update
+      await db.runTransaction(async (tx: Transaction) => {
+        const job = await tx.get(jobRef);
+        const jobData = job.data();
+
+        if (jobData?.status === "success") {
+          return; // Already processed
+        }
+
+        tx.update(jobRef, {
           status: "success",
           awb: verdict.awbNumber ?? null,
           carrierShipmentId: verdict.shipmentId ?? null,
@@ -2092,12 +2074,15 @@ export const processShipmentTask3 = onRequest(
           errorMessage: FieldValue.delete(),
           apiResp: carrier,
           completedAt: FieldValue.serverTimestamp(),
-        }),
-        batchRef.update({
+        });
+
+        tx.update(batchRef, {
           processing: FieldValue.increment(-1),
           success: FieldValue.increment(1),
-        }),
-        orderRef.set(
+        });
+
+        tx.set(
+          orderRef,
           {
             awb: verdict.awbNumber ?? null,
             courier: `Xpressbees: ${verdict.courierName ?? "Unknown"}`,
@@ -2111,8 +2096,8 @@ export const processShipmentTask3 = onRequest(
             }),
           },
           { merge: true },
-        ),
-      ]);
+        );
+      });
 
       await maybeCompleteBatch(batchRef);
 
