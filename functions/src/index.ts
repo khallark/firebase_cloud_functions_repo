@@ -83,7 +83,8 @@ async function handleJobFailure(params: {
   const isExceptionError =
     errorCode === "INSUFFICIENT_BALANCE" ||
     errorCode === "ORDER_ALREADY_SHIPPED" ||
-    errorCode === "ORDER_NOT_FOUND";
+    errorCode === "ORDER_NOT_FOUND" ||
+    errorCode === "COURIER_SELECTION_FAILED";
 
   // Priority fallback conditions:
   // 1. It's a Priority job
@@ -105,11 +106,6 @@ async function handleJobFailure(params: {
         ...(apiResp && { lastApiResp: apiResp }),
       });
 
-      // **FIX: Decrement processing counter when moving to fallback**
-      await batchRef.update({
-        processing: FieldValue.increment(-1),
-      });
-
       // Queue fallback handler task
       await createTask(
         { shop, batchId: batchRef.id, jobId },
@@ -120,6 +116,11 @@ async function handleJobFailure(params: {
           delaySeconds: 2,
         },
       );
+
+      // **FIX: Decrement processing counter when moving to fallback**
+      await batchRef.update({
+        processing: FieldValue.increment(-1),
+      });
 
       console.log(`Priority fallback triggered for job ${jobId} after ${errorCode}`);
 
@@ -208,7 +209,7 @@ export const enqueueShipmentTasks = onRequest(
 
       const priorityCourier =
         courier === "Priority"
-          ? shopDoc?.integrations?.couriers?.priorityList?.[0]?.toLowerCase()
+          ? shopDoc?.integrations?.couriers?.priorityList?.[0]?.name.toLowerCase()
           : null;
 
       const url = (() => {
@@ -346,6 +347,22 @@ export const handlePriorityFallback = onRequest(
       }
 
       const jobData = jobSnap.data()!;
+
+      // **ADD THIS CHECK:**
+      // If job is already processing or completed, don't queue another fallback
+      if (
+        jobData.status === "processing" ||
+        jobData.status === "success" ||
+        jobData.status === "failed"
+      ) {
+        res.json({
+          ok: true,
+          action: "already_handled",
+          message: `Job already in ${jobData.status} state`,
+        });
+        return;
+      }
+
       const batchData = batchSnap.data()!;
       const shopDoc = shopSnap.data()!;
 
@@ -377,9 +394,9 @@ export const handlePriorityFallback = onRequest(
       }
 
       // Determine current courier and find its index
-      const currentCourier = jobData.courier || capitalizeWords(priorityList[0]);
+      const currentCourier = jobData.courier || capitalizeWords(priorityList[0]?.name);
       const currentIndex = priorityList.findIndex(
-        (c: string) => capitalizeWords(c) === currentCourier,
+        (c: any) => capitalizeWords(c?.name) === currentCourier,
       );
 
       if (currentIndex === -1) {
@@ -436,11 +453,11 @@ export const handlePriorityFallback = onRequest(
       }
 
       // Get next courier
-      const nextCourier = capitalizeWords(priorityList[nextIndex]);
+      const nextCourier = capitalizeWords(priorityList[nextIndex]?.name);
 
       // Determine target URL for next courier
       const url = (() => {
-        const courierLower = priorityList[nextIndex].toLowerCase();
+        const courierLower = priorityList[nextIndex]?.name.toLowerCase();
         if (courierLower === "delhivery") {
           return String(process.env.SHIPMENT_TASK_TARGET_URL_1);
         }
@@ -453,21 +470,45 @@ export const handlePriorityFallback = onRequest(
         throw new Error(`Unsupported fallback courier: ${courierLower}`);
       })();
 
-      // Update job document with fallback info
+      // // Update job document with fallback info
+      // await jobRef.update({
+      //   status: "fallback_queued",
+      //   courier: nextCourier,
+      //   attempts: 0, // Reset attempts for new courier
+      //   previousCouriers: FieldValue.arrayUnion(currentCourier),
+      //   fallbackAttempt: (jobData.fallbackAttempt || 0) + 1,
+      //   lastFallbackAt: FieldValue.serverTimestamp(),
+      //   // Clear old error fields
+      //   errorCode: FieldValue.delete(),
+      //   errorMessage: FieldValue.delete(),
+      // });
+
       const previousCouriers = jobData.previousCouriers || [];
-      await jobRef.update({
-        status: "fallback_queued",
-        courier: nextCourier,
-        attempts: 0, // Reset attempts for new courier
-        previousCouriers: FieldValue.arrayUnion(currentCourier),
-        fallbackAttempt: (jobData.fallbackAttempt || 0) + 1,
-        lastFallbackAt: FieldValue.serverTimestamp(),
-        // Clear old error fields
-        errorCode: FieldValue.delete(),
-        errorMessage: FieldValue.delete(),
+
+      // In handlePriorityFallback, before creating new task:
+      await db.runTransaction(async (tx: Transaction) => {
+        const currentJob = await tx.get(jobRef);
+        const currentData = currentJob.data();
+
+        // Only proceed if job is in expected state
+        if (currentData?.status !== "attempting_fallback") {
+          throw new Error("Job not in expected state for fallback");
+        }
+
+        // Update job status atomically
+        tx.update(jobRef, {
+          status: "fallback_queued",
+          courier: nextCourier,
+          attempts: 0,
+          previousCouriers: FieldValue.arrayUnion(currentCourier),
+          fallbackAttempt: (currentData.fallbackAttempt || 0) + 1,
+          lastFallbackAt: FieldValue.serverTimestamp(),
+          errorCode: FieldValue.delete(),
+          errorMessage: FieldValue.delete(),
+        });
       });
 
-      // Create new Cloud Task for fallback courier
+      // Create task AFTER atomic status update
       await createTask(
         {
           shop,
@@ -1005,11 +1046,14 @@ export const processShipmentTask2 = onRequest(
       return false;
     }
 
-    /** Extract error info from Shiprocket error response (non-2xx only) */
-    function extractShiprocketError(sr: any): {
+    /** Classify Shiprocket create-order response (works for all responses) */
+    function evalShiprocketResp(sr: any): {
+      ok: boolean;
+      retryable: boolean;
       code: string;
       message: string;
-      isInsufficientBalance: boolean;
+      orderId?: string | number | null;
+      shipmentId?: string | number | null;
     } {
       const msgFields = [
         sr?.message,
@@ -1021,7 +1065,23 @@ export const processShipmentTask2 = onRequest(
         .filter((x) => typeof x === "string" && x.length)
         .join(" | ");
 
-      const rawMsg = msgFields || "carrier error";
+      const rawMsg = msgFields || "";
+
+      // Success shape seen in docs: { order_id, shipment_id, status: "NEW", status_code: 1, ... }
+      const looksSuccess = !("status_code" in (sr ?? {})) || sr?.status_code === 1;
+
+      if (looksSuccess) {
+        return {
+          ok: true,
+          retryable: false,
+          code: "OK",
+          message: "created",
+          orderId: sr?.order_id ?? null,
+          shipmentId: sr?.shipment_id ?? null,
+        };
+      }
+
+      // Check for insufficient balance error
       const lowerMsg = rawMsg.toLowerCase();
 
       const balanceKeywords = [
@@ -1041,12 +1101,22 @@ export const processShipmentTask2 = onRequest(
         "credit limit",
       ];
 
-      const isInsufficientBalance = balanceKeywords.some((keyword) => lowerMsg.includes(keyword));
+      const isBalanceError = balanceKeywords.some((keyword) => lowerMsg.includes(keyword));
+
+      if (isBalanceError) {
+        return {
+          ok: false,
+          retryable: false,
+          code: "INSUFFICIENT_BALANCE",
+          message: rawMsg || "Insufficient balance in carrier account",
+        };
+      }
 
       return {
-        code: isInsufficientBalance ? "INSUFFICIENT_BALANCE" : "CARRIER_ERROR",
-        message: rawMsg,
-        isInsufficientBalance,
+        ok: false,
+        retryable: httpRetryable(sr?.status_code),
+        code: "CARRIER_AMBIGUOUS",
+        message: rawMsg || "carrier error",
       };
     }
 
@@ -1073,17 +1143,18 @@ export const processShipmentTask2 = onRequest(
         const pickupText = await pickupResp.text();
         const pickupJson = parseJson(pickupText);
 
-        // Check for non-2xx responses
-        if (!pickupResp.ok) {
-          const errorInfo = extractShiprocketError(pickupJson);
+        // Evaluate all responses (both 2xx and non-2xx)
+        const verdict = evalShiprocketResp(pickupJson);
+
+        if (!verdict.ok) {
           return {
             success: false,
-            error: errorInfo.message || `HTTP ${pickupResp.status}`,
+            error: verdict.message || `HTTP ${pickupResp.status}`,
             data: pickupJson,
           };
         }
 
-        // For 2xx responses, check for success indicator
+        // Success response has pickup_status: 1
         if (pickupJson?.pickup_status === 1) {
           return {
             success: true,
@@ -1091,7 +1162,7 @@ export const processShipmentTask2 = onRequest(
           };
         }
 
-        // 2xx but no success indicator - treat as failure
+        // Ambiguous response - no clear error but no success either
         return {
           success: false,
           error: pickupJson?.message || "Unknown pickup error",
@@ -1277,17 +1348,23 @@ export const processShipmentTask2 = onRequest(
         const text = await resp.text();
         const orderCreateJson = parseJson(text);
 
-        // Handle non-2xx responses
-        if (!resp.ok) {
-          const errorInfo = extractShiprocketError(orderCreateJson);
+        // Evaluate response (works for both 2xx and non-2xx)
+        const verdict = evalShiprocketResp(orderCreateJson);
+
+        // Handle both HTTP errors and business logic errors
+        if (!verdict.ok) {
+          const errorCode = verdict.code;
+          const errorMessage = verdict.message;
+          const isRetryable = verdict.retryable;
+
           const failure = await handleJobFailure({
             shop,
             batchRef,
             jobRef,
             jobId,
-            errorCode: errorInfo.code,
-            errorMessage: errorInfo.message,
-            isRetryable: httpRetryable(resp.status) && !errorInfo.isInsufficientBalance,
+            errorCode,
+            errorMessage,
+            isRetryable,
             apiResp: orderCreateJson,
           });
 
@@ -1295,7 +1372,7 @@ export const processShipmentTask2 = onRequest(
             return void res.status(failure.statusCode).json({
               ok: false,
               reason: failure.reason,
-              code: errorInfo.code,
+              code: errorCode,
             });
           } else {
             return void res.status(failure.statusCode).json({
@@ -1305,19 +1382,19 @@ export const processShipmentTask2 = onRequest(
           }
         }
 
-        // 2xx response - extract data directly
-        srOrderId = orderCreateJson?.order_id;
-        srShipmentId = orderCreateJson?.shipment_id;
+        // Extract data from successful response
+        srOrderId = verdict.orderId ?? orderCreateJson?.order_id;
+        srShipmentId = verdict.shipmentId ?? orderCreateJson?.shipment_id;
 
         if (!srShipmentId) {
-          // This shouldn't happen with 2xx, but handle gracefully
+          // This shouldn't happen with successful verdict, but handle gracefully
           const failure = await handleJobFailure({
             shop,
             batchRef,
             jobRef,
             jobId,
             errorCode: "MISSING_SHIPMENT_ID",
-            errorMessage: "Shiprocket returned 2xx but missing shipment_id",
+            errorMessage: "Shiprocket returned success but missing shipment_id",
             isRetryable: true,
             apiResp: orderCreateJson,
           });
@@ -1376,17 +1453,23 @@ export const processShipmentTask2 = onRequest(
       const awbText = await awbResp.text();
       const awbJson = parseJson(awbText);
 
-      // Handle non-2xx responses
-      if (!awbResp.ok) {
-        const errorInfo = extractShiprocketError(awbJson);
+      // Evaluate response (works for both 2xx and non-2xx)
+      const awbVerdict = evalShiprocketResp(awbJson);
+
+      // Handle both HTTP errors and business logic errors
+      if (!awbVerdict.ok) {
+        const errorCode = awbVerdict.code;
+        const errorMessage = awbVerdict.message;
+        const isRetryable = awbVerdict.retryable;
+
         const failure = await handleJobFailure({
           shop,
           batchRef,
           jobRef,
           jobId,
-          errorCode: errorInfo.code,
-          errorMessage: errorInfo.message,
-          isRetryable: httpRetryable(awbResp.status) && !errorInfo.isInsufficientBalance,
+          errorCode,
+          errorMessage,
+          isRetryable,
           apiResp: awbJson,
         });
 
@@ -1394,7 +1477,7 @@ export const processShipmentTask2 = onRequest(
           return void res.status(failure.statusCode).json({
             ok: false,
             reason: failure.reason,
-            code: errorInfo.code,
+            code: errorCode,
           });
         } else {
           return void res.status(failure.statusCode).json({
@@ -1404,21 +1487,21 @@ export const processShipmentTask2 = onRequest(
         }
       }
 
-      // 2xx response - extract AWB data directly
+      // Extract AWB data from successful response
       const node = awbJson?.response?.data ?? awbJson?.data ?? awbJson?.response ?? awbJson;
       const awbCode = node?.awb_code ?? null;
       const courierName = node?.courier_name ?? null;
       const courierId = node?.courier_company_id ?? null;
 
       if (!awbCode) {
-        // This shouldn't happen with 2xx, but handle gracefully
+        // This shouldn't happen with successful verdict, but handle gracefully
         const failure = await handleJobFailure({
           shop,
           batchRef,
           jobRef,
           jobId,
           errorCode: "MISSING_AWB_CODE",
-          errorMessage: "Shiprocket returned 2xx but missing AWB code",
+          errorMessage: "Shiprocket returned success but missing AWB code",
           isRetryable: true,
           apiResp: awbJson,
         });
@@ -3134,7 +3217,7 @@ async function maybeCompleteSummary(summaryRef: DocumentReference) {
 // ============================================================================
 // SHARED UTILITIES - Used by both scheduled and manual updates
 // ============================================================================
-function determineNewStatus(status: any): string | null {
+function determineNewDelhiveryStatus(status: any): string | null {
   const { Status, StatusType } = status;
 
   const statusMap: Record<string, Record<string, string>> = {
@@ -3180,11 +3263,11 @@ const MANUAL_CHUNK_SIZE = 100; // Order IDs processed per manual task
 const API_BATCH_SIZE = 50; // Orders per Delhivery API call
 
 // ============================================================================
-// SCHEDULED STATUS UPDATES
+// SCHEDULED DELHIVERY STATUS UPDATES
 // ============================================================================
 
 // 1. SCHEDULER - Enqueues initial tasks (one per account)
-export const enqueueStatusUpdateTasksScheduled = onSchedule(
+export const enqueueDelhiveryStatusUpdateTasksScheduled = onSchedule(
   {
     schedule: "0 0,4,8,12,16,20 * * *", // 6 times daily
     timeZone: "Asia/Kolkata",
@@ -3399,7 +3482,7 @@ export const updateDelhiveryStatusesJob = onRequest(
       if (!apiKey) throw new Error("API_KEY_MISSING");
 
       // Process one chunk of orders
-      const result = await processOrderChunk(accountId, apiKey, cursor);
+      const result = await processDelhiveryOrderChunk(accountId, apiKey, cursor);
 
       // Update job progress
       await jobRef.update({
@@ -3480,7 +3563,7 @@ interface ChunkResult {
   nextCursor?: string;
 }
 
-async function processOrderChunk(
+async function processDelhiveryOrderChunk(
   accountId: string,
   apiKey: string,
   cursor: string | null,
@@ -3539,7 +3622,7 @@ async function processOrderChunk(
 
   for (let i = 0; i < eligibleOrders.length; i += API_BATCH_SIZE) {
     const batch = eligibleOrders.slice(i, Math.min(i + API_BATCH_SIZE, eligibleOrders.length));
-    const updates = await fetchAndProcessBatch(batch, apiKey);
+    const updates = await fetchAndProcessDelhiveryBatch(batch, apiKey);
 
     // Apply updates using Firestore batch writes
     if (updates.length > 0) {
@@ -3575,7 +3658,10 @@ interface OrderUpdate {
   data: any;
 }
 
-async function fetchAndProcessBatch(orders: any[], apiKey: string): Promise<OrderUpdate[]> {
+async function fetchAndProcessDelhiveryBatch(
+  orders: any[],
+  apiKey: string,
+): Promise<OrderUpdate[]> {
   const waybills = orders
     .map((order) => (order.customStatus?.includes("DTO") ? order.awb_reverse : order.awb))
     .filter(Boolean)
@@ -3603,7 +3689,7 @@ async function fetchAndProcessBatch(orders: any[], apiKey: string): Promise<Orde
     const trackingData = (await response.json()) as any;
     const shipments = trackingData.ShipmentData || [];
 
-    return prepareOrderUpdates(orders, shipments);
+    return prepareDelhiveryOrderUpdates(orders, shipments);
   } catch (error: any) {
     console.error("Batch processing error:", error);
     if (error.message.startsWith("HTTP_")) {
@@ -3614,7 +3700,7 @@ async function fetchAndProcessBatch(orders: any[], apiKey: string): Promise<Orde
 }
 
 // 5. UPDATE PREPARATION - Maps API responses to Firestore updates
-function prepareOrderUpdates(orders: any[], shipments: any[]): OrderUpdate[] {
+function prepareDelhiveryOrderUpdates(orders: any[], shipments: any[]): OrderUpdate[] {
   const updates: OrderUpdate[] = [];
   const ordersByName = new Map(orders.map((o) => [o.name, o]));
 
@@ -3625,7 +3711,7 @@ function prepareOrderUpdates(orders: any[], shipments: any[]): OrderUpdate[] {
     const order = ordersByName.get(shipment.ReferenceNo);
     if (!order) continue;
 
-    const newStatus = determineNewStatus(shipment.Status);
+    const newStatus = determineNewDelhiveryStatus(shipment.Status);
     if (!newStatus) continue;
     if (newStatus === order.customStatus) continue;
     if (newStatus === "Closed/Cancelled Conditional") {
@@ -3759,6 +3845,498 @@ async function handleJobError(error: any, body: any): Promise<void> {
     console.error("Failed to update job with error status:", e);
   }
 }
+
+// ============================================================================
+// SHARED UTILITIES - Used by both scheduled and manual updates
+// ============================================================================
+// function determineNewShiprocketStatus(currentStatus: string): string | null {
+//   const statusMap: Record<string, string> = {
+//     "In Transit": "In Transit",
+//     "Out For Delivery": "Out For Delivery",
+//     "Delivered": "Delivered",
+//   };
+
+//   return statusMap[currentStatus] || null;
+// }
+
+// // ============================================================================
+// // SCHEDULED SHIPROCKET STATUS UPDATES
+// // ============================================================================
+
+// // 1. SCHEDULER - Enqueues initial tasks (one per account)
+// export const enqueueShiprocketStatusUpdateTasksScheduled = onSchedule(
+//   {
+//     schedule: "0 0,4,8,12,16,20 * * *", // 6 times daily
+//     timeZone: "Asia/Kolkata",
+//     region: process.env.LOCATION || "asia-south1",
+//     memory: "512MiB",
+//     timeoutSeconds: 540,
+//     secrets: [TASKS_SECRET],
+//   },
+//   async (event) => {
+//     console.log(`Starting scheduled Shiprocket status update batch processing...${event ? "" : ""}`);
+
+//     try {
+//       const usersSnapshot = await db.collection("users").where("activeAccountId", "!=", null).get();
+
+//       if (usersSnapshot.empty) {
+//         console.log("No users with active accounts found");
+//         return;
+//       }
+
+//       // Group users by account and filter for Shiprocket integration
+//       const accountToUsers = new Map<string, string[]>();
+//       let totalUsersCount = 0;
+
+//       for (const userDoc of usersSnapshot.docs) {
+//         const userId = userDoc.id;
+//         const activeAccountId = userDoc.get("activeAccountId");
+//         if (!activeAccountId) continue;
+
+//         try {
+//           const accountDoc = await db.collection("accounts").doc(activeAccountId).get();
+//           if (!accountDoc.exists) continue;
+
+//           const apiKey = accountDoc.data()?.integrations?.couriers?.shiprocket?.apiKey;
+//           if (apiKey) {
+//             if (!accountToUsers.has(activeAccountId)) {
+//               accountToUsers.set(activeAccountId, []);
+//             }
+//             accountToUsers.get(activeAccountId)!.push(userId);
+//             totalUsersCount++;
+//           }
+//         } catch (error) {
+//           console.error(`Error checking account ${activeAccountId}:`, error);
+//         }
+//       }
+
+//       if (accountToUsers.size === 0) {
+//         console.log("No accounts with Shiprocket integration found");
+//         return;
+//       }
+
+//       console.log(
+//         `Found ${accountToUsers.size} accounts with Shiprocket (${totalUsersCount} users)`,
+//       );
+
+//       // Create batch header
+//       const batchRef = db.collection("status_update_batches").doc();
+//       const batchId = batchRef.id;
+
+//       await batchRef.set({
+//         createdAt: FieldValue.serverTimestamp(),
+//         createdBy: "system-scheduled",
+//         total: accountToUsers.size,
+//         totalUsers: totalUsersCount,
+//         queued: accountToUsers.size,
+//         status: "running",
+//         processing: 0,
+//         success: 0,
+//         failed: 0,
+//         type: "status_update",
+//         schedule: "6x_daily",
+//         courier: "shiprocket",
+//       });
+
+//       // Create job documents (one per account)
+//       const writer = db.bulkWriter();
+//       for (const [accountId, userIds] of accountToUsers) {
+//         writer.set(
+//           batchRef.collection("jobs").doc(accountId),
+//           {
+//             accountId,
+//             userIds,
+//             userCount: userIds.length,
+//             status: "queued",
+//             attempts: 0,
+//             createdAt: FieldValue.serverTimestamp(),
+//             processedOrders: 0,
+//             updatedOrders: 0,
+//             totalChunks: 0,
+//           },
+//           { merge: true },
+//         );
+//       }
+//       await writer.close();
+
+//       const targetUrl = process.env.UPDATE_STATUS_TASK_JOB_TARGET_URL_SHIPROCKET;
+//       if (!targetUrl) {
+//         throw new Error("UPDATE_STATUS_TASK_TARGET_URL_SHIPROCKET not configured");
+//       }
+
+//       // Create initial tasks (chunk 0 for each account)
+//       const taskPromises = Array.from(accountToUsers.entries()).map(([accountId, userIds], index) =>
+//         createTask(
+//           {
+//             accountId,
+//             userIds,
+//             batchId,
+//             jobId: accountId,
+//             chunkIndex: 0,
+//             cursor: null,
+//           } as any,
+//           {
+//             tasksSecret: TASKS_SECRET.value() || "",
+//             url: targetUrl,
+//             queue: process.env.STATUS_UPDATE_QUEUE_NAME_SHIPROCKET || "shiprocket-status-update-queue",
+//             delaySeconds: Math.floor(index * 2),
+//           },
+//         ),
+//       );
+
+//       await Promise.all(taskPromises);
+
+//       console.log(`Enqueued ${accountToUsers.size} initial tasks for batch ${batchId}`);
+//     } catch (error) {
+//       console.error("enqueueShiprocketStatusUpdateTasks failed:", error);
+//       throw error;
+//     }
+//   },
+// );
+
+// // 2. MAIN TASK HANDLER - Processes one chunk and queues next if needed
+// export const updateShiprocketStatusesJob = onRequest(
+//   { cors: true, timeoutSeconds: 540, secrets: [TASKS_SECRET], memory: "512MiB" },
+//   async (req: Request, res: Response): Promise<void> => {
+//     try {
+//       requireHeaderSecret(req, "x-tasks-secret", TASKS_SECRET.value() || "");
+
+//       if (req.method !== "POST") {
+//         res.status(405).json({ error: "method_not_allowed" });
+//         return;
+//       }
+
+//       const {
+//         accountId,
+//         userIds,
+//         batchId,
+//         jobId,
+//         cursor = null,
+//         chunkIndex = 0,
+//       } = req.body as {
+//         accountId?: string;
+//         userIds?: string[];
+//         batchId?: string;
+//         jobId?: string;
+//         cursor?: string | null;
+//         chunkIndex?: number;
+//       };
+
+//       if (!accountId || !userIds?.length || !batchId || !jobId) {
+//         res.status(400).json({ error: "missing_required_params" });
+//         return;
+//       }
+
+//       const batchRef = db.collection("status_update_batches").doc(batchId);
+//       const jobRef = batchRef.collection("jobs").doc(jobId);
+
+//       // Idempotency check
+//       const jSnap = await jobRef.get();
+//       if (jSnap.exists && jSnap.data()?.status === "success") {
+//         res.json({ ok: true, dedup: true });
+//         return;
+//       }
+
+//       // Initialize job on first chunk
+//       if (chunkIndex === 0) {
+//         const validUserIds = await validateUsers(accountId, userIds);
+//         if (validUserIds.length === 0) {
+//           throw new Error("NO_VALID_USERS_FOR_ACCOUNT");
+//         }
+
+//         await db.runTransaction(async (tx: Transaction) => {
+//           const snap = await tx.get(jobRef);
+//           const data = snap.data() || {};
+//           const prevAttempts = Number(data.attempts || 0);
+//           const firstAttempt = prevAttempts === 0 || data.status === "queued";
+
+//           tx.set(
+//             jobRef,
+//             {
+//               status: "processing",
+//               attempts: (prevAttempts || 0) + 1,
+//               lastAttemptAt: FieldValue.serverTimestamp(),
+//               accountId,
+//               userIds: validUserIds,
+//               userCount: validUserIds.length,
+//               processedOrders: 0,
+//               updatedOrders: 0,
+//               totalChunks: 0,
+//             },
+//             { merge: true },
+//           );
+
+//           const inc: any = { processing: FieldValue.increment(1) };
+//           if (firstAttempt) inc.queued = FieldValue.increment(-1);
+//           tx.update(batchRef, inc);
+//         });
+//       }
+
+//       // Verify account and get API key
+//       const accountDoc = await db.collection("accounts").doc(accountId).get();
+//       if (!accountDoc.exists) throw new Error("ACCOUNT_NOT_FOUND");
+
+//       const apiKey = accountDoc.data()?.integrations?.couriers?.shiprocket?.apiKey;
+//       if (!apiKey) throw new Error("API_KEY_MISSING");
+
+//       // Process one chunk of orders
+//       const result = await processShiprocketOrderChunk(accountId, apiKey, cursor);
+
+//       // Update job progress
+//       await jobRef.update({
+//         processedOrders: FieldValue.increment(result.processed),
+//         updatedOrders: FieldValue.increment(result.updated),
+//         totalChunks: FieldValue.increment(1),
+//         lastChunkAt: FieldValue.serverTimestamp(),
+//         lastCursor: result.nextCursor || FieldValue.delete(),
+//       });
+
+//       // If more work remains, queue next chunk
+//       if (result.hasMore && result.nextCursor) {
+//         await queueNextChunk(TASKS_SECRET.value() || "", {
+//           accountId,
+//           userIds,
+//           batchId,
+//           jobId,
+//           cursor: result.nextCursor,
+//           chunkIndex: chunkIndex + 1,
+//         });
+
+//         res.json({
+//           ok: true,
+//           status: "chunk_completed",
+//           chunkIndex,
+//           processed: result.processed,
+//           updated: result.updated,
+//           hasMore: true,
+//         });
+//         return;
+//       }
+
+//       // Job complete
+//       const jobData = (await jobRef.get()).data() || {};
+//       await Promise.all([
+//         jobRef.update({
+//           status: "success",
+//           message: "status_update_completed",
+//           completedAt: FieldValue.serverTimestamp(),
+//         }),
+//         batchRef.update({
+//           processing: FieldValue.increment(-1),
+//           success: FieldValue.increment(1),
+//         }),
+//       ]);
+
+//       await maybeCompleteBatch(batchRef);
+
+//       res.json({
+//         ok: true,
+//         status: "job_completed",
+//         totalProcessed: jobData.processedOrders || 0,
+//         totalUpdated: jobData.updatedOrders || 0,
+//         totalChunks: jobData.totalChunks || 0,
+//       });
+//     } catch (error: any) {
+//       await handleJobError(error, req.body);
+//       const msg = error.message || String(error);
+//       const code = msg.split(/\s/)[0];
+//       const NON_RETRYABLE = ["ACCOUNT_NOT_FOUND", "API_KEY_MISSING", "NO_VALID_USERS_FOR_ACCOUNT"];
+//       const isRetryable = !NON_RETRYABLE.includes(code);
+
+//       res.status(isRetryable ? 503 : 200).json({
+//         ok: false,
+//         error: isRetryable ? "job_failed_transient" : "job_failed_permanent",
+//         code,
+//         message: msg,
+//       });
+//     }
+//   },
+// );
+
+// // 3. CHUNK PROCESSOR - Fetches and processes one page of orders
+// interface ChunkResult {
+//   processed: number;
+//   updated: number;
+//   hasMore: boolean;
+//   nextCursor?: string;
+// }
+
+// async function processShiprocketOrderChunk(
+//   accountId: string,
+//   apiKey: string,
+//   cursor: string | null,
+// ): Promise<ChunkResult> {
+//   const excludedStatuses = new Set([
+//     "New",
+//     "Confirmed",
+//     "Ready To Dispatch",
+//     "Delivered",
+//   ]);
+
+//   // Build paginated query - using array-contains to match couriers that include "Shiprocket"
+//   let query = db
+//     .collection("accounts")
+//     .doc(accountId)
+//     .collection("orders")
+//     .where("courier", ">=", "Shiprocket")
+//     .where("courier", "<=", "Shiprocket\uf8ff")
+//     .orderBy("courier")
+//     .orderBy("__name__")
+//     .limit(CHUNK_SIZE);
+
+//   if (cursor) {
+//     // Cursor should be in format "courier|docId"
+//     const [courierCursor, docIdCursor] = cursor.split("|");
+//     query = query.startAfter(courierCursor, docIdCursor);
+//   }
+
+//   const snapshot = await query.get();
+
+//   if (snapshot.empty) {
+//     return { processed: 0, updated: 0, hasMore: false };
+//   }
+
+//   const eligibleOrders = snapshot.docs
+//     .map((doc: QueryDocumentSnapshot) => ({ id: doc.id, ref: doc.ref, ...doc.data() }))
+//     .filter(
+//       (order: any) =>
+//         order.awb &&
+//         order.customStatus &&
+//         !excludedStatuses.has(order.customStatus) &&
+//         order.courier?.includes("Shiprocket")
+//     );
+
+//   if (eligibleOrders.length === 0) {
+//     const lastDoc = snapshot.docs[snapshot.docs.length - 1];
+//     const lastCourier = lastDoc.get("courier");
+//     return {
+//       processed: snapshot.size,
+//       updated: 0,
+//       hasMore: snapshot.size === CHUNK_SIZE,
+//       nextCursor: `${lastCourier}|${lastDoc.id}`,
+//     };
+//   }
+
+//   console.log(`Processing ${eligibleOrders.length} eligible Shiprocket orders for account ${accountId}`);
+
+//   // Process in API batches
+//   let totalUpdated = 0;
+
+//   for (let i = 0; i < eligibleOrders.length; i += API_BATCH_SIZE) {
+//     const batch = eligibleOrders.slice(i, Math.min(i + API_BATCH_SIZE, eligibleOrders.length));
+//     const updates = await fetchAndProcessShiprocketBatch(batch, apiKey);
+
+//     // Apply updates using Firestore batch writes
+//     if (updates.length > 0) {
+//       const writeBatch = db.batch();
+//       updates.forEach((update) => {
+//         writeBatch.update(update.ref, update.data);
+//       });
+//       await writeBatch.commit();
+//       totalUpdated += updates.length;
+//       console.log(`Updated ${updates.length} orders in API batch ${i / API_BATCH_SIZE + 1}`);
+//     }
+
+//     // Rate limiting between API calls
+//     if (i + API_BATCH_SIZE < eligibleOrders.length) {
+//       await sleep(150);
+//     }
+//   }
+
+//   const lastDoc = snapshot.docs[snapshot.docs.length - 1];
+//   const hasMore = snapshot.size === CHUNK_SIZE;
+//   const lastCourier = lastDoc.get("courier");
+
+//   return {
+//     processed: eligibleOrders.length,
+//     updated: totalUpdated,
+//     hasMore,
+//     nextCursor: hasMore ? `${lastCourier}|${lastDoc.id}` : undefined,
+//   };
+// }
+
+// // 4. API PROCESSOR - Calls Shiprocket and prepares updates
+// interface OrderUpdate {
+//   ref: DocumentReference;
+//   data: any;
+// }
+
+// async function fetchAndProcessShiprocketBatch(orders: any[], apiKey: string): Promise<OrderUpdate[]> {
+//   const awbs = orders.map((order) => order.awb).filter(Boolean);
+
+//   if (awbs.length === 0) return [];
+
+//   try {
+//     const trackingUrl = "https://apiv2.shiprocket.in/v1/external/courier/track/awbs";
+//     const response = await fetch(trackingUrl, {
+//       method: "POST",
+//       headers: {
+//         "Authorization": `Bearer ${apiKey}`,
+//         "Content-Type": "application/json",
+//         "Accept": "application/json",
+//       },
+//       body: JSON.stringify({ awbs }),
+//     });
+
+//     if (!response.ok) {
+//       if (response.status >= 500 || response.status === 429) {
+//         throw new Error(`HTTP_${response.status}`);
+//       }
+//       console.error(`Shiprocket API error: ${response.status}`);
+//       return [];
+//     }
+
+//     const trackingData = (await response.json()) as any;
+
+//     return prepareShiprocketOrderUpdates(orders, trackingData);
+//   } catch (error: any) {
+//     console.error("Batch processing error:", error);
+//     if (error.message.startsWith("HTTP_")) {
+//       throw error;
+//     }
+//     return [];
+//   }
+// }
+
+// // 5. UPDATE PREPARATION - Maps API responses to Firestore updates
+// function prepareShiprocketOrderUpdates(orders: any[], trackingData: any): OrderUpdate[] {
+//   const updates: OrderUpdate[] = [];
+//   const ordersByAwb = new Map(orders.map((o) => [o.awb, o]));
+
+//   for (const [awb, shipmentData] of Object.entries(trackingData)) {
+//     const order = ordersByAwb.get(awb);
+//     if (!order) continue;
+
+//     const shipmentInfo = shipmentData as any;
+//     const trackingDataObj = shipmentInfo?.tracking_data;
+//     if (!trackingDataObj) continue;
+
+//     const shipmentTrack = trackingDataObj.shipment_track;
+//     if (!Array.isArray(shipmentTrack) || shipmentTrack.length === 0) continue;
+
+//     const currentStatus = shipmentTrack[0]?.current_status;
+//     if (!currentStatus) continue;
+
+//     const newStatus = determineNewShiprocketStatus(currentStatus);
+//     if (!newStatus) continue;
+//     if (newStatus === order.customStatus) continue;
+
+//     updates.push({
+//       ref: order.ref,
+//       data: {
+//         customStatus: newStatus,
+//         lastStatusUpdate: FieldValue.serverTimestamp(),
+//         customStatusesLogs: FieldValue.arrayUnion({
+//           status: newStatus,
+//           createdAt: Timestamp.now(),
+//           remarks: getStatusRemarks(newStatus),
+//         }),
+//       },
+//     });
+//   }
+
+//   return updates;
+// }
 
 // ============================================================================
 // CRON JOB - Closes delivered orders after 144 hours
@@ -4293,7 +4871,7 @@ function prepareManualUpdates(
     const order = ordersByName.get(shipment.ReferenceNo);
     if (!order) continue;
 
-    const newStatus = determineNewStatus(shipment.Status);
+    const newStatus = determineNewDelhiveryStatus(shipment.Status);
     if (!newStatus) continue;
     if (newStatus === order.customStatus) continue;
     if (newStatus === "Closed/Cancelled Conditional") {
