@@ -896,6 +896,7 @@ export const processShipmentTask = onRequest(
           {
             awb,
             courier: "Delhivery", // Change to "Shiprocket" or "Xpressbees" as appropriate
+            courierProvider: "Delhivery",
             customStatus: "Ready To Dispatch",
             shippingMode,
             lastStatusUpdate: FieldValue.serverTimestamp(),
@@ -1539,6 +1540,7 @@ export const processShipmentTask2 = onRequest(
           {
             awb: awbCode,
             courier: `Shiprocket: ${courierName ?? "Unknown"}`,
+            courierProvider: "Shiprocket",
             customStatus: "Ready To Dispatch",
             lastStatusUpdate: FieldValue.serverTimestamp(),
             customStatusesLogs: FieldValue.arrayUnion({
@@ -2086,6 +2088,7 @@ export const processShipmentTask3 = onRequest(
           {
             awb: verdict.awbNumber ?? null,
             courier: `Xpressbees: ${verdict.courierName ?? "Unknown"}`,
+            courierProvider: "Xpressbees",
             customStatus: "Ready To Dispatch",
             shippingMode,
             lastStatusUpdate: FieldValue.serverTimestamp(),
@@ -2811,6 +2814,7 @@ export const processReturnShipmentTask = onRequest(
           {
             awb_reverse: awb,
             courier_reverse: "Delhivery",
+            courierReverseProvider: "Delhivery",
             customStatus: "DTO Booked",
             lastStatusUpdate: FieldValue.serverTimestamp(),
             customStatusesLogs: FieldValue.arrayUnion({
@@ -3759,7 +3763,7 @@ async function processDelhiveryOrderChunk(
     "Pending Refunds",
   ]);
 
-  // Build paginated query with OR condition
+  // Build paginated query with OR condition for both courier and courier_reverse
   let query = db
     .collection("accounts")
     .doc(accountId)
@@ -3967,7 +3971,6 @@ function determineNewShiprocketStatus(currentStatus: string): string | null {
     Delivered: "Delivered",
     "RTO IN INTRANSIT": "RTO In Transit",
   };
-
   return statusMap[currentStatus] || null;
 }
 
@@ -4289,21 +4292,22 @@ async function processShiprocketOrderChunk(
     "Pending Refunds",
   ]);
 
-  // Build paginated query - using array-contains to match couriers that include "Shiprocket"
+  // Build paginated query with OR condition for both courierProvider and courierReverseProvider
   let query = db
     .collection("accounts")
     .doc(accountId)
     .collection("orders")
-    .where("courier", ">=", "Shiprocket")
-    .where("courier", "<=", "Shiprocket\uf8ff")
-    .orderBy("courier")
+    .where(
+      Filter.or(
+        Filter.where("courierProvider", "==", "Shiprocket"),
+        Filter.where("courierReverseProvider", "==", "Shiprocket"),
+      ),
+    )
     .orderBy("__name__")
     .limit(CHUNK_SIZE);
 
   if (cursor) {
-    // Cursor should be in format "courier|docId"
-    const [courierCursor, docIdCursor] = cursor.split("|");
-    query = query.startAfter(courierCursor, docIdCursor);
+    query = query.startAfter(cursor);
   }
 
   const snapshot = await query.get();
@@ -4314,22 +4318,29 @@ async function processShiprocketOrderChunk(
 
   const eligibleOrders = snapshot.docs
     .map((doc: QueryDocumentSnapshot) => ({ id: doc.id, ref: doc.ref, ...doc.data() }))
-    .filter(
-      (order: any) =>
-        order.awb &&
-        order.customStatus &&
-        !excludedStatuses.has(order.customStatus) &&
-        order.courier?.includes("Shiprocket"),
-    );
+    .filter((order: any) => {
+      // Check courier conditions: (courierProvider is Shiprocket AND no courierReverseProvider) OR (courierReverseProvider is Shiprocket)
+      const hasShiprocketCourier = order.courierProvider === "Shiprocket";
+      const hasNoCourierReverse = !order.courierReverseProvider;
+      const hasShiprocketCourierReverse = order.courierReverseProvider === "Shiprocket";
+
+      const meetsCourierCondition =
+        (hasShiprocketCourier && hasNoCourierReverse) || hasShiprocketCourierReverse;
+
+      // Check status condition
+      const meetsStatusCondition =
+        order.awb && order.customStatus && !excludedStatuses.has(order.customStatus);
+
+      return meetsCourierCondition && meetsStatusCondition;
+    });
 
   if (eligibleOrders.length === 0) {
     const lastDoc = snapshot.docs[snapshot.docs.length - 1];
-    const lastCourier = lastDoc.get("courier");
     return {
       processed: snapshot.size,
       updated: 0,
       hasMore: snapshot.size === CHUNK_SIZE,
-      nextCursor: `${lastCourier}|${lastDoc.id}`,
+      nextCursor: lastDoc.id,
     };
   }
 
@@ -4363,13 +4374,12 @@ async function processShiprocketOrderChunk(
 
   const lastDoc = snapshot.docs[snapshot.docs.length - 1];
   const hasMore = snapshot.size === CHUNK_SIZE;
-  const lastCourier = lastDoc.get("courier");
 
   return {
     processed: eligibleOrders.length,
     updated: totalUpdated,
     hasMore,
-    nextCursor: hasMore ? `${lastCourier}|${lastDoc.id}` : undefined,
+    nextCursor: hasMore ? lastDoc.id : undefined,
   };
 }
 
@@ -4377,7 +4387,10 @@ async function fetchAndProcessShiprocketBatch(
   orders: any[],
   apiKey: string,
 ): Promise<OrderUpdate[]> {
-  const awbs = orders.map((order) => order.awb).filter(Boolean);
+  // Select correct AWB based on whether it's a DTO (customer return) order
+  const awbs = orders
+    .map((order) => (order.customStatus?.includes("DTO") ? order.awb_reverse : order.awb))
+    .filter(Boolean);
 
   if (awbs.length === 0) return [];
 
@@ -4419,7 +4432,14 @@ async function fetchAndProcessShiprocketBatch(
 // 5. UPDATE PREPARATION - Maps API responses to Firestore updates
 function prepareShiprocketOrderUpdates(orders: any[], trackingData: any): OrderUpdate[] {
   const updates: OrderUpdate[] = [];
-  const ordersByAwb = new Map(orders.map((o) => [o.awb, o]));
+
+  // Create map with correct AWB (reverse for DTO orders, regular otherwise)
+  const ordersByAwb = new Map(
+    orders.map((o) => {
+      const awb = o.customStatus?.includes("DTO") ? o.awb_reverse : o.awb;
+      return [awb, o];
+    }),
+  );
 
   for (const [awb, shipmentData] of Object.entries(trackingData)) {
     const order = ordersByAwb.get(awb);
@@ -4438,6 +4458,562 @@ function prepareShiprocketOrderUpdates(orders: any[], trackingData: any): OrderU
     const newStatus = determineNewShiprocketStatus(currentStatus);
     if (!newStatus) continue;
     if (newStatus === order.customStatus) continue;
+
+    updates.push({
+      ref: order.ref,
+      data: {
+        customStatus: newStatus,
+        lastStatusUpdate: FieldValue.serverTimestamp(),
+        customStatusesLogs: FieldValue.arrayUnion({
+          status: newStatus,
+          createdAt: Timestamp.now(),
+          remarks: getStatusRemarks(newStatus),
+        }),
+      },
+    });
+  }
+
+  return updates;
+}
+
+// ============================================================================
+// SCHEDULED XPRESSBEES STATUS UPDATES
+// ============================================================================
+
+// 1. STATUS DETERMINATION FUNCTION
+function determineNewXpressbeesStatus(currentStatus: string): string | null {
+  const statusMap: Record<string, string> = {
+    "in transit": "In Transit",
+    "out for delivery": "Out For Delivery",
+    delivered: "Delivered",
+    "RT-IT": "RTO In Transit",
+    "RT-DL": "RTO Delivered",
+  };
+  return statusMap[currentStatus] || null;
+}
+
+// HELPER: Login to get fresh token
+async function getXpressbeesToken(email: string, password: string): Promise<string | null> {
+  try {
+    const response = await fetch("https://shipment.xpressbees.com/api/users/login", {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        Accept: "application/json",
+      },
+      body: JSON.stringify({ email, password }),
+    });
+
+    if (!response.ok) {
+      console.error(`Xpressbees login failed: ${response.status}`);
+      return null;
+    }
+
+    const data = (await response.json()) as any;
+    if (data.status && data.data) {
+      return data.data; // The JWT token
+    }
+
+    return null;
+  } catch (error) {
+    console.error("Xpressbees login error:", error);
+    return null;
+  }
+}
+
+// 2. SCHEDULER
+export const enqueueXpressbeesStatusUpdateTasksScheduled = onSchedule(
+  {
+    schedule: "0 0,4,8,12,16,20 * * *", // 6 times daily
+    timeZone: "Asia/Kolkata",
+    region: process.env.LOCATION || "asia-south1",
+    memory: "512MiB",
+    timeoutSeconds: 540,
+    secrets: [TASKS_SECRET],
+  },
+  async (event) => {
+    console.log(
+      `Starting scheduled Xpressbees status update batch processing...${event ? "" : ""}`,
+    );
+
+    try {
+      const usersSnapshot = await db.collection("users").where("activeAccountId", "!=", null).get();
+
+      if (usersSnapshot.empty) {
+        console.log("No users with active accounts found");
+        return;
+      }
+
+      // Group users by account and filter for Xpressbees integration
+      const accountToUsers = new Map<string, string[]>();
+      let totalUsersCount = 0;
+
+      for (const userDoc of usersSnapshot.docs) {
+        const userId = userDoc.id;
+        const activeAccountId = userDoc.get("activeAccountId");
+        if (!activeAccountId) continue;
+
+        try {
+          const accountDoc = await db.collection("accounts").doc(activeAccountId).get();
+          if (!accountDoc.exists) continue;
+
+          const apiKey = accountDoc.data()?.integrations?.couriers?.xpressbees?.apiKey;
+          if (apiKey) {
+            if (!accountToUsers.has(activeAccountId)) {
+              accountToUsers.set(activeAccountId, []);
+            }
+            accountToUsers.get(activeAccountId)!.push(userId);
+            totalUsersCount++;
+          }
+        } catch (error) {
+          console.error(`Error checking account ${activeAccountId}:`, error);
+        }
+      }
+
+      if (accountToUsers.size === 0) {
+        console.log("No accounts with Xpressbees integration found");
+        return;
+      }
+
+      console.log(
+        `Found ${accountToUsers.size} accounts with Xpressbees (${totalUsersCount} users)`,
+      );
+
+      // Create batch header
+      const batchRef = db.collection("status_update_batches").doc();
+      const batchId = batchRef.id;
+
+      await batchRef.set({
+        createdAt: FieldValue.serverTimestamp(),
+        createdBy: "system-scheduled",
+        total: accountToUsers.size,
+        totalUsers: totalUsersCount,
+        queued: accountToUsers.size,
+        status: "running",
+        processing: 0,
+        success: 0,
+        failed: 0,
+        type: "status_update",
+        schedule: "6x_daily",
+        courier: "xpressbees",
+      });
+
+      // Create job documents (one per account)
+      const writer = db.bulkWriter();
+      for (const [accountId, userIds] of accountToUsers) {
+        writer.set(
+          batchRef.collection("jobs").doc(accountId),
+          {
+            accountId,
+            userIds,
+            userCount: userIds.length,
+            status: "queued",
+            attempts: 0,
+            createdAt: FieldValue.serverTimestamp(),
+            processedOrders: 0,
+            updatedOrders: 0,
+            totalChunks: 0,
+          },
+          { merge: true },
+        );
+      }
+      await writer.close();
+
+      const targetUrl = process.env.UPDATE_STATUS_TASK_JOB_TARGET_URL_XPRESSBEES;
+      if (!targetUrl) {
+        throw new Error("UPDATE_STATUS_TASK_TARGET_URL_XPRESSBEES not configured");
+      }
+
+      // Create initial tasks (chunk 0 for each account)
+      const taskPromises = Array.from(accountToUsers.entries()).map(([accountId, userIds], index) =>
+        createTask(
+          {
+            accountId,
+            userIds,
+            batchId,
+            jobId: accountId,
+            chunkIndex: 0,
+            cursor: null,
+          } as any,
+          {
+            tasksSecret: TASKS_SECRET.value() || "",
+            url: targetUrl,
+            queue: process.env.STATUS_UPDATE_QUEUE_NAME || "statuses-update-queue",
+            delaySeconds: Math.floor(index * 2),
+          },
+        ),
+      );
+
+      await Promise.all(taskPromises);
+
+      console.log(`Enqueued ${accountToUsers.size} initial tasks for batch ${batchId}`);
+    } catch (error) {
+      console.error("enqueueXpressbeesStatusUpdateTasks failed:", error);
+      throw error;
+    }
+  },
+);
+
+// 3. MAIN TASK HANDLER
+export const updateXpressbeesStatusesJob = onRequest(
+  { cors: true, timeoutSeconds: 540, secrets: [TASKS_SECRET], memory: "512MiB" },
+  async (req: Request, res: Response): Promise<void> => {
+    try {
+      requireHeaderSecret(req, "x-tasks-secret", TASKS_SECRET.value() || "");
+
+      if (req.method !== "POST") {
+        res.status(405).json({ error: "method_not_allowed" });
+        return;
+      }
+
+      const {
+        accountId,
+        userIds,
+        batchId,
+        jobId,
+        cursor = null,
+        chunkIndex = 0,
+      } = req.body as {
+        accountId?: string;
+        userIds?: string[];
+        batchId?: string;
+        jobId?: string;
+        cursor?: string | null;
+        chunkIndex?: number;
+      };
+
+      if (!accountId || !userIds?.length || !batchId || !jobId) {
+        res.status(400).json({ error: "missing_required_params" });
+        return;
+      }
+
+      const batchRef = db.collection("status_update_batches").doc(batchId);
+      const jobRef = batchRef.collection("jobs").doc(jobId);
+
+      // Idempotency check
+      const jSnap = await jobRef.get();
+      if (jSnap.exists && jSnap.data()?.status === "success") {
+        res.json({ ok: true, dedup: true });
+        return;
+      }
+
+      // Initialize job on first chunk
+      if (chunkIndex === 0) {
+        const validUserIds = await validateUsers(accountId, userIds);
+        if (validUserIds.length === 0) {
+          throw new Error("NO_VALID_USERS_FOR_ACCOUNT");
+        }
+
+        await db.runTransaction(async (tx: Transaction) => {
+          const snap = await tx.get(jobRef);
+          const data = snap.data() || {};
+          const prevAttempts = Number(data.attempts || 0);
+          const firstAttempt = prevAttempts === 0 || data.status === "queued";
+
+          tx.set(
+            jobRef,
+            {
+              status: "processing",
+              attempts: (prevAttempts || 0) + 1,
+              lastAttemptAt: FieldValue.serverTimestamp(),
+              accountId,
+              userIds: validUserIds,
+              userCount: validUserIds.length,
+              processedOrders: 0,
+              updatedOrders: 0,
+              totalChunks: 0,
+            },
+            { merge: true },
+          );
+
+          const inc: any = { processing: FieldValue.increment(1) };
+          if (firstAttempt) inc.queued = FieldValue.increment(-1);
+          tx.update(batchRef, inc);
+        });
+      }
+
+      // Verify account and get credentials
+      const accountDoc = await db.collection("accounts").doc(accountId).get();
+      if (!accountDoc.exists) throw new Error("ACCOUNT_NOT_FOUND");
+
+      const email = accountDoc.data()?.integrations?.couriers?.xpressbees?.email;
+      const password = accountDoc.data()?.integrations?.couriers?.xpressbees?.password;
+
+      if (!email || !password) throw new Error("CREDENTIALS_MISSING");
+
+      // Get fresh token for this chunk
+      const token = await getXpressbeesToken(email, password);
+      if (!token) throw new Error("TOKEN_FETCH_FAILED");
+
+      // Process one chunk of orders
+      const result = await processXpressbeesOrderChunk(accountId, token, cursor);
+
+      // Update job progress
+      await jobRef.update({
+        processedOrders: FieldValue.increment(result.processed),
+        updatedOrders: FieldValue.increment(result.updated),
+        totalChunks: FieldValue.increment(1),
+        lastChunkAt: FieldValue.serverTimestamp(),
+        lastCursor: result.nextCursor || FieldValue.delete(),
+      });
+
+      // If more work remains, queue next chunk
+      if (result.hasMore && result.nextCursor) {
+        await queueNextChunk(
+          TASKS_SECRET.value() || "",
+          process.env.UPDATE_STATUS_TASK_JOB_TARGET_URL_XPRESSBEES!,
+          {
+            accountId,
+            userIds,
+            batchId,
+            jobId,
+            cursor: result.nextCursor,
+            chunkIndex: chunkIndex + 1,
+          },
+        );
+
+        res.json({
+          ok: true,
+          status: "chunk_completed",
+          chunkIndex,
+          processed: result.processed,
+          updated: result.updated,
+          hasMore: true,
+        });
+        return;
+      }
+
+      // Job complete
+      const jobData = (await jobRef.get()).data() || {};
+      await Promise.all([
+        jobRef.update({
+          status: "success",
+          message: "status_update_completed",
+          completedAt: FieldValue.serverTimestamp(),
+        }),
+        batchRef.update({
+          processing: FieldValue.increment(-1),
+          success: FieldValue.increment(1),
+        }),
+      ]);
+
+      await maybeCompleteBatch(batchRef);
+
+      res.json({
+        ok: true,
+        status: "job_completed",
+        totalProcessed: jobData.processedOrders || 0,
+        totalUpdated: jobData.updatedOrders || 0,
+        totalChunks: jobData.totalChunks || 0,
+      });
+    } catch (error: any) {
+      await handleJobError(error, req.body);
+      const msg = error.message || String(error);
+      const code = msg.split(/\s/)[0];
+      const NON_RETRYABLE = [
+        "ACCOUNT_NOT_FOUND",
+        "CREDENTIALS_MISSING",
+        "NO_VALID_USERS_FOR_ACCOUNT",
+        "TOKEN_FETCH_FAILED",
+      ];
+      const isRetryable = !NON_RETRYABLE.includes(code);
+
+      res.status(isRetryable ? 503 : 200).json({
+        ok: false,
+        error: isRetryable ? "job_failed_transient" : "job_failed_permanent",
+        code,
+        message: msg,
+      });
+    }
+  },
+);
+
+// 4. CHUNK PROCESSOR
+async function processXpressbeesOrderChunk(
+  accountId: string,
+  token: string,
+  cursor: string | null,
+): Promise<ChunkResult> {
+  const excludedStatuses = new Set([
+    "New",
+    "Confirmed",
+    "Ready To Dispatch",
+    "DTO Requested",
+    "Lost",
+    "Closed",
+    "RTO Closed",
+    "RTO Delivered",
+    "DTO Delivered",
+    "Pending Refunds",
+  ]);
+
+  // Build paginated query with OR condition for both courierProvider and courierReverseProvider
+  let query = db
+    .collection("accounts")
+    .doc(accountId)
+    .collection("orders")
+    .where(
+      Filter.or(
+        Filter.where("courierProvider", "==", "Xpressbees"),
+        Filter.where("courierReverseProvider", "==", "Xpressbees"),
+      ),
+    )
+    .orderBy("__name__")
+    .limit(CHUNK_SIZE);
+
+  if (cursor) {
+    query = query.startAfter(cursor);
+  }
+
+  const snapshot = await query.get();
+
+  if (snapshot.empty) {
+    return { processed: 0, updated: 0, hasMore: false };
+  }
+
+  const eligibleOrders = snapshot.docs
+    .map((doc: QueryDocumentSnapshot) => ({ id: doc.id, ref: doc.ref, ...doc.data() }))
+    .filter((order: any) => {
+      // Check courier conditions: (courierProvider is Xpressbees AND no courierReverseProvider) OR (courierReverseProvider is Xpressbees)
+      const hasXpressbeesCourier = order.courierProvider === "Xpressbees";
+      const hasNoCourierReverse = !order.courierReverseProvider;
+      const hasXpressbeesCourierReverse = order.courierReverseProvider === "Xpressbees";
+
+      const meetsCourierCondition =
+        (hasXpressbeesCourier && hasNoCourierReverse) || hasXpressbeesCourierReverse;
+
+      // Check status condition
+      const meetsStatusCondition =
+        order.awb && order.customStatus && !excludedStatuses.has(order.customStatus);
+
+      return meetsCourierCondition && meetsStatusCondition;
+    });
+
+  if (eligibleOrders.length === 0) {
+    const lastDoc = snapshot.docs[snapshot.docs.length - 1];
+    return {
+      processed: snapshot.size,
+      updated: 0,
+      hasMore: snapshot.size === CHUNK_SIZE,
+      nextCursor: lastDoc.id,
+    };
+  }
+
+  console.log(
+    `Processing ${eligibleOrders.length} eligible Xpressbees orders for account ${accountId}`,
+  );
+
+  // Process in API batches (individual calls for each AWB)
+  let totalUpdated = 0;
+
+  for (let i = 0; i < eligibleOrders.length; i += API_BATCH_SIZE) {
+    const batch = eligibleOrders.slice(i, Math.min(i + API_BATCH_SIZE, eligibleOrders.length));
+    const updates = await fetchAndProcessXpressbeesBatch(batch, token);
+
+    // Apply updates using Firestore batch writes
+    if (updates.length > 0) {
+      const writeBatch = db.batch();
+      updates.forEach((update) => {
+        writeBatch.update(update.ref, update.data);
+      });
+      await writeBatch.commit();
+      totalUpdated += updates.length;
+      console.log(`Updated ${updates.length} orders in API batch ${i / API_BATCH_SIZE + 1}`);
+    }
+
+    // Rate limiting between API batches
+    if (i + API_BATCH_SIZE < eligibleOrders.length) {
+      await sleep(150);
+    }
+  }
+
+  const lastDoc = snapshot.docs[snapshot.docs.length - 1];
+  const hasMore = snapshot.size === CHUNK_SIZE;
+
+  return {
+    processed: eligibleOrders.length,
+    updated: totalUpdated,
+    hasMore,
+    nextCursor: hasMore ? lastDoc.id : undefined,
+  };
+}
+
+// 5. API BATCH PROCESSOR (collecting all responses first)
+async function fetchAndProcessXpressbeesBatch(
+  orders: any[],
+  token: string,
+): Promise<OrderUpdate[]> {
+  const trackingResults: any[] = [];
+
+  // Fetch tracking data for all orders
+  for (const order of orders) {
+    // Select correct AWB based on whether it's a DTO order
+    const awb = order.customStatus?.includes("DTO") ? order.awb_reverse : order.awb;
+
+    if (!awb) {
+      trackingResults.push(null);
+      continue;
+    }
+
+    try {
+      const trackingUrl = `https://shipment.xpressbees.com/api/shipments2/track/${awb}`;
+      const response = await fetch(trackingUrl, {
+        method: "GET",
+        headers: {
+          Authorization: `Bearer ${token}`,
+          "Content-Type": "application/json",
+          Accept: "application/json",
+        },
+      });
+
+      if (!response.ok) {
+        if (response.status >= 500 || response.status === 429) {
+          throw new Error(`HTTP_${response.status}`);
+        }
+        console.error(`Xpressbees API error for AWB ${awb}: ${response.status}`);
+        trackingResults.push(null);
+        continue;
+      }
+
+      const trackingData = (await response.json()) as any;
+      trackingResults.push(trackingData);
+
+      // Small delay between individual calls
+      await sleep(50);
+    } catch (error: any) {
+      console.error(`Error tracking AWB ${awb}:`, error);
+      if (error.message.startsWith("HTTP_")) {
+        throw error;
+      }
+      trackingResults.push(null);
+      continue;
+    }
+  }
+
+  // Process all collected tracking data at once
+  return prepareXpressbeesOrderUpdates(orders, trackingResults);
+}
+
+// 6. UPDATE PREPARATION (batch version)
+function prepareXpressbeesOrderUpdates(orders: any[], trackingDataArray: any[]): OrderUpdate[] {
+  const updates: OrderUpdate[] = [];
+
+  for (let i = 0; i < orders.length; i++) {
+    const order = orders[i];
+    const trackingData = trackingDataArray[i];
+
+    if (!trackingData || !trackingData.status || !trackingData.data) continue;
+
+    const currentStatus =
+      trackingData.data.status !== "rto"
+        ? trackingData.data.status
+        : trackingData.data.history[0].status_code;
+    if (!currentStatus) continue;
+
+    const newStatus = determineNewXpressbeesStatus(currentStatus);
+    if (!newStatus) continue;
+    if (newStatus === order.customStatus) continue;
+
     updates.push({
       ref: order.ref,
       data: {
@@ -5089,6 +5665,198 @@ async function queueManualUpdateChunk(
     delaySeconds: 2,
   });
 }
+
+// ============================================================================
+// MIGRATION: ADD COURIER PROVIDER FIELDS
+// ============================================================================
+
+// Extract provider name from courier string
+function getCourierProvider(courier: string | undefined | null): string | null {
+  if (!courier || typeof courier !== "string") return null;
+
+  // Extract provider from "Provider: Details" format
+  const colonIndex = courier.indexOf(":");
+  if (colonIndex > 0) {
+    return courier.substring(0, colonIndex).trim();
+  }
+
+  // If no colon, return the whole string trimmed
+  return courier.trim();
+}
+
+interface MigrationStats {
+  accountsProcessed: number;
+  ordersScanned: number;
+  ordersUpdated: number;
+  ordersSkipped: number;
+  errors: number;
+}
+
+async function migrateAccountOrders(accountId: string): Promise<{
+  scanned: number;
+  updated: number;
+  skipped: number;
+}> {
+  const BATCH_SIZE = 500; // Firestore batch write limit
+  let scanned = 0;
+  let updated = 0;
+  let skipped = 0;
+  let lastDoc: QueryDocumentSnapshot | null = null;
+
+  while (true) {
+    // Query orders in chunks
+    let query = db.collection("accounts").doc(accountId).collection("orders").limit(BATCH_SIZE);
+
+    if (lastDoc) {
+      query = query.startAfter(lastDoc);
+    }
+
+    const snapshot = await query.get();
+
+    if (snapshot.empty) {
+      break; // No more orders
+    }
+
+    // Process this batch
+    const batch = db.batch();
+    let batchCount = 0;
+
+    for (const doc of snapshot.docs) {
+      scanned++;
+      const data = doc.data();
+
+      // Check if migration is needed
+      const needsUpdate =
+        (data.courier && !data.courierProvider) ||
+        (data.courier_reverse && !data.courierReverseProvider);
+
+      if (!needsUpdate) {
+        skipped++;
+        continue;
+      }
+
+      // Extract providers
+      const courierProvider = getCourierProvider(data.courier);
+      const courierReverseProvider = getCourierProvider(data.courier_reverse);
+
+      // Build update object
+      const updateData: any = {};
+
+      if (data.courier && !data.courierProvider) {
+        updateData.courierProvider = courierProvider;
+      }
+
+      if (data.courier_reverse && !data.courierReverseProvider) {
+        updateData.courierReverseProvider = courierReverseProvider;
+      }
+
+      // Add to batch
+      if (Object.keys(updateData).length > 0) {
+        batch.update(doc.ref, updateData);
+        batchCount++;
+        updated++;
+      }
+    }
+
+    // Commit batch if there are updates
+    if (batchCount > 0) {
+      await batch.commit();
+      console.log(`  💾 Committed batch: ${batchCount} orders updated`);
+    }
+
+    lastDoc = snapshot.docs[snapshot.docs.length - 1];
+
+    // Progress update
+    if (scanned % 1000 === 0) {
+      console.log(`  📈 Progress: ${scanned} scanned, ${updated} updated`);
+    }
+  }
+
+  return { scanned, updated, skipped };
+}
+
+export const migrateCourierProviders = onRequest(
+  {
+    cors: true,
+    timeoutSeconds: 540,
+    memory: "1GiB",
+    region: process.env.LOCATION || "asia-south1",
+    secrets: [ENQUEUE_FUNCTION_SECRET], // Add secret protection
+  },
+  async (req: Request, res: Response): Promise<void> => {
+    try {
+      // Optional: Add secret protection
+      requireHeaderSecret(req, "x-api-key", ENQUEUE_FUNCTION_SECRET.value() || "");
+
+      console.log("🚀 Starting Courier Provider Fields Migration...\n");
+
+      const stats: MigrationStats = {
+        accountsProcessed: 0,
+        ordersScanned: 0,
+        ordersUpdated: 0,
+        ordersSkipped: 0,
+        errors: 0,
+      };
+
+      try {
+        // Get all accounts
+        const accountsSnapshot = await db.collection("accounts").get();
+        console.log(`Found ${accountsSnapshot.size} accounts to process\n`);
+
+        // Process each account
+        for (const accountDoc of accountsSnapshot.docs) {
+          const accountId = accountDoc.id;
+          console.log(`\n📦 Processing account: ${accountId}`);
+
+          try {
+            const accountStats = await migrateAccountOrders(accountId);
+            stats.accountsProcessed++;
+            stats.ordersScanned += accountStats.scanned;
+            stats.ordersUpdated += accountStats.updated;
+            stats.ordersSkipped += accountStats.skipped;
+
+            console.log(
+              `  ✅ Account completed: ${accountStats.updated} updated, ${accountStats.skipped} skipped`,
+            );
+          } catch (error) {
+            stats.errors++;
+            console.error(`  ❌ Error processing account ${accountId}:`, error);
+          }
+
+          // Small delay between accounts to avoid rate limits
+          await sleep(100);
+        }
+
+        // Print final summary
+        console.log("\n" + "=".repeat(60));
+        console.log("📊 MIGRATION SUMMARY");
+        console.log("=".repeat(60));
+        console.log(`Accounts processed: ${stats.accountsProcessed}`);
+        console.log(`Orders scanned:     ${stats.ordersScanned}`);
+        console.log(`Orders updated:     ${stats.ordersUpdated}`);
+        console.log(`Orders skipped:     ${stats.ordersSkipped}`);
+        console.log(`Errors:             ${stats.errors}`);
+        console.log("=".repeat(60));
+        console.log("✨ Migration completed!\n");
+
+        res.json({
+          success: true,
+          summary: stats,
+          message: "Migration completed successfully",
+        });
+      } catch (error) {
+        console.error("\n❌ Migration failed:", error);
+        res.status(500).json({
+          success: false,
+          error: error instanceof Error ? error.message : String(error),
+          stats,
+        });
+      }
+    } catch (authError) {
+      res.status(401).json({ error: `Unauthorized ${authError}` });
+    }
+  },
+);
 
 // // ============================================================================
 // // AI CONFIGURATION - Using Vertex AI
