@@ -2183,44 +2183,79 @@ async function handleReturnJobFailure(params: {
 }): Promise<{ shouldReturnFailure: boolean; statusCode: number; reason: string }> {
   const { batchRef, jobRef, errorCode, errorMessage, isRetryable, apiResp } = params;
 
-  const jobSnap = await jobRef.get();
-  const jobData = jobSnap.data() || {};
+  // FIX: Use transaction for atomic failure handling
+  const result = await db.runTransaction(async (tx: Transaction) => {
+    const job = await tx.get(jobRef);
+    const jobData = job.data() || {};
 
-  const attempts = Number(jobData.attempts || 0);
-  const maxAttempts = Number(process.env.RETURN_SHIPMENT_QUEUE_MAX_ATTEMPTS || 3);
-  const attemptsExhausted = attempts >= maxAttempts;
+    // Check if already in terminal state
+    if (jobData.status === "success" || jobData.status === "failed") {
+      return { alreadyTerminal: true, wasSuccess: jobData.status === "success" };
+    }
 
-  const updateData: any = {
-    status: isRetryable ? (attemptsExhausted ? "failed" : "retrying") : "failed",
-    errorCode: isRetryable ? "EXCEPTION" : errorCode,
-    errorMessage: errorMessage.slice(0, 400),
-  };
+    const attempts = Number(jobData.attempts || 0);
+    const maxAttempts = Number(process.env.RETURN_SHIPMENT_QUEUE_MAX_ATTEMPTS || 3);
+    const attemptsExhausted = attempts >= maxAttempts;
 
-  if (apiResp) {
-    updateData.apiResp = apiResp;
+    const shouldFail = !isRetryable || attemptsExhausted;
+    const newStatus = shouldFail ? "failed" : "retrying";
+
+    const updateData: any = {
+      status: newStatus,
+      errorCode: isRetryable ? "EXCEPTION" : errorCode,
+      errorMessage: errorMessage.slice(0, 400),
+    };
+
+    if (apiResp) {
+      updateData.apiResp = apiResp;
+    }
+
+    // Update job atomically
+    tx.set(jobRef, updateData, { merge: true });
+
+    // Update batch counters atomically
+    const batchUpdate: any = { processing: FieldValue.increment(-1) };
+    if (shouldFail) {
+      batchUpdate.failed = FieldValue.increment(1);
+    }
+    tx.update(batchRef, batchUpdate);
+
+    return {
+      alreadyTerminal: false,
+      shouldFail,
+      isRetryable,
+      attemptsExhausted,
+    };
+  });
+
+  // Handle already terminal case
+  if (result.alreadyTerminal) {
+    if (result.wasSuccess) {
+      await maybeCompleteBatch(batchRef);
+    }
+    return {
+      shouldReturnFailure: false,
+      statusCode: 200,
+      reason: "already_processed",
+    };
   }
 
-  await Promise.all([
-    jobRef.set(updateData, { merge: true }),
-    batchRef.update(
-      isRetryable && !attemptsExhausted
-        ? { processing: FieldValue.increment(-1) }
-        : { processing: FieldValue.increment(-1), failed: FieldValue.increment(1) },
-    ),
-  ]);
-
-  if (!isRetryable || attemptsExhausted) {
+  // Complete batch if permanently failed
+  if (result.shouldFail) {
     await maybeCompleteBatch(batchRef);
   }
 
   return {
     shouldReturnFailure: true,
-    statusCode: isRetryable && !attemptsExhausted ? 503 : 200,
-    reason: isRetryable ? "retryable_error" : "permanent_error",
+    statusCode: result.isRetryable && !result.attemptsExhausted ? 503 : 200,
+    reason: result.isRetryable && !result.attemptsExhausted ? "retryable_error" : "permanent_error",
   };
 }
 
-/** Called by Vercel API to enqueue return shipment Cloud Tasks (one per jobId) */
+// ============================================================================
+// RETURN SHIPMENT TASK ENQUEUER
+// ============================================================================
+
 export const enqueueReturnShipmentTasks = onRequest(
   { cors: true, timeoutSeconds: 60, secrets: [ENQUEUE_FUNCTION_SECRET, TASKS_SECRET] },
   async (req: Request, res: Response): Promise<void> => {
@@ -2310,7 +2345,7 @@ export const enqueueReturnShipmentTasks = onRequest(
         pickupName,
         shippingMode,
         createdAt: FieldValue.serverTimestamp(),
-        createdBy: requestedBy,
+        createdBy: requestedBy || "system",
         total: orderIds.length,
         queued: orderIds.length,
         status: "queued",
@@ -2319,47 +2354,19 @@ export const enqueueReturnShipmentTasks = onRequest(
         failed: 0,
       });
 
-      // Create job docs with courier info
+      // Create job docs and enqueue tasks
       const writer = db.bulkWriter();
       const taskPromises: Promise<any>[] = [];
+
+      const taskUrl = process.env.RETURN_TASK_TARGET_URL_1;
+      if (!taskUrl) {
+        throw new Error("RETURN_TASK_TARGET_URL_1 not configured");
+      }
 
       for (const o of orderIds) {
         const orderData = orderDataMap.get(String(o))!;
         const courier = orderData.courier;
-
         const normalizedCourier = courier.split(":")[0].trim();
-
-        // Map courier to return booking URL
-        // let taskUrl: string;
-        // try {
-        //   if (normalizedCourier === "Delhivery") {
-        //     taskUrl = String(process.env.RETURN_TASK_TARGET_URL_1);
-        //   } else if (normalizedCourier === "Shiprocket") {
-        //     taskUrl = String(process.env.RETURN_TASK_TARGET_URL_2);
-        //   } else {
-        //     throw new Error(`Unsupported courier for returns: ${normalizedCourier}`);
-        //   }
-        // } catch (urlError) {
-        //   console.error(`Failed to map courier ${normalizedCourier} for order ${o}:`, urlError);
-
-        //   writer.set(
-        //     batchRef.collection("jobs").doc(String(o)),
-        //     {
-        //       orderId: String(o),
-        //       orderName: orderData.name,
-        //       courier: normalizedCourier,
-        //       status: "failed",
-        //       errorCode: "UNSUPPORTED_COURIER",
-        //       errorMessage: `Courier ${normalizedCourier} is not supported for returns`,
-        //       attempts: 0,
-        //     },
-        //     { merge: true },
-        //   );
-
-        //   continue;
-        // }
-
-        const taskUrl = process.env.RETURN_TASK_TARGET_URL_1;
 
         // Create job document
         writer.set(
@@ -2374,7 +2381,7 @@ export const enqueueReturnShipmentTasks = onRequest(
           { merge: true },
         );
 
-        // Queue Cloud Task (NO variantIds in payload)
+        // Queue Cloud Task
         taskPromises.push(
           createTask(
             {
@@ -2406,7 +2413,7 @@ export const enqueueReturnShipmentTasks = onRequest(
       await writer.close();
       await Promise.allSettled(taskPromises);
 
-      // Recalculate batch counters
+      // Recalculate batch counters after task creation
       const jobsSnap = await batchRef.collection("jobs").get();
       let queuedCount = 0;
       let failedCount = 0;
@@ -2499,6 +2506,37 @@ export const processReturnShipmentTask = onRequest(
         };
       }
 
+      // Check for insufficient balance error
+      const lowerRemarks = remarks.toLowerCase();
+      const lowerError = String(carrier?.error || carrier?.message || "").toLowerCase();
+      const combinedText = `${lowerRemarks} ${lowerError}`;
+
+      const balanceKeywords = [
+        "insufficient",
+        "wallet",
+        "balance",
+        "insufficient balance",
+        "low balance",
+        "wallet balance",
+        "insufficient wallet",
+        "insufficient fund",
+        "recharge",
+        "add balance",
+        "balance low",
+        "no balance",
+      ];
+
+      const isBalanceError = balanceKeywords.some((keyword) => combinedText.includes(keyword));
+
+      if (isBalanceError) {
+        return {
+          ok: false,
+          retryable: false,
+          code: "INSUFFICIENT_BALANCE",
+          message: remarks || "Insufficient balance in carrier account",
+        };
+      }
+
       // Known permanent validation/business errors (non-retryable)
       return {
         ok: false,
@@ -2546,33 +2584,31 @@ export const processReturnShipmentTask = onRequest(
       const orderRef = db.collection("accounts").doc(shop).collection("orders").doc(String(jobId));
       const accountRef = db.collection("accounts").doc(shop);
 
-      // Idempotency: if already success, just ack
-      const jSnap = await jobRef.get();
-      if (jSnap.exists && jSnap.data()?.status === "success") {
-        // Fix any inconsistent batch counters
-        await db.runTransaction(async (tx: Transaction) => {
-          const b = await tx.get(batchRef);
-          const d = b.data() || {};
+      // FIX: Atomic idempotency check and status update
+      const shouldProceed = await db.runTransaction(async (tx: Transaction) => {
+        const job = await tx.get(jobRef);
+        const jobData = job.data();
 
-          if ((d.processing || 0) > 0) {
+        // Check terminal states atomically
+        if (jobData?.status === "success") {
+          const batch = await tx.get(batchRef);
+          const batchData = batch.data() || {};
+          if ((batchData.processing || 0) > 0) {
             tx.update(batchRef, {
               processing: FieldValue.increment(-1),
             });
           }
-        });
+          return false;
+        }
 
-        await maybeCompleteBatch(batchRef);
+        if (jobData?.status === "failed") {
+          return false; // Already failed, don't reprocess
+        }
 
-        res.json({ ok: true, dedup: true });
-        return;
-      }
-
-      // --- Start bookkeeping (transaction) -----------------------------------
-      await db.runTransaction(async (tx: Transaction) => {
-        const snap = await tx.get(jobRef);
-        const data = snap.data() || {};
-        const prevAttempts = Number(data.attempts || 0);
-        const firstAttempt = prevAttempts === 0 || !data.status || data.status === "queued";
+        // Proceed with processing
+        const prevAttempts = Number(jobData?.attempts || 0);
+        const jobStatus = jobData?.status;
+        const firstAttempt = prevAttempts === 0 || jobStatus === "queued" || !jobStatus;
 
         tx.set(
           jobRef,
@@ -2587,21 +2623,51 @@ export const processReturnShipmentTask = onRequest(
         const inc: any = { processing: FieldValue.increment(1) };
         if (firstAttempt) inc.queued = FieldValue.increment(-1);
         tx.update(batchRef, inc);
+
+        return true;
       });
 
-      // Allocate AWB
-      awb = await allocateAwb(shop);
+      if (!shouldProceed) {
+        await maybeCompleteBatch(batchRef);
+        res.json({ ok: true, dedup: true });
+        return;
+      }
 
-      // Load order
+      // Load order first to check status
       const ordSnap = await orderRef.get();
       if (!ordSnap.exists) throw new Error("ORDER_NOT_FOUND");
       const order = ordSnap.data();
 
-      // ✅ Validate order status before processing
+      // Check if order is in correct status for return shipment
       const status = order?.customStatus;
       if (status !== "Delivered" && status !== "DTO Requested") {
-        throw new Error("INVALID_ORDER_STATUS");
+        const failure = await handleReturnJobFailure({
+          shop,
+          batchRef,
+          jobRef,
+          jobId,
+          errorCode: "INVALID_ORDER_STATUS",
+          errorMessage: `Order status is '${status}' - not 'Delivered' or 'DTO Requested'. Cannot book return.`,
+          isRetryable: false,
+        });
+
+        if (failure.shouldReturnFailure) {
+          res.status(failure.statusCode).json({
+            ok: false,
+            reason: failure.reason,
+            code: "INVALID_ORDER_STATUS",
+          });
+        } else {
+          res.status(failure.statusCode).json({
+            ok: true,
+            action: failure.reason,
+          });
+        }
+        return;
       }
+
+      // Allocate AWB
+      awb = await allocateAwb(shop);
 
       // Build payload for Delhivery return
       const payload = buildDelhiveryReturnPayload({
@@ -2656,11 +2722,18 @@ export const processReturnShipmentTask = onRequest(
           isRetryable: httpRetryable(resp.status),
         });
 
-        res.status(failure.statusCode).json({
-          ok: false,
-          reason: failure.reason,
-          code: `HTTP_${resp.status}`,
-        });
+        if (failure.shouldReturnFailure) {
+          res.status(failure.statusCode).json({
+            ok: false,
+            reason: failure.reason,
+            code: `HTTP_${resp.status}`,
+          });
+        } else {
+          res.status(failure.statusCode).json({
+            ok: true,
+            action: failure.reason,
+          });
+        }
         return;
       }
 
@@ -2689,33 +2762,55 @@ export const processReturnShipmentTask = onRequest(
           apiResp: carrier,
         });
 
-        res.status(failure.statusCode).json({
-          ok: false,
-          reason: failure.reason,
-          code: verdict.code,
-        });
+        if (failure.shouldReturnFailure) {
+          res.status(failure.statusCode).json({
+            ok: false,
+            reason: failure.reason,
+            code: verdict.code,
+          });
+        } else {
+          res.status(failure.statusCode).json({
+            ok: true,
+            action: failure.reason,
+          });
+        }
         return;
       }
 
       // --- Success path ------------------------------------------------------
-      awbReleased = true; // guard: DO NOT release a used AWB
+      // FIX: Atomic success update
+      awbReleased = true;
 
-      await Promise.all([
-        jobRef.update({
+      await db.runTransaction(async (tx: Transaction) => {
+        const job = await tx.get(jobRef);
+        const jobData = job.data();
+
+        // Prevent double-counting
+        if (jobData?.status === "success") {
+          return; // Already processed
+        }
+
+        // Update atomically
+        tx.update(jobRef, {
           status: "success",
           awb,
+          carrierShipmentId: verdict.carrierShipmentId ?? null,
           errorCode: FieldValue.delete(),
           errorMessage: FieldValue.delete(),
           apiResp: carrier,
           completedAt: FieldValue.serverTimestamp(),
-        }),
-        batchRef.update({
+        });
+
+        tx.update(batchRef, {
           processing: FieldValue.increment(-1),
           success: FieldValue.increment(1),
-        }),
-        orderRef.set(
+        });
+
+        tx.set(
+          orderRef,
           {
             awb_reverse: awb,
+            courier_reverse: "Delhivery",
             customStatus: "DTO Booked",
             lastStatusUpdate: FieldValue.serverTimestamp(),
             customStatusesLogs: FieldValue.arrayUnion({
@@ -2725,17 +2820,17 @@ export const processReturnShipmentTask = onRequest(
             }),
           },
           { merge: true },
-        ),
-      ]);
+        );
+      });
 
       await maybeCompleteBatch(batchRef);
 
-      res.json({ ok: true, awb });
+      res.json({ ok: true, awb, carrierShipmentId: verdict.carrierShipmentId ?? null });
       return;
     } catch (e: any) {
       // Generic failure (network/bug/etc.)
       const msg = e instanceof Error ? e.message : String(e);
-      const code = msg.split(/\s/)[0];
+      const code = msg.split(/\s/)[0]; // first token
       const isRetryable = !RETURN_NON_RETRYABLE.has(code);
 
       try {
@@ -2772,11 +2867,18 @@ export const processReturnShipmentTask = onRequest(
             isRetryable,
           });
 
-          res.status(failure.statusCode).json({
-            error: isRetryable ? "job_failed_transient" : "job_failed_permanent",
-            code,
-            message: msg,
-          });
+          if (failure.shouldReturnFailure) {
+            res.status(failure.statusCode).json({
+              error: isRetryable ? "job_failed_transient" : "job_failed_permanent",
+              code,
+              message: msg,
+            });
+          } else {
+            res.status(failure.statusCode).json({
+              ok: true,
+              action: failure.reason,
+            });
+          }
           return;
         }
       } catch (handlerError) {
@@ -3665,8 +3767,8 @@ async function processDelhiveryOrderChunk(
     .where(
       Filter.or(
         Filter.where("courier", "==", "Delhivery"),
-        Filter.where("courier_reverse", "==", "Delhivery")
-      )
+        Filter.where("courier_reverse", "==", "Delhivery"),
+      ),
     )
     .orderBy("__name__")
     .limit(CHUNK_SIZE);
@@ -3688,17 +3790,14 @@ async function processDelhiveryOrderChunk(
       const hasDelhiveryCourier = order.courier === "Delhivery";
       const hasNoCourierReverse = !order.courier_reverse;
       const hasDelhiveryCourierReverse = order.courier_reverse === "Delhivery";
-      
-      const meetsCourierCondition = 
-        (hasDelhiveryCourier && hasNoCourierReverse) || 
-        (hasDelhiveryCourierReverse);
-      
+
+      const meetsCourierCondition =
+        (hasDelhiveryCourier && hasNoCourierReverse) || hasDelhiveryCourierReverse;
+
       // Check status condition
-      const meetsStatusCondition = 
-        order.awb && 
-        order.customStatus && 
-        !excludedStatuses.has(order.customStatus);
-      
+      const meetsStatusCondition =
+        order.awb && order.customStatus && !excludedStatuses.has(order.customStatus);
+
       return meetsCourierCondition && meetsStatusCondition;
     });
 
