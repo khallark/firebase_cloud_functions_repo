@@ -14,7 +14,7 @@ import {
 } from "./buildPayload";
 import { defineSecret } from "firebase-functions/params";
 import { setGlobalOptions } from "firebase-functions/options";
-import { DocumentReference, Timestamp, Transaction } from "firebase-admin/firestore";
+import { DocumentReference, Filter, Timestamp, Transaction } from "firebase-admin/firestore";
 // import { genkit } from 'genkit';
 // import vertexAI from "@genkit-ai/vertexai";
 import { QueryDocumentSnapshot } from "firebase-functions/firestore";
@@ -2330,34 +2330,36 @@ export const enqueueReturnShipmentTasks = onRequest(
         const normalizedCourier = courier.split(":")[0].trim();
 
         // Map courier to return booking URL
-        let taskUrl: string;
-        try {
-          if (normalizedCourier === "Delhivery") {
-            taskUrl = String(process.env.RETURN_TASK_TARGET_URL_1);
-          } else if (normalizedCourier === "Shiprocket") {
-            taskUrl = String(process.env.RETURN_TASK_TARGET_URL_2);
-          } else {
-            throw new Error(`Unsupported courier for returns: ${normalizedCourier}`);
-          }
-        } catch (urlError) {
-          console.error(`Failed to map courier ${normalizedCourier} for order ${o}:`, urlError);
+        // let taskUrl: string;
+        // try {
+        //   if (normalizedCourier === "Delhivery") {
+        //     taskUrl = String(process.env.RETURN_TASK_TARGET_URL_1);
+        //   } else if (normalizedCourier === "Shiprocket") {
+        //     taskUrl = String(process.env.RETURN_TASK_TARGET_URL_2);
+        //   } else {
+        //     throw new Error(`Unsupported courier for returns: ${normalizedCourier}`);
+        //   }
+        // } catch (urlError) {
+        //   console.error(`Failed to map courier ${normalizedCourier} for order ${o}:`, urlError);
 
-          writer.set(
-            batchRef.collection("jobs").doc(String(o)),
-            {
-              orderId: String(o),
-              orderName: orderData.name,
-              courier: normalizedCourier,
-              status: "failed",
-              errorCode: "UNSUPPORTED_COURIER",
-              errorMessage: `Courier ${normalizedCourier} is not supported for returns`,
-              attempts: 0,
-            },
-            { merge: true },
-          );
+        //   writer.set(
+        //     batchRef.collection("jobs").doc(String(o)),
+        //     {
+        //       orderId: String(o),
+        //       orderName: orderData.name,
+        //       courier: normalizedCourier,
+        //       status: "failed",
+        //       errorCode: "UNSUPPORTED_COURIER",
+        //       errorMessage: `Courier ${normalizedCourier} is not supported for returns`,
+        //       attempts: 0,
+        //     },
+        //     { merge: true },
+        //   );
 
-          continue;
-        }
+        //   continue;
+        // }
+
+        const taskUrl = process.env.RETURN_TASK_TARGET_URL_1;
 
         // Create job document
         writer.set(
@@ -3240,12 +3242,105 @@ function sleep(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
+// HELPER FUNCTIONS
+async function validateUsers(accountId: string, userIds: string[]): Promise<string[]> {
+  const results = await Promise.all(
+    userIds.map(async (userId) => {
+      try {
+        const userDoc = await db.collection("users").doc(userId).get();
+        if (!userDoc.exists) return null;
+        if (userDoc.get("activeAccountId") !== accountId) return null;
+        return userId;
+      } catch {
+        return null;
+      }
+    }),
+  );
+  return results.filter((id): id is string => id !== null);
+}
+
+async function queueNextChunk(
+  tasksSecret: string,
+  targetUrl: string,
+  params: {
+    accountId: string;
+    userIds: string[];
+    batchId: string;
+    jobId: string;
+    cursor: string;
+    chunkIndex: number;
+  },
+): Promise<void> {
+  await createTask(params, {
+    tasksSecret,
+    url: targetUrl,
+    queue: process.env.STATUS_UPDATE_QUEUE_NAME || "statuses-update-queue",
+    delaySeconds: 2,
+  });
+}
+
+async function handleJobError(error: any, body: any): Promise<void> {
+  const { batchId, jobId, chunkIndex } = body;
+  if (!batchId || !jobId) return;
+
+  const msg = error.message || String(error);
+  const code = msg.split(/\s/)[0];
+  const NON_RETRYABLE = ["ACCOUNT_NOT_FOUND", "API_KEY_MISSING", "NO_VALID_USERS_FOR_ACCOUNT"];
+  const isRetryable = !NON_RETRYABLE.includes(code);
+
+  const batchRef = db.collection("status_update_batches").doc(batchId);
+  const jobRef = batchRef.collection("jobs").doc(jobId);
+
+  try {
+    const jobSnap = await jobRef.get();
+    const attempts = Number(jobSnap.data()?.attempts || 0);
+    const maxAttempts = Number(process.env.STATUS_UPDATE_QUEUE_MAX_ATTEMPTS || 4);
+    const attemptsExhausted = attempts >= maxAttempts;
+
+    await Promise.all([
+      jobRef.set(
+        {
+          status: isRetryable ? (attemptsExhausted ? "failed" : "retrying") : "failed",
+          errorCode: isRetryable ? "EXCEPTION" : code,
+          errorMessage: msg.slice(0, 400),
+          failedAt: FieldValue.serverTimestamp(),
+          failedAtChunk: chunkIndex || 0,
+        },
+        { merge: true },
+      ),
+      batchRef.update(
+        isRetryable && !attemptsExhausted
+          ? { processing: FieldValue.increment(-1) }
+          : { processing: FieldValue.increment(-1), failed: FieldValue.increment(1) },
+      ),
+    ]);
+
+    await maybeCompleteBatch(batchRef);
+  } catch (e) {
+    console.error("Failed to update job with error status:", e);
+  }
+}
+
 // ============================================================================
 // CONFIGURATION
 // ============================================================================
 const CHUNK_SIZE = 200; // Orders processed per scheduled task
 const MANUAL_CHUNK_SIZE = 100; // Order IDs processed per manual task
 const API_BATCH_SIZE = 50; // Orders per Delhivery API call
+
+// CHUNK PROCESSOR - Fetches and processes one page of orders
+interface ChunkResult {
+  processed: number;
+  updated: number;
+  hasMore: boolean;
+  nextCursor?: string;
+}
+
+// API PROCESSOR - Calls Delhivery and prepares updates
+interface OrderUpdate {
+  ref: DocumentReference;
+  data: any;
+}
 
 // ============================================================================
 // SCHEDULED DELHIVERY STATUS UPDATES
@@ -3480,14 +3575,18 @@ export const updateDelhiveryStatusesJob = onRequest(
 
       // If more work remains, queue next chunk
       if (result.hasMore && result.nextCursor) {
-        await queueNextChunk(TASKS_SECRET.value() || "", {
-          accountId,
-          userIds,
-          batchId,
-          jobId,
-          cursor: result.nextCursor,
-          chunkIndex: chunkIndex + 1,
-        });
+        await queueNextChunk(
+          TASKS_SECRET.value() || "",
+          process.env.UPDATE_STATUS_TASK_JOB_TARGET_URL!,
+          {
+            accountId,
+            userIds,
+            batchId,
+            jobId,
+            cursor: result.nextCursor,
+            chunkIndex: chunkIndex + 1,
+          },
+        );
 
         res.json({
           ok: true,
@@ -3540,14 +3639,6 @@ export const updateDelhiveryStatusesJob = onRequest(
   },
 );
 
-// 3. CHUNK PROCESSOR - Fetches and processes one page of orders
-interface ChunkResult {
-  processed: number;
-  updated: number;
-  hasMore: boolean;
-  nextCursor?: string;
-}
-
 async function processDelhiveryOrderChunk(
   accountId: string,
   apiKey: string,
@@ -3563,14 +3654,20 @@ async function processDelhiveryOrderChunk(
     "RTO Closed",
     "RTO Delivered",
     "DTO Delivered",
+    "Pending Refunds",
   ]);
 
-  // Build paginated query
+  // Build paginated query with OR condition
   let query = db
     .collection("accounts")
     .doc(accountId)
     .collection("orders")
-    .where("courier", "==", "Delhivery")
+    .where(
+      Filter.or(
+        Filter.where("courier", "==", "Delhivery"),
+        Filter.where("courier_reverse", "==", "Delhivery")
+      )
+    )
     .orderBy("__name__")
     .limit(CHUNK_SIZE);
 
@@ -3586,9 +3683,24 @@ async function processDelhiveryOrderChunk(
 
   const eligibleOrders = snapshot.docs
     .map((doc: QueryDocumentSnapshot) => ({ id: doc.id, ref: doc.ref, ...doc.data() }))
-    .filter(
-      (order: any) => order.awb && order.customStatus && !excludedStatuses.has(order.customStatus),
-    );
+    .filter((order: any) => {
+      // Check courier conditions: (courier == Delhivery AND no courier_reverse) OR (courier_reverse == Delhivery)
+      const hasDelhiveryCourier = order.courier === "Delhivery";
+      const hasNoCourierReverse = !order.courier_reverse;
+      const hasDelhiveryCourierReverse = order.courier_reverse === "Delhivery";
+      
+      const meetsCourierCondition = 
+        (hasDelhiveryCourier && hasNoCourierReverse) || 
+        (hasDelhiveryCourierReverse);
+      
+      // Check status condition
+      const meetsStatusCondition = 
+        order.awb && 
+        order.customStatus && 
+        !excludedStatuses.has(order.customStatus);
+      
+      return meetsCourierCondition && meetsStatusCondition;
+    });
 
   if (eligibleOrders.length === 0) {
     const lastDoc = snapshot.docs[snapshot.docs.length - 1];
@@ -3635,12 +3747,6 @@ async function processDelhiveryOrderChunk(
     hasMore,
     nextCursor: hasMore ? lastDoc.id : undefined,
   };
-}
-
-// 4. API PROCESSOR - Calls Delhivery and prepares updates
-interface OrderUpdate {
-  ref: DocumentReference;
-  data: any;
 }
 
 async function fetchAndProcessDelhiveryBatch(
@@ -3751,577 +3857,504 @@ function prepareDelhiveryOrderUpdates(orders: any[], shipments: any[]): OrderUpd
   return updates;
 }
 
-// 6. HELPER FUNCTIONS
-async function validateUsers(accountId: string, userIds: string[]): Promise<string[]> {
-  const results = await Promise.all(
-    userIds.map(async (userId) => {
-      try {
-        const userDoc = await db.collection("users").doc(userId).get();
-        if (!userDoc.exists) return null;
-        if (userDoc.get("activeAccountId") !== accountId) return null;
-        return userId;
-      } catch {
-        return null;
-      }
-    }),
-  );
-  return results.filter((id): id is string => id !== null);
-}
-
-async function queueNextChunk(
-  tasksSecret: string,
-  params: {
-    accountId: string;
-    userIds: string[];
-    batchId: string;
-    jobId: string;
-    cursor: string;
-    chunkIndex: number;
-  },
-): Promise<void> {
-  const targetUrl = process.env.UPDATE_STATUS_TASK_JOB_TARGET_URL;
-
-  await createTask(params, {
-    tasksSecret,
-    url: targetUrl,
-    queue: process.env.STATUS_UPDATE_QUEUE_NAME || "statuses-update-queue",
-    delaySeconds: 2,
-  });
-}
-
-async function handleJobError(error: any, body: any): Promise<void> {
-  const { batchId, jobId, chunkIndex } = body;
-  if (!batchId || !jobId) return;
-
-  const msg = error.message || String(error);
-  const code = msg.split(/\s/)[0];
-  const NON_RETRYABLE = ["ACCOUNT_NOT_FOUND", "API_KEY_MISSING", "NO_VALID_USERS_FOR_ACCOUNT"];
-  const isRetryable = !NON_RETRYABLE.includes(code);
-
-  const batchRef = db.collection("status_update_batches").doc(batchId);
-  const jobRef = batchRef.collection("jobs").doc(jobId);
-
-  try {
-    const jobSnap = await jobRef.get();
-    const attempts = Number(jobSnap.data()?.attempts || 0);
-    const maxAttempts = Number(process.env.STATUS_UPDATE_QUEUE_MAX_ATTEMPTS || 4);
-    const attemptsExhausted = attempts >= maxAttempts;
-
-    await Promise.all([
-      jobRef.set(
-        {
-          status: isRetryable ? (attemptsExhausted ? "failed" : "retrying") : "failed",
-          errorCode: isRetryable ? "EXCEPTION" : code,
-          errorMessage: msg.slice(0, 400),
-          failedAt: FieldValue.serverTimestamp(),
-          failedAtChunk: chunkIndex || 0,
-        },
-        { merge: true },
-      ),
-      batchRef.update(
-        isRetryable && !attemptsExhausted
-          ? { processing: FieldValue.increment(-1) }
-          : { processing: FieldValue.increment(-1), failed: FieldValue.increment(1) },
-      ),
-    ]);
-
-    await maybeCompleteBatch(batchRef);
-  } catch (e) {
-    console.error("Failed to update job with error status:", e);
-  }
-}
-
 // ============================================================================
 // SHARED UTILITIES - Used by both scheduled and manual updates
 // ============================================================================
-// function determineNewShiprocketStatus(currentStatus: string): string | null {
-//   const statusMap: Record<string, string> = {
-//     "In Transit": "In Transit",
-//     "Out For Delivery": "Out For Delivery",
-//     "Delivered": "Delivered",
-//   };
-
-//   return statusMap[currentStatus] || null;
-// }
-
-// // ============================================================================
-// // SCHEDULED SHIPROCKET STATUS UPDATES
-// // ============================================================================
-
-// // 1. SCHEDULER - Enqueues initial tasks (one per account)
-// export const enqueueShiprocketStatusUpdateTasksScheduled = onSchedule(
-//   {
-//     schedule: "0 0,4,8,12,16,20 * * *", // 6 times daily
-//     timeZone: "Asia/Kolkata",
-//     region: process.env.LOCATION || "asia-south1",
-//     memory: "512MiB",
-//     timeoutSeconds: 540,
-//     secrets: [TASKS_SECRET],
-//   },
-//   async (event) => {
-//     console.log(`Starting scheduled Shiprocket status update batch processing...${event ? "" : ""}`);
-
-//     try {
-//       const usersSnapshot = await db.collection("users").where("activeAccountId", "!=", null).get();
-
-//       if (usersSnapshot.empty) {
-//         console.log("No users with active accounts found");
-//         return;
-//       }
-
-//       // Group users by account and filter for Shiprocket integration
-//       const accountToUsers = new Map<string, string[]>();
-//       let totalUsersCount = 0;
-
-//       for (const userDoc of usersSnapshot.docs) {
-//         const userId = userDoc.id;
-//         const activeAccountId = userDoc.get("activeAccountId");
-//         if (!activeAccountId) continue;
-
-//         try {
-//           const accountDoc = await db.collection("accounts").doc(activeAccountId).get();
-//           if (!accountDoc.exists) continue;
-
-//           const apiKey = accountDoc.data()?.integrations?.couriers?.shiprocket?.apiKey;
-//           if (apiKey) {
-//             if (!accountToUsers.has(activeAccountId)) {
-//               accountToUsers.set(activeAccountId, []);
-//             }
-//             accountToUsers.get(activeAccountId)!.push(userId);
-//             totalUsersCount++;
-//           }
-//         } catch (error) {
-//           console.error(`Error checking account ${activeAccountId}:`, error);
-//         }
-//       }
-
-//       if (accountToUsers.size === 0) {
-//         console.log("No accounts with Shiprocket integration found");
-//         return;
-//       }
-
-//       console.log(
-//         `Found ${accountToUsers.size} accounts with Shiprocket (${totalUsersCount} users)`,
-//       );
-
-//       // Create batch header
-//       const batchRef = db.collection("status_update_batches").doc();
-//       const batchId = batchRef.id;
-
-//       await batchRef.set({
-//         createdAt: FieldValue.serverTimestamp(),
-//         createdBy: "system-scheduled",
-//         total: accountToUsers.size,
-//         totalUsers: totalUsersCount,
-//         queued: accountToUsers.size,
-//         status: "running",
-//         processing: 0,
-//         success: 0,
-//         failed: 0,
-//         type: "status_update",
-//         schedule: "6x_daily",
-//         courier: "shiprocket",
-//       });
-
-//       // Create job documents (one per account)
-//       const writer = db.bulkWriter();
-//       for (const [accountId, userIds] of accountToUsers) {
-//         writer.set(
-//           batchRef.collection("jobs").doc(accountId),
-//           {
-//             accountId,
-//             userIds,
-//             userCount: userIds.length,
-//             status: "queued",
-//             attempts: 0,
-//             createdAt: FieldValue.serverTimestamp(),
-//             processedOrders: 0,
-//             updatedOrders: 0,
-//             totalChunks: 0,
-//           },
-//           { merge: true },
-//         );
-//       }
-//       await writer.close();
-
-//       const targetUrl = process.env.UPDATE_STATUS_TASK_JOB_TARGET_URL_SHIPROCKET;
-//       if (!targetUrl) {
-//         throw new Error("UPDATE_STATUS_TASK_TARGET_URL_SHIPROCKET not configured");
-//       }
-
-//       // Create initial tasks (chunk 0 for each account)
-//       const taskPromises = Array.from(accountToUsers.entries()).map(([accountId, userIds], index) =>
-//         createTask(
-//           {
-//             accountId,
-//             userIds,
-//             batchId,
-//             jobId: accountId,
-//             chunkIndex: 0,
-//             cursor: null,
-//           } as any,
-//           {
-//             tasksSecret: TASKS_SECRET.value() || "",
-//             url: targetUrl,
-//             queue: process.env.STATUS_UPDATE_QUEUE_NAME_SHIPROCKET || "shiprocket-status-update-queue",
-//             delaySeconds: Math.floor(index * 2),
-//           },
-//         ),
-//       );
-
-//       await Promise.all(taskPromises);
-
-//       console.log(`Enqueued ${accountToUsers.size} initial tasks for batch ${batchId}`);
-//     } catch (error) {
-//       console.error("enqueueShiprocketStatusUpdateTasks failed:", error);
-//       throw error;
-//     }
-//   },
-// );
-
-// // 2. MAIN TASK HANDLER - Processes one chunk and queues next if needed
-// export const updateShiprocketStatusesJob = onRequest(
-//   { cors: true, timeoutSeconds: 540, secrets: [TASKS_SECRET], memory: "512MiB" },
-//   async (req: Request, res: Response): Promise<void> => {
-//     try {
-//       requireHeaderSecret(req, "x-tasks-secret", TASKS_SECRET.value() || "");
-
-//       if (req.method !== "POST") {
-//         res.status(405).json({ error: "method_not_allowed" });
-//         return;
-//       }
-
-//       const {
-//         accountId,
-//         userIds,
-//         batchId,
-//         jobId,
-//         cursor = null,
-//         chunkIndex = 0,
-//       } = req.body as {
-//         accountId?: string;
-//         userIds?: string[];
-//         batchId?: string;
-//         jobId?: string;
-//         cursor?: string | null;
-//         chunkIndex?: number;
-//       };
-
-//       if (!accountId || !userIds?.length || !batchId || !jobId) {
-//         res.status(400).json({ error: "missing_required_params" });
-//         return;
-//       }
-
-//       const batchRef = db.collection("status_update_batches").doc(batchId);
-//       const jobRef = batchRef.collection("jobs").doc(jobId);
-
-//       // Idempotency check
-//       const jSnap = await jobRef.get();
-//       if (jSnap.exists && jSnap.data()?.status === "success") {
-//         res.json({ ok: true, dedup: true });
-//         return;
-//       }
-
-//       // Initialize job on first chunk
-//       if (chunkIndex === 0) {
-//         const validUserIds = await validateUsers(accountId, userIds);
-//         if (validUserIds.length === 0) {
-//           throw new Error("NO_VALID_USERS_FOR_ACCOUNT");
-//         }
-
-//         await db.runTransaction(async (tx: Transaction) => {
-//           const snap = await tx.get(jobRef);
-//           const data = snap.data() || {};
-//           const prevAttempts = Number(data.attempts || 0);
-//           const firstAttempt = prevAttempts === 0 || data.status === "queued";
-
-//           tx.set(
-//             jobRef,
-//             {
-//               status: "processing",
-//               attempts: (prevAttempts || 0) + 1,
-//               lastAttemptAt: FieldValue.serverTimestamp(),
-//               accountId,
-//               userIds: validUserIds,
-//               userCount: validUserIds.length,
-//               processedOrders: 0,
-//               updatedOrders: 0,
-//               totalChunks: 0,
-//             },
-//             { merge: true },
-//           );
-
-//           const inc: any = { processing: FieldValue.increment(1) };
-//           if (firstAttempt) inc.queued = FieldValue.increment(-1);
-//           tx.update(batchRef, inc);
-//         });
-//       }
-
-//       // Verify account and get API key
-//       const accountDoc = await db.collection("accounts").doc(accountId).get();
-//       if (!accountDoc.exists) throw new Error("ACCOUNT_NOT_FOUND");
-
-//       const apiKey = accountDoc.data()?.integrations?.couriers?.shiprocket?.apiKey;
-//       if (!apiKey) throw new Error("API_KEY_MISSING");
-
-//       // Process one chunk of orders
-//       const result = await processShiprocketOrderChunk(accountId, apiKey, cursor);
-
-//       // Update job progress
-//       await jobRef.update({
-//         processedOrders: FieldValue.increment(result.processed),
-//         updatedOrders: FieldValue.increment(result.updated),
-//         totalChunks: FieldValue.increment(1),
-//         lastChunkAt: FieldValue.serverTimestamp(),
-//         lastCursor: result.nextCursor || FieldValue.delete(),
-//       });
-
-//       // If more work remains, queue next chunk
-//       if (result.hasMore && result.nextCursor) {
-//         await queueNextChunk(TASKS_SECRET.value() || "", {
-//           accountId,
-//           userIds,
-//           batchId,
-//           jobId,
-//           cursor: result.nextCursor,
-//           chunkIndex: chunkIndex + 1,
-//         });
-
-//         res.json({
-//           ok: true,
-//           status: "chunk_completed",
-//           chunkIndex,
-//           processed: result.processed,
-//           updated: result.updated,
-//           hasMore: true,
-//         });
-//         return;
-//       }
-
-//       // Job complete
-//       const jobData = (await jobRef.get()).data() || {};
-//       await Promise.all([
-//         jobRef.update({
-//           status: "success",
-//           message: "status_update_completed",
-//           completedAt: FieldValue.serverTimestamp(),
-//         }),
-//         batchRef.update({
-//           processing: FieldValue.increment(-1),
-//           success: FieldValue.increment(1),
-//         }),
-//       ]);
-
-//       await maybeCompleteBatch(batchRef);
-
-//       res.json({
-//         ok: true,
-//         status: "job_completed",
-//         totalProcessed: jobData.processedOrders || 0,
-//         totalUpdated: jobData.updatedOrders || 0,
-//         totalChunks: jobData.totalChunks || 0,
-//       });
-//     } catch (error: any) {
-//       await handleJobError(error, req.body);
-//       const msg = error.message || String(error);
-//       const code = msg.split(/\s/)[0];
-//       const NON_RETRYABLE = ["ACCOUNT_NOT_FOUND", "API_KEY_MISSING", "NO_VALID_USERS_FOR_ACCOUNT"];
-//       const isRetryable = !NON_RETRYABLE.includes(code);
-
-//       res.status(isRetryable ? 503 : 200).json({
-//         ok: false,
-//         error: isRetryable ? "job_failed_transient" : "job_failed_permanent",
-//         code,
-//         message: msg,
-//       });
-//     }
-//   },
-// );
-
-// // 3. CHUNK PROCESSOR - Fetches and processes one page of orders
-// interface ChunkResult {
-//   processed: number;
-//   updated: number;
-//   hasMore: boolean;
-//   nextCursor?: string;
-// }
-
-// async function processShiprocketOrderChunk(
-//   accountId: string,
-//   apiKey: string,
-//   cursor: string | null,
-// ): Promise<ChunkResult> {
-//   const excludedStatuses = new Set([
-//     "New",
-//     "Confirmed",
-//     "Ready To Dispatch",
-//     "Delivered",
-//   ]);
-
-//   // Build paginated query - using array-contains to match couriers that include "Shiprocket"
-//   let query = db
-//     .collection("accounts")
-//     .doc(accountId)
-//     .collection("orders")
-//     .where("courier", ">=", "Shiprocket")
-//     .where("courier", "<=", "Shiprocket\uf8ff")
-//     .orderBy("courier")
-//     .orderBy("__name__")
-//     .limit(CHUNK_SIZE);
-
-//   if (cursor) {
-//     // Cursor should be in format "courier|docId"
-//     const [courierCursor, docIdCursor] = cursor.split("|");
-//     query = query.startAfter(courierCursor, docIdCursor);
-//   }
-
-//   const snapshot = await query.get();
-
-//   if (snapshot.empty) {
-//     return { processed: 0, updated: 0, hasMore: false };
-//   }
-
-//   const eligibleOrders = snapshot.docs
-//     .map((doc: QueryDocumentSnapshot) => ({ id: doc.id, ref: doc.ref, ...doc.data() }))
-//     .filter(
-//       (order: any) =>
-//         order.awb &&
-//         order.customStatus &&
-//         !excludedStatuses.has(order.customStatus) &&
-//         order.courier?.includes("Shiprocket")
-//     );
-
-//   if (eligibleOrders.length === 0) {
-//     const lastDoc = snapshot.docs[snapshot.docs.length - 1];
-//     const lastCourier = lastDoc.get("courier");
-//     return {
-//       processed: snapshot.size,
-//       updated: 0,
-//       hasMore: snapshot.size === CHUNK_SIZE,
-//       nextCursor: `${lastCourier}|${lastDoc.id}`,
-//     };
-//   }
-
-//   console.log(`Processing ${eligibleOrders.length} eligible Shiprocket orders for account ${accountId}`);
-
-//   // Process in API batches
-//   let totalUpdated = 0;
-
-//   for (let i = 0; i < eligibleOrders.length; i += API_BATCH_SIZE) {
-//     const batch = eligibleOrders.slice(i, Math.min(i + API_BATCH_SIZE, eligibleOrders.length));
-//     const updates = await fetchAndProcessShiprocketBatch(batch, apiKey);
-
-//     // Apply updates using Firestore batch writes
-//     if (updates.length > 0) {
-//       const writeBatch = db.batch();
-//       updates.forEach((update) => {
-//         writeBatch.update(update.ref, update.data);
-//       });
-//       await writeBatch.commit();
-//       totalUpdated += updates.length;
-//       console.log(`Updated ${updates.length} orders in API batch ${i / API_BATCH_SIZE + 1}`);
-//     }
-
-//     // Rate limiting between API calls
-//     if (i + API_BATCH_SIZE < eligibleOrders.length) {
-//       await sleep(150);
-//     }
-//   }
-
-//   const lastDoc = snapshot.docs[snapshot.docs.length - 1];
-//   const hasMore = snapshot.size === CHUNK_SIZE;
-//   const lastCourier = lastDoc.get("courier");
-
-//   return {
-//     processed: eligibleOrders.length,
-//     updated: totalUpdated,
-//     hasMore,
-//     nextCursor: hasMore ? `${lastCourier}|${lastDoc.id}` : undefined,
-//   };
-// }
-
-// // 4. API PROCESSOR - Calls Shiprocket and prepares updates
-// interface OrderUpdate {
-//   ref: DocumentReference;
-//   data: any;
-// }
-
-// async function fetchAndProcessShiprocketBatch(orders: any[], apiKey: string): Promise<OrderUpdate[]> {
-//   const awbs = orders.map((order) => order.awb).filter(Boolean);
-
-//   if (awbs.length === 0) return [];
-
-//   try {
-//     const trackingUrl = "https://apiv2.shiprocket.in/v1/external/courier/track/awbs";
-//     const response = await fetch(trackingUrl, {
-//       method: "POST",
-//       headers: {
-//         "Authorization": `Bearer ${apiKey}`,
-//         "Content-Type": "application/json",
-//         "Accept": "application/json",
-//       },
-//       body: JSON.stringify({ awbs }),
-//     });
-
-//     if (!response.ok) {
-//       if (response.status >= 500 || response.status === 429) {
-//         throw new Error(`HTTP_${response.status}`);
-//       }
-//       console.error(`Shiprocket API error: ${response.status}`);
-//       return [];
-//     }
-
-//     const trackingData = (await response.json()) as any;
-
-//     return prepareShiprocketOrderUpdates(orders, trackingData);
-//   } catch (error: any) {
-//     console.error("Batch processing error:", error);
-//     if (error.message.startsWith("HTTP_")) {
-//       throw error;
-//     }
-//     return [];
-//   }
-// }
-
-// // 5. UPDATE PREPARATION - Maps API responses to Firestore updates
-// function prepareShiprocketOrderUpdates(orders: any[], trackingData: any): OrderUpdate[] {
-//   const updates: OrderUpdate[] = [];
-//   const ordersByAwb = new Map(orders.map((o) => [o.awb, o]));
-
-//   for (const [awb, shipmentData] of Object.entries(trackingData)) {
-//     const order = ordersByAwb.get(awb);
-//     if (!order) continue;
-
-//     const shipmentInfo = shipmentData as any;
-//     const trackingDataObj = shipmentInfo?.tracking_data;
-//     if (!trackingDataObj) continue;
-
-//     const shipmentTrack = trackingDataObj.shipment_track;
-//     if (!Array.isArray(shipmentTrack) || shipmentTrack.length === 0) continue;
-
-//     const currentStatus = shipmentTrack[0]?.current_status;
-//     if (!currentStatus) continue;
-
-//     const newStatus = determineNewShiprocketStatus(currentStatus);
-//     if (!newStatus) continue;
-//     if (newStatus === order.customStatus) continue;
-
-//     updates.push({
-//       ref: order.ref,
-//       data: {
-//         customStatus: newStatus,
-//         lastStatusUpdate: FieldValue.serverTimestamp(),
-//         customStatusesLogs: FieldValue.arrayUnion({
-//           status: newStatus,
-//           createdAt: Timestamp.now(),
-//           remarks: getStatusRemarks(newStatus),
-//         }),
-//       },
-//     });
-//   }
-
-//   return updates;
-// }
+function determineNewShiprocketStatus(currentStatus: string): string | null {
+  const statusMap: Record<string, string> = {
+    "In Transit": "In Transit",
+    "In Transit-EN-ROUTE": "In Transit",
+    "Out for Delivery": "Out For Delivery",
+    Delivered: "Delivered",
+    "RTO IN INTRANSIT": "RTO In Transit",
+  };
+
+  return statusMap[currentStatus] || null;
+}
+
+// ============================================================================
+// SCHEDULED SHIPROCKET STATUS UPDATES
+// ============================================================================
+
+// 1. SCHEDULER - Enqueues initial tasks (one per account)
+export const enqueueShiprocketStatusUpdateTasksScheduled = onSchedule(
+  {
+    schedule: "0 0,4,8,12,16,20 * * *", // 6 times daily
+    timeZone: "Asia/Kolkata",
+    region: process.env.LOCATION || "asia-south1",
+    memory: "512MiB",
+    timeoutSeconds: 540,
+    secrets: [TASKS_SECRET],
+  },
+  async (event) => {
+    console.log(
+      `Starting scheduled Shiprocket status update batch processing...${event ? "" : ""}`,
+    );
+
+    try {
+      const usersSnapshot = await db.collection("users").where("activeAccountId", "!=", null).get();
+
+      if (usersSnapshot.empty) {
+        console.log("No users with active accounts found");
+        return;
+      }
+
+      // Group users by account and filter for Shiprocket integration
+      const accountToUsers = new Map<string, string[]>();
+      let totalUsersCount = 0;
+
+      for (const userDoc of usersSnapshot.docs) {
+        const userId = userDoc.id;
+        const activeAccountId = userDoc.get("activeAccountId");
+        if (!activeAccountId) continue;
+
+        try {
+          const accountDoc = await db.collection("accounts").doc(activeAccountId).get();
+          if (!accountDoc.exists) continue;
+
+          const apiKey = accountDoc.data()?.integrations?.couriers?.shiprocket?.apiKey;
+          if (apiKey) {
+            if (!accountToUsers.has(activeAccountId)) {
+              accountToUsers.set(activeAccountId, []);
+            }
+            accountToUsers.get(activeAccountId)!.push(userId);
+            totalUsersCount++;
+          }
+        } catch (error) {
+          console.error(`Error checking account ${activeAccountId}:`, error);
+        }
+      }
+
+      if (accountToUsers.size === 0) {
+        console.log("No accounts with Shiprocket integration found");
+        return;
+      }
+
+      console.log(
+        `Found ${accountToUsers.size} accounts with Shiprocket (${totalUsersCount} users)`,
+      );
+
+      // Create batch header
+      const batchRef = db.collection("status_update_batches").doc();
+      const batchId = batchRef.id;
+
+      await batchRef.set({
+        createdAt: FieldValue.serverTimestamp(),
+        createdBy: "system-scheduled",
+        total: accountToUsers.size,
+        totalUsers: totalUsersCount,
+        queued: accountToUsers.size,
+        status: "running",
+        processing: 0,
+        success: 0,
+        failed: 0,
+        type: "status_update",
+        schedule: "6x_daily",
+        courier: "shiprocket",
+      });
+
+      // Create job documents (one per account)
+      const writer = db.bulkWriter();
+      for (const [accountId, userIds] of accountToUsers) {
+        writer.set(
+          batchRef.collection("jobs").doc(accountId),
+          {
+            accountId,
+            userIds,
+            userCount: userIds.length,
+            status: "queued",
+            attempts: 0,
+            createdAt: FieldValue.serverTimestamp(),
+            processedOrders: 0,
+            updatedOrders: 0,
+            totalChunks: 0,
+          },
+          { merge: true },
+        );
+      }
+      await writer.close();
+
+      const targetUrl = process.env.UPDATE_STATUS_TASK_JOB_TARGET_URL_SHIPROCKET;
+      if (!targetUrl) {
+        throw new Error("UPDATE_STATUS_TASK_TARGET_URL_SHIPROCKET not configured");
+      }
+
+      // Create initial tasks (chunk 0 for each account)
+      const taskPromises = Array.from(accountToUsers.entries()).map(([accountId, userIds], index) =>
+        createTask(
+          {
+            accountId,
+            userIds,
+            batchId,
+            jobId: accountId,
+            chunkIndex: 0,
+            cursor: null,
+          } as any,
+          {
+            tasksSecret: TASKS_SECRET.value() || "",
+            url: targetUrl,
+            queue: process.env.STATUS_UPDATE_QUEUE_NAME || "statuses-update-queue",
+            delaySeconds: Math.floor(index * 2),
+          },
+        ),
+      );
+
+      await Promise.all(taskPromises);
+
+      console.log(`Enqueued ${accountToUsers.size} initial tasks for batch ${batchId}`);
+    } catch (error) {
+      console.error("enqueueShiprocketStatusUpdateTasks failed:", error);
+      throw error;
+    }
+  },
+);
+
+// 2. MAIN TASK HANDLER - Processes one chunk and queues next if needed
+export const updateShiprocketStatusesJob = onRequest(
+  { cors: true, timeoutSeconds: 540, secrets: [TASKS_SECRET], memory: "512MiB" },
+  async (req: Request, res: Response): Promise<void> => {
+    try {
+      requireHeaderSecret(req, "x-tasks-secret", TASKS_SECRET.value() || "");
+
+      if (req.method !== "POST") {
+        res.status(405).json({ error: "method_not_allowed" });
+        return;
+      }
+
+      const {
+        accountId,
+        userIds,
+        batchId,
+        jobId,
+        cursor = null,
+        chunkIndex = 0,
+      } = req.body as {
+        accountId?: string;
+        userIds?: string[];
+        batchId?: string;
+        jobId?: string;
+        cursor?: string | null;
+        chunkIndex?: number;
+      };
+
+      if (!accountId || !userIds?.length || !batchId || !jobId) {
+        res.status(400).json({ error: "missing_required_params" });
+        return;
+      }
+
+      const batchRef = db.collection("status_update_batches").doc(batchId);
+      const jobRef = batchRef.collection("jobs").doc(jobId);
+
+      // Idempotency check
+      const jSnap = await jobRef.get();
+      if (jSnap.exists && jSnap.data()?.status === "success") {
+        res.json({ ok: true, dedup: true });
+        return;
+      }
+
+      // Initialize job on first chunk
+      if (chunkIndex === 0) {
+        const validUserIds = await validateUsers(accountId, userIds);
+        if (validUserIds.length === 0) {
+          throw new Error("NO_VALID_USERS_FOR_ACCOUNT");
+        }
+
+        await db.runTransaction(async (tx: Transaction) => {
+          const snap = await tx.get(jobRef);
+          const data = snap.data() || {};
+          const prevAttempts = Number(data.attempts || 0);
+          const firstAttempt = prevAttempts === 0 || data.status === "queued";
+
+          tx.set(
+            jobRef,
+            {
+              status: "processing",
+              attempts: (prevAttempts || 0) + 1,
+              lastAttemptAt: FieldValue.serverTimestamp(),
+              accountId,
+              userIds: validUserIds,
+              userCount: validUserIds.length,
+              processedOrders: 0,
+              updatedOrders: 0,
+              totalChunks: 0,
+            },
+            { merge: true },
+          );
+
+          const inc: any = { processing: FieldValue.increment(1) };
+          if (firstAttempt) inc.queued = FieldValue.increment(-1);
+          tx.update(batchRef, inc);
+        });
+      }
+
+      // Verify account and get API key
+      const accountDoc = await db.collection("accounts").doc(accountId).get();
+      if (!accountDoc.exists) throw new Error("ACCOUNT_NOT_FOUND");
+
+      const apiKey = accountDoc.data()?.integrations?.couriers?.shiprocket?.apiKey;
+      if (!apiKey) throw new Error("API_KEY_MISSING");
+
+      // Process one chunk of orders
+      const result = await processShiprocketOrderChunk(accountId, apiKey, cursor);
+
+      // Update job progress
+      await jobRef.update({
+        processedOrders: FieldValue.increment(result.processed),
+        updatedOrders: FieldValue.increment(result.updated),
+        totalChunks: FieldValue.increment(1),
+        lastChunkAt: FieldValue.serverTimestamp(),
+        lastCursor: result.nextCursor || FieldValue.delete(),
+      });
+
+      // If more work remains, queue next chunk
+      if (result.hasMore && result.nextCursor) {
+        await queueNextChunk(
+          TASKS_SECRET.value() || "",
+          process.env.UPDATE_STATUS_TASK_JOB_TARGET_URL_SHIPROCKET!,
+          {
+            accountId,
+            userIds,
+            batchId,
+            jobId,
+            cursor: result.nextCursor,
+            chunkIndex: chunkIndex + 1,
+          },
+        );
+
+        res.json({
+          ok: true,
+          status: "chunk_completed",
+          chunkIndex,
+          processed: result.processed,
+          updated: result.updated,
+          hasMore: true,
+        });
+        return;
+      }
+
+      // Job complete
+      const jobData = (await jobRef.get()).data() || {};
+      await Promise.all([
+        jobRef.update({
+          status: "success",
+          message: "status_update_completed",
+          completedAt: FieldValue.serverTimestamp(),
+        }),
+        batchRef.update({
+          processing: FieldValue.increment(-1),
+          success: FieldValue.increment(1),
+        }),
+      ]);
+
+      await maybeCompleteBatch(batchRef);
+
+      res.json({
+        ok: true,
+        status: "job_completed",
+        totalProcessed: jobData.processedOrders || 0,
+        totalUpdated: jobData.updatedOrders || 0,
+        totalChunks: jobData.totalChunks || 0,
+      });
+    } catch (error: any) {
+      await handleJobError(error, req.body);
+      const msg = error.message || String(error);
+      const code = msg.split(/\s/)[0];
+      const NON_RETRYABLE = ["ACCOUNT_NOT_FOUND", "API_KEY_MISSING", "NO_VALID_USERS_FOR_ACCOUNT"];
+      const isRetryable = !NON_RETRYABLE.includes(code);
+
+      res.status(isRetryable ? 503 : 200).json({
+        ok: false,
+        error: isRetryable ? "job_failed_transient" : "job_failed_permanent",
+        code,
+        message: msg,
+      });
+    }
+  },
+);
+
+async function processShiprocketOrderChunk(
+  accountId: string,
+  apiKey: string,
+  cursor: string | null,
+): Promise<ChunkResult> {
+  const excludedStatuses = new Set([
+    "New",
+    "Confirmed",
+    "Ready To Dispatch",
+    "DTO Requested",
+    "Lost",
+    "Closed",
+    "RTO Closed",
+    "RTO Delivered",
+    "DTO Delivered",
+    "Pending Refunds",
+  ]);
+
+  // Build paginated query - using array-contains to match couriers that include "Shiprocket"
+  let query = db
+    .collection("accounts")
+    .doc(accountId)
+    .collection("orders")
+    .where("courier", ">=", "Shiprocket")
+    .where("courier", "<=", "Shiprocket\uf8ff")
+    .orderBy("courier")
+    .orderBy("__name__")
+    .limit(CHUNK_SIZE);
+
+  if (cursor) {
+    // Cursor should be in format "courier|docId"
+    const [courierCursor, docIdCursor] = cursor.split("|");
+    query = query.startAfter(courierCursor, docIdCursor);
+  }
+
+  const snapshot = await query.get();
+
+  if (snapshot.empty) {
+    return { processed: 0, updated: 0, hasMore: false };
+  }
+
+  const eligibleOrders = snapshot.docs
+    .map((doc: QueryDocumentSnapshot) => ({ id: doc.id, ref: doc.ref, ...doc.data() }))
+    .filter(
+      (order: any) =>
+        order.awb &&
+        order.customStatus &&
+        !excludedStatuses.has(order.customStatus) &&
+        order.courier?.includes("Shiprocket"),
+    );
+
+  if (eligibleOrders.length === 0) {
+    const lastDoc = snapshot.docs[snapshot.docs.length - 1];
+    const lastCourier = lastDoc.get("courier");
+    return {
+      processed: snapshot.size,
+      updated: 0,
+      hasMore: snapshot.size === CHUNK_SIZE,
+      nextCursor: `${lastCourier}|${lastDoc.id}`,
+    };
+  }
+
+  console.log(
+    `Processing ${eligibleOrders.length} eligible Shiprocket orders for account ${accountId}`,
+  );
+
+  // Process in API batches
+  let totalUpdated = 0;
+
+  for (let i = 0; i < eligibleOrders.length; i += API_BATCH_SIZE) {
+    const batch = eligibleOrders.slice(i, Math.min(i + API_BATCH_SIZE, eligibleOrders.length));
+    const updates = await fetchAndProcessShiprocketBatch(batch, apiKey);
+
+    // Apply updates using Firestore batch writes
+    if (updates.length > 0) {
+      const writeBatch = db.batch();
+      updates.forEach((update) => {
+        writeBatch.update(update.ref, update.data);
+      });
+      await writeBatch.commit();
+      totalUpdated += updates.length;
+      console.log(`Updated ${updates.length} orders in API batch ${i / API_BATCH_SIZE + 1}`);
+    }
+
+    // Rate limiting between API calls
+    if (i + API_BATCH_SIZE < eligibleOrders.length) {
+      await sleep(150);
+    }
+  }
+
+  const lastDoc = snapshot.docs[snapshot.docs.length - 1];
+  const hasMore = snapshot.size === CHUNK_SIZE;
+  const lastCourier = lastDoc.get("courier");
+
+  return {
+    processed: eligibleOrders.length,
+    updated: totalUpdated,
+    hasMore,
+    nextCursor: hasMore ? `${lastCourier}|${lastDoc.id}` : undefined,
+  };
+}
+
+async function fetchAndProcessShiprocketBatch(
+  orders: any[],
+  apiKey: string,
+): Promise<OrderUpdate[]> {
+  const awbs = orders.map((order) => order.awb).filter(Boolean);
+
+  if (awbs.length === 0) return [];
+
+  try {
+    const trackingUrl = "https://apiv2.shiprocket.in/v1/external/courier/track/awbs";
+    const response = await fetch(trackingUrl, {
+      method: "POST",
+      headers: {
+        Authorization: `Bearer ${apiKey}`,
+        "Content-Type": "application/json",
+        Accept: "application/json",
+      },
+      body: JSON.stringify({ awbs }),
+    });
+
+    if (!response.ok) {
+      if (response.status >= 500 || response.status === 429) {
+        throw new Error(`HTTP_${response.status}`);
+      }
+      console.error(`Shiprocket API error: ${response.status}`);
+      return [];
+    }
+
+    const trackingData = (await response.json()) as any;
+
+    const fieldCount = Object.keys(trackingData).length;
+    console.log(fieldCount);
+
+    return prepareShiprocketOrderUpdates(orders, trackingData);
+  } catch (error: any) {
+    console.error("Batch processing error:", error);
+    if (error.message.startsWith("HTTP_")) {
+      throw error;
+    }
+    return [];
+  }
+}
+
+// 5. UPDATE PREPARATION - Maps API responses to Firestore updates
+function prepareShiprocketOrderUpdates(orders: any[], trackingData: any): OrderUpdate[] {
+  const updates: OrderUpdate[] = [];
+  const ordersByAwb = new Map(orders.map((o) => [o.awb, o]));
+
+  for (const [awb, shipmentData] of Object.entries(trackingData)) {
+    const order = ordersByAwb.get(awb);
+    if (!order) continue;
+
+    const shipmentInfo = shipmentData as any;
+    const trackingDataObj = shipmentInfo?.tracking_data;
+    if (!trackingDataObj) continue;
+
+    const shipmentTrack = trackingDataObj.shipment_track;
+    if (!Array.isArray(shipmentTrack) || shipmentTrack.length === 0) continue;
+
+    const currentStatus = shipmentTrack[0]?.current_status;
+    if (!currentStatus) continue;
+
+    const newStatus = determineNewShiprocketStatus(currentStatus);
+    if (!newStatus) continue;
+    if (newStatus === order.customStatus) continue;
+    updates.push({
+      ref: order.ref,
+      data: {
+        customStatus: newStatus,
+        lastStatusUpdate: FieldValue.serverTimestamp(),
+        customStatusesLogs: FieldValue.arrayUnion({
+          status: newStatus,
+          createdAt: Timestamp.now(),
+          remarks: getStatusRemarks(newStatus),
+        }),
+      },
+    });
+  }
+
+  return updates;
+}
 
 // ============================================================================
 // CRON JOB - Closes delivered orders after 144 hours
@@ -4718,6 +4751,7 @@ async function processOrderIdsChunk(
     "RTO Closed",
     "RTO Delivered",
     "DTO Delivered",
+    "Pending Refunds",
   ]);
 
   // Fetch orders in batches (Firestore getAll limit is 500)
