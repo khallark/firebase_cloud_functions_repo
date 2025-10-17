@@ -99,7 +99,7 @@ export function buildDelhiveryPayload(params: {
     shipment_width: "10",
     shipment_height: "10",
     shipment_length: "10",
-    weight: _(order?.raw?.total_weight),
+    weight: _(order?.raw?.total_weight ? order?.raw?.total_weight : 250),
 
     shipping_mode: shippingMode,
     address_type: _(order?.address_type),
@@ -165,7 +165,8 @@ export function buildShiprocketPayload(opts: {
     ? "COD"
     : "Prepaid";
 
-  const weight = Number(order?.raw?.total_weight) / 1000;
+  const weightingms = order?.raw?.total_weight ? Number(order?.raw.total_weight) : 250;
+  const weight = weightingms / 1000;
 
   function normalizePhoneNumber(phoneNumber: string): string {
     // Remove all whitespace characters from the phone number
@@ -295,7 +296,7 @@ export function buildDelhiveryReturnPayload(params: {
   const totalQty = selected.reduce((sum, li) => sum + (li.quantity ?? 1), 0);
 
   const totalWeightGm = order?.raw?.total_weight;
-  const weightField = totalWeightGm ? String(totalWeightGm) : "";
+  const weightField = totalWeightGm ? String(totalWeightGm) : "250";
 
   function normalizePhoneNumber(phoneNumber: string): string {
     const cleanedNumber = phoneNumber.replace(/\s/g, "");

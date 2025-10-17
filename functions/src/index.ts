@@ -3760,6 +3760,7 @@ async function processDelhiveryOrderChunk(
     "RTO Closed",
     "RTO Delivered",
     "DTO Delivered",
+    "Cancellation Requested",
     "Pending Refunds",
   ]);
 
@@ -4289,6 +4290,7 @@ async function processShiprocketOrderChunk(
     "RTO Closed",
     "RTO Delivered",
     "DTO Delivered",
+    "Cancellation Requested",
     "Pending Refunds",
   ]);
 
@@ -4844,6 +4846,7 @@ async function processXpressbeesOrderChunk(
     "RTO Closed",
     "RTO Delivered",
     "DTO Delivered",
+    "Cancellation Requested",
     "Pending Refunds",
   ]);
 
@@ -5426,6 +5429,7 @@ async function processOrderIdsChunk(
     "RTO Closed",
     "RTO Delivered",
     "DTO Delivered",
+    "Cancellation Requested",
     "Pending Refunds",
   ]);
 
