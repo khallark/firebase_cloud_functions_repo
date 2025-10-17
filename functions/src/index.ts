@@ -4490,6 +4490,7 @@ function determineNewXpressbeesStatus(currentStatus: string): string | null {
     delivered: "Delivered",
     "RT-IT": "RTO In Transit",
     "RT-DL": "RTO Delivered",
+    lost: "Lost",
   };
   return statusMap[currentStatus] || null;
 }
