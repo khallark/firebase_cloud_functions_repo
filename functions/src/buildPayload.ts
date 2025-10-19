@@ -11,7 +11,9 @@ export function buildDelhiveryPayload(params: {
   const ship =
     order?.raw?.shipping_address || order?.shipping_address || order?.shippingAddress || {};
 
-  const paid = !order.raw.payment_gateway_names.join(",").toLowerCase().includes("cod");
+  const paid =
+    !order.raw.payment_gateway_names.join(",").toLowerCase().includes("cod") &&
+    !Number(order.raw.total_outstanding);
   const items =
     (Array.isArray(order?.raw?.line_items) && order.raw.line_items) || order?.lineItems || [];
 
@@ -161,9 +163,11 @@ export function buildShiprocketPayload(opts: {
 
   const sub_total = order?.raw?.total_outstanding;
 
-  const payment_method = order.raw.payment_gateway_names.join(",").toLowerCase().includes("cod")
-    ? "COD"
-    : "Prepaid";
+  const payment_method =
+    !order.raw.payment_gateway_names.join(",").toLowerCase().includes("cod") &&
+    !Number(order.raw.total_outstanding)
+      ? "Prepaid"
+      : "COD";
 
   const weightingms = order?.raw?.total_weight ? Number(order?.raw.total_weight) : 250;
   const weight = weightingms / 1000;
@@ -362,7 +366,9 @@ export function buildXpressbeesPayload(params: {
   const ship =
     order?.raw?.shipping_address || order?.shipping_address || order?.shippingAddress || {};
 
-  const paid = !order.raw.payment_gateway_names.join(",").toLowerCase().includes("cod");
+  const paid =
+    !order.raw.payment_gateway_names.join(",").toLowerCase().includes("cod") &&
+    !Number(order.raw.total_outstanding);
   const items =
     (Array.isArray(order?.raw?.line_items) && order.raw.line_items) || order?.lineItems || [];
 

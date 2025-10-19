@@ -3028,7 +3028,7 @@ async function fulfillOrderOnShopify(
   }
   let { fulfillment_orders: fos } = (await foResp.json()) as any;
 
-  // If no FOs are visible, it’s almost always a scope issue
+  // If no FOs are visible, it's almost always a scope issue
   if (!Array.isArray(fos) || fos.length === 0) {
     return { nothingToDo: true }; // caller can treat this as "check app scopes"
   }
@@ -3077,43 +3077,67 @@ async function fulfillOrderOnShopify(
   );
   if (!fulfillableFOs.length) return { nothingToDo: true };
 
-  // 4) Create the fulfillment:
-  //    Pass only the FO IDs → fulfill all remaining quantities automatically.
-  const lineItemsByFO = fulfillableFOs.map((fo: any) => ({
-    fulfillment_order_id: fo.id,
-    // Omit fulfillment_order_line_items to fulfill all remaining; safer than sending li.quantity.
-  }));
+  // 4) Group fulfillment orders by assigned location
+  const fosByLocation = new Map<string, any[]>();
 
-  const fulfillUrl = `https://${shop}/admin/api/${V}/fulfillments.json`;
-  const resp = await fetch(fulfillUrl, {
-    method: "POST",
-    headers,
-    body: JSON.stringify({
-      fulfillment: {
-        line_items_by_fulfillment_order: lineItemsByFO,
-        tracking_info: {
-          number: String(awb) || "",
-          // Optionally set company/url so the link is clickable in Admin:
-          company: courier,
-          url: String(courier).toLowerCase().includes("shiprocket")
-            ? `https://apiv2.shiprocket.in/v1/external/courier/track/awb/${awb}`
-            : `https://track.delhivery.com/api/v1/packages/json/?waybill=${awb}&ref_ids=`,
-        },
-        notify_customer: false,
-      },
-    }),
-  });
-
-  if (!resp.ok) {
-    const text = await resp.text();
-    const err: any = new Error(`Fulfillment create failed: HTTP_${resp.status}`);
-    err.code = `HTTP_${resp.status}`;
-    err.detail = text;
-    throw err;
+  for (const fo of fulfillableFOs) {
+    const locationId = fo.assigned_location_id?.toString() || "unknown";
+    if (!fosByLocation.has(locationId)) {
+      fosByLocation.set(locationId, []);
+    }
+    fosByLocation.get(locationId)!.push(fo);
   }
 
-  const json: any = await resp.json();
-  return { fulfillmentId: json?.fulfillment?.id };
+  // 5) Create separate fulfillments for each location
+  const fulfillmentIds: string[] = [];
+
+  for (const [locationId, locationFOs] of fosByLocation.entries()) {
+    const lineItemsByFO = locationFOs.map((fo: any) => ({
+      fulfillment_order_id: fo.id,
+      // Omit fulfillment_order_line_items to fulfill all remaining; safer than sending li.quantity.
+    }));
+
+    const fulfillUrl = `https://${shop}/admin/api/${V}/fulfillments.json`;
+    const resp = await fetch(fulfillUrl, {
+      method: "POST",
+      headers,
+      body: JSON.stringify({
+        fulfillment: {
+          line_items_by_fulfillment_order: lineItemsByFO,
+          tracking_info: {
+            number: String(awb) || "",
+            // Optionally set company/url so the link is clickable in Admin:
+            company: courier,
+            url:
+              String(courier) === "Delhivery"
+                ? `https://www.delhivery.com/track-v2/package/${awb}`
+                : String(courier) === "Shiprocket"
+                  ? `https://shiprocket.co/tracking/${awb}`
+                  : `https://www.xpressbees.com/shipment/tracking?awbNo=${awb}`,
+          },
+          notify_customer: false,
+        },
+      }),
+    });
+
+    if (!resp.ok) {
+      const text = await resp.text();
+      console.error(`Fulfillment create failed for location ${locationId}:`, text);
+      // Continue with other locations instead of throwing
+      continue;
+    }
+
+    const json: any = await resp.json();
+    if (json?.fulfillment?.id) {
+      fulfillmentIds.push(json.fulfillment.id);
+    }
+  }
+
+  // Return the first fulfillment ID (or undefined if all failed)
+  return {
+    fulfillmentId: fulfillmentIds[0],
+    // You could also return all IDs if needed: fulfillmentIds
+  };
 }
 
 /** Cloud Tasks → fulfills exactly ONE order and updates the summary */
@@ -3153,7 +3177,7 @@ export const processFulfillmentTask = onRequest(
       let courier = "";
       if (order.exists) {
         awb = order.get("awb");
-        courier = order.get("courier");
+        courier = order.get("courierProvider");
       }
 
       const [accountSnap, jobSnap] = await Promise.all([
@@ -3971,6 +3995,7 @@ function determineNewShiprocketStatus(currentStatus: string): string | null {
     "Out for Delivery": "Out For Delivery",
     Delivered: "Delivered",
     "RTO IN INTRANSIT": "RTO In Transit",
+    "RTO Delivered": "RTO Delivered",
   };
   return statusMap[currentStatus] || null;
 }
