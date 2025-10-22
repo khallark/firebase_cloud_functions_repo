@@ -18,6 +18,18 @@ import { DocumentReference, Filter, Timestamp, Transaction } from "firebase-admi
 // import { genkit } from 'genkit';
 // import vertexAI from "@genkit-ai/vertexai";
 import { QueryDocumentSnapshot } from "firebase-functions/firestore";
+import {
+  sendDeliveredOrderWhatsAppMessage,
+  sendDispatchedOrderWhatsAppMessage,
+  sendDTOBookedOrderWhatsAppMessage,
+  sendDTODeliveredOrderWhatsAppMessage,
+  sendDTOInTransitOrderWhatsAppMessage,
+  sendInTransitOrderWhatsAppMessage,
+  sendLostOrderWhatsAppMessage,
+  sendOutForDeliveryOrderWhatsAppMessage,
+  sendRTODeliveredOrderWhatsAppMessage,
+  sendRTOInTransitOrderWhatsAppMessage,
+} from "./whatsappMessagesSendingFuncs";
 
 setGlobalOptions({ region: process.env.LOCATION || "asia-south1" });
 
@@ -29,6 +41,24 @@ function requireHeaderSecret(req: Request, header: string, expected: string) {
   const got = (req.get(header) || "").trim();
   if (!got || got !== (expected || "").trim()) throw new Error(`UNAUTH_${header}`);
 }
+
+// // Add this helper function at the top with other helpers
+// const cleanForFirestore = (obj: any): any => {
+//   if (obj === null || obj === undefined) return null;
+//   if (typeof obj !== "object") return obj;
+
+//   if (Array.isArray(obj)) {
+//     return obj.map(cleanForFirestore);
+//   }
+
+//   const cleaned: any = {};
+//   for (const [key, value] of Object.entries(obj)) {
+//     if (value !== undefined) {
+//       cleaned[key] = cleanForFirestore(value);
+//     }
+//   }
+//   return cleaned;
+// };
 
 function capitalizeWords(sentence: string): string {
   if (!sentence) return sentence;
@@ -2586,6 +2616,8 @@ export const processReturnShipmentTask = onRequest(
       const jobRef = batchRef.collection("jobs").doc(String(jobId));
       const orderRef = db.collection("accounts").doc(shop).collection("orders").doc(String(jobId));
       const accountRef = db.collection("accounts").doc(shop);
+      const orderData = (await orderRef.get()).data() as any;
+      const accountData = (await accountRef.get()).data() as any;
 
       // FIX: Atomic idempotency check and status update
       const shouldProceed = await db.runTransaction(async (tx: Transaction) => {
@@ -2828,6 +2860,7 @@ export const processReturnShipmentTask = onRequest(
       });
 
       await maybeCompleteBatch(batchRef);
+      await sendDTOBookedOrderWhatsAppMessage(accountData, orderData);
 
       res.json({ ok: true, awb, carrierShipmentId: verdict.carrierShipmentId ?? null });
       return;
@@ -3094,7 +3127,12 @@ async function fulfillOrderOnShopify(
   for (const [locationId, locationFOs] of fosByLocation.entries()) {
     const lineItemsByFO = locationFOs.map((fo: any) => ({
       fulfillment_order_id: fo.id,
-      // Omit fulfillment_order_line_items to fulfill all remaining; safer than sending li.quantity.
+      fulfillment_order_line_items: fo.line_items
+        .filter((li: any) => li.fulfillable_quantity > 0) // Only unfulfilled items
+        .map((li: any) => ({
+          id: li.id,
+          quantity: li.fulfillable_quantity,
+        })),
     }));
 
     const fulfillUrl = `https://${shop}/admin/api/${V}/fulfillments.json`;
@@ -3128,8 +3166,12 @@ async function fulfillOrderOnShopify(
     }
 
     const json: any = await resp.json();
+    console.log(`Fulfillment response for location ${locationId}:`, JSON.stringify(json)); // 👈 ADD THIS
+
     if (json?.fulfillment?.id) {
       fulfillmentIds.push(json.fulfillment.id);
+    } else {
+      console.error(`No fulfillment ID in response for location ${locationId}`, json); // 👈 ADD THIS
     }
   }
 
@@ -3171,7 +3213,10 @@ export const processFulfillmentTask = onRequest(
         .collection("orders_fulfillment_summary")
         .doc(summaryId);
       const jobRef = summaryRef.collection("jobs").doc(jobId);
-      const orderRef = db.collection("accounts").doc(shop).collection("orders").doc(String(jobId));
+      const shopRef = db.collection("accounts").doc(shop);
+      const orderRef = shopRef.collection("orders").doc(String(jobId));
+      const orderData = (await orderRef.get()).data() as any;
+      const shopData = (await shopRef.get()).data() as any;
       const order = await orderRef.get();
       let awb = "";
       let courier = "";
@@ -3256,6 +3301,8 @@ export const processFulfillmentTask = onRequest(
         ]);
 
         await maybeCompleteSummary(summaryRef);
+        await sendDispatchedOrderWhatsAppMessage(shopData, orderData);
+
         res.json({ ok: true });
         return;
       } catch (err: any) {
@@ -3470,6 +3517,59 @@ interface ChunkResult {
 interface OrderUpdate {
   ref: DocumentReference;
   data: any;
+}
+
+// Status-wise message sending functions
+const messageActionFor = new Map<string, any>([
+  ["In Transit", sendInTransitOrderWhatsAppMessage],
+  ["Out For Delivery", sendOutForDeliveryOrderWhatsAppMessage],
+  ["Delivered", sendDeliveredOrderWhatsAppMessage],
+  ["RTO In Transit", sendRTOInTransitOrderWhatsAppMessage],
+  ["RTO Delivered", sendRTODeliveredOrderWhatsAppMessage],
+  ["DTO In Transit", sendDTOInTransitOrderWhatsAppMessage],
+  ["DTO Delivered", sendDTODeliveredOrderWhatsAppMessage],
+  ["Lost", sendLostOrderWhatsAppMessage],
+]);
+
+// Function to handle message sending
+async function sendStatusChangeMessages(updates: OrderUpdate[], shop: any): Promise<void> {
+  const messagePromises = updates.map(async (update) => {
+    try {
+      const newStatus = update.data.customStatus;
+
+      if (!shop) {
+        console.warn(`Shop data not found for order ${update.ref.id}, skipping message.`);
+        return;
+      }
+
+      // Check if this status has a message function
+      const messageFn = messageActionFor.get(newStatus);
+      if (!messageFn) {
+        return; // No message configured for this status
+      }
+
+      // Get the full order data (we need this for the message)
+      const orderDoc = await update.ref.get();
+      if (!orderDoc.exists) return;
+
+      const order = orderDoc.data() as any;
+
+      // Send the message
+      const resp = await messageFn(shop, order);
+
+      if (!resp) {
+        return;
+      }
+
+      console.log(`Sent ${newStatus} message for order ${orderDoc.id}`);
+    } catch (error) {
+      // Log but don't fail the whole process if message sending fails
+      console.error(`Failed to send message for order ${update.ref.id}:`, error);
+    }
+  });
+
+  // Send all messages in parallel, but don't block on failures
+  await Promise.allSettled(messagePromises);
 }
 
 // ============================================================================
@@ -3788,6 +3888,11 @@ async function processDelhiveryOrderChunk(
     "Pending Refunds",
   ]);
 
+  const shopRef = db.collection("accounts").doc(accountId);
+
+  const shopDoc = await shopRef.get();
+  const shopData = (shopDoc.data() as any) || null;
+
   // Build paginated query with OR condition for both courier and courier_reverse
   let query = db
     .collection("accounts")
@@ -3858,6 +3963,9 @@ async function processDelhiveryOrderChunk(
       await writeBatch.commit();
       totalUpdated += updates.length;
       console.log(`Updated ${updates.length} orders in API batch ${i / API_BATCH_SIZE + 1}`);
+
+      // ✅ ADD MESSAGE SENDING HERE - After successful commit
+      await sendStatusChangeMessages(updates, shopData);
     }
 
     // Rate limiting between API calls
@@ -4319,6 +4427,11 @@ async function processShiprocketOrderChunk(
     "Pending Refunds",
   ]);
 
+  const shopRef = db.collection("accounts").doc(accountId);
+
+  const shopDoc = await shopRef.get();
+  const shopData = (shopDoc.data() as any) || null;
+
   // Build paginated query with OR condition for both courierProvider and courierReverseProvider
   let query = db
     .collection("accounts")
@@ -4391,6 +4504,9 @@ async function processShiprocketOrderChunk(
       await writeBatch.commit();
       totalUpdated += updates.length;
       console.log(`Updated ${updates.length} orders in API batch ${i / API_BATCH_SIZE + 1}`);
+
+      // ✅ ADD MESSAGE SENDING HERE - After successful commit
+      await sendStatusChangeMessages(updates, shopData);
     }
 
     // Rate limiting between API calls
@@ -4876,6 +4992,11 @@ async function processXpressbeesOrderChunk(
     "Pending Refunds",
   ]);
 
+  const shopRef = db.collection("accounts").doc(accountId);
+
+  const shopDoc = await shopRef.get();
+  const shopData = (shopDoc.data() as any) || null;
+
   // Build paginated query with OR condition for both courierProvider and courierReverseProvider
   let query = db
     .collection("accounts")
@@ -4948,6 +5069,9 @@ async function processXpressbeesOrderChunk(
       await writeBatch.commit();
       totalUpdated += updates.length;
       console.log(`Updated ${updates.length} orders in API batch ${i / API_BATCH_SIZE + 1}`);
+
+      // ✅ ADD MESSAGE SENDING HERE - After successful commit
+      await sendStatusChangeMessages(updates, shopData);
     }
 
     // Rate limiting between API batches
