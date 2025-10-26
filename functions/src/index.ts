@@ -199,6 +199,162 @@ async function handleJobFailure(params: {
   };
 }
 
+/**
+ * Check if order has multiple vendors
+ */
+function hasMultipleVendors(lineItems: any[]): boolean {
+  const vendors = new Set<string>();
+  for (const item of lineItems) {
+    const vendor = item.vendor || "default";
+    vendors.add(vendor);
+  }
+  return vendors.size > 1;
+}
+
+/**
+ * Group line items by vendor and calculate totals
+ */
+interface VendorGroup {
+  vendor: string;
+  lineItems: any[];
+  subtotal: number;
+  tax: number;
+  total: number;
+  totalWeight: number;
+}
+
+function groupLineItemsByVendor(lineItems: any[]): VendorGroup[] {
+  const groupsMap = new Map<string, VendorGroup>();
+
+  for (const item of lineItems) {
+    const vendor = item.vendor || "default";
+
+    if (!groupsMap.has(vendor)) {
+      groupsMap.set(vendor, {
+        vendor,
+        lineItems: [],
+        subtotal: 0,
+        tax: 0,
+        total: 0,
+        totalWeight: 0,
+      });
+    }
+
+    const group = groupsMap.get(vendor)!;
+    group.lineItems.push(item);
+
+    // Calculate subtotal
+    const itemSubtotal =
+      parseFloat(item.price) * item.quantity - parseFloat(item.total_discount || "0");
+    group.subtotal += itemSubtotal;
+
+    // Calculate tax
+    const itemTax = (item.tax_lines || []).reduce((sum: number, taxLine: any) => {
+      return sum + parseFloat(taxLine.price);
+    }, 0);
+    group.tax += itemTax;
+
+    // Calculate weight
+    group.totalWeight += (item.grams || 0) * item.quantity;
+  }
+
+  // Calculate totals
+  for (const group of groupsMap.values()) {
+    group.total = group.subtotal + group.tax;
+  }
+
+  return Array.from(groupsMap.values());
+}
+
+/**
+ * Mark batch as completed if all jobs are done
+ */
+async function maybeCompleteSplitBatch(batchRef: DocumentReference): Promise<void> {
+  await db.runTransaction(async (tx: Transaction) => {
+    const b = await tx.get(batchRef);
+    const d = b.data() || {};
+    const total = Number(d.totalJobs || 0);
+    const success = Number(d.successJobs || 0);
+    const failed = Number(d.failedJobs || 0);
+    const processing = Number(d.processingJobs || 0);
+
+    if (total && success + failed === total && processing === 0) {
+      tx.update(batchRef, {
+        status: "completed",
+        completedAt: FieldValue.serverTimestamp(),
+      });
+    }
+  });
+}
+
+/**
+ * Handle job failure with retry logic
+ */
+async function handleSplitJobFailure(params: {
+  shop: string;
+  batchRef: DocumentReference;
+  jobRef: DocumentReference;
+  jobId: string;
+  errorCode: string;
+  errorMessage: string;
+  isRetryable: boolean;
+}): Promise<{ shouldReturnFailure: boolean; statusCode: number }> {
+  const { batchRef, jobRef, errorCode, errorMessage, isRetryable } = params;
+
+  const result = await db.runTransaction(async (tx: Transaction) => {
+    const jobSnap = await tx.get(jobRef);
+    const jobData = jobSnap.data() || {};
+
+    // Check if already in terminal state
+    if (jobData.status === "success" || jobData.status === "failed") {
+      return { alreadyTerminal: true };
+    }
+
+    const attempts = Number(jobData.attempts || 0);
+    const maxAttempts = Number(process.env.ORDER_SPLIT_QUEUE_MAX_ATTEMPTS || 3);
+    const attemptsExhausted = attempts >= maxAttempts;
+
+    // Update job
+    const updateData: any = {
+      status: isRetryable ? (attemptsExhausted ? "failed" : "retrying") : "failed",
+      errorCode: errorCode,
+      errorMessage: errorMessage.slice(0, 400),
+      lastFailedAt: FieldValue.serverTimestamp(),
+    };
+
+    tx.set(jobRef, updateData, { merge: true });
+
+    // Update batch counters
+    if (isRetryable && !attemptsExhausted) {
+      tx.update(batchRef, { processingJobs: FieldValue.increment(-1) });
+    } else {
+      tx.update(batchRef, {
+        processingJobs: FieldValue.increment(-1),
+        failedJobs: FieldValue.increment(1),
+      });
+    }
+
+    return {
+      isRetryable,
+      attemptsExhausted,
+      isPermanent: !isRetryable || attemptsExhausted,
+    };
+  });
+
+  if (result.alreadyTerminal) {
+    return { shouldReturnFailure: false, statusCode: 200 };
+  }
+
+  if (result.isPermanent) {
+    await maybeCompleteSplitBatch(batchRef);
+  }
+
+  return {
+    shouldReturnFailure: true,
+    statusCode: result.isRetryable && !result.attemptsExhausted ? 503 : 200,
+  };
+}
+
 /** Called by Vercel API to enqueue Cloud Tasks (one per jobId) */
 export const enqueueShipmentTasks = onRequest(
   { cors: true, timeoutSeconds: 60, secrets: [ENQUEUE_FUNCTION_SECRET, TASKS_SECRET] },
@@ -2200,6 +2356,724 @@ export const processShipmentTask3 = onRequest(
   },
 );
 
+/**
+ * ENQUEUE: Called from webhook to create batch + jobs for order splitting
+ *
+ * CRITICAL: Cancels the original order BEFORE creating any jobs to prevent
+ * race conditions where split orders are created but original isn't cancelled.
+ */
+export const enqueueOrderSplitBatch = onRequest(
+  { cors: true, timeoutSeconds: 60, secrets: [ENQUEUE_FUNCTION_SECRET, TASKS_SECRET] },
+  async (req: Request, res: Response): Promise<void> => {
+    try {
+      requireHeaderSecret(req, "x-api-key", ENQUEUE_FUNCTION_SECRET.value() || "");
+
+      if (req.method !== "POST") {
+        res.status(405).json({ error: "method_not_allowed" });
+        return;
+      }
+
+      const { shop, orderId } = (req.body || {}) as {
+        shop?: string;
+        orderId?: string;
+      };
+
+      if (!shop || !orderId) {
+        res.status(400).json({ error: "missing_shop_or_orderId" });
+        return;
+      }
+
+      console.log(`\n========== ORDER SPLIT ENQUEUE START ==========`);
+      console.log(`Shop: ${shop} | Order: ${orderId}`);
+
+      // Get order from Firestore
+      const orderRef = db.collection("accounts").doc(shop).collection("orders").doc(orderId);
+      const orderSnap = await orderRef.get();
+
+      if (!orderSnap.exists) {
+        console.error(`Order not found: ${orderId}`);
+        res.status(404).json({ error: "order_not_found" });
+        return;
+      }
+
+      const orderData = orderSnap.data()!;
+      const originalOrder = orderData.raw;
+
+      if (!originalOrder || !originalOrder.line_items) {
+        console.error(`Invalid order data for: ${orderId}`);
+        res.status(400).json({ error: "invalid_order_data" });
+        return;
+      }
+
+      // Check if order needs splitting
+      if (!hasMultipleVendors(originalOrder.line_items)) {
+        console.log(`Order ${orderId} is single vendor - no split needed`);
+        res.status(400).json({ error: "order_is_single_vendor" });
+        return;
+      }
+
+      // Check if already being processed
+      if (
+        orderData.splitProcessing?.status === "processing" ||
+        orderData.splitProcessing?.status === "completed"
+      ) {
+        console.log(`Order ${orderId} already processing or completed`);
+        res.status(200).json({ message: "already_processing_or_completed" });
+        return;
+      }
+
+      // Get account for API access
+      const accountSnap = await db.collection("accounts").doc(shop).get();
+      if (!accountSnap.exists) {
+        console.error(`Account not found: ${shop}`);
+        res.status(500).json({ error: "account_not_found" });
+        return;
+      }
+
+      const accessToken = accountSnap.data()?.accessToken;
+      if (!accessToken) {
+        console.error(`Access token not found for: ${shop}`);
+        res.status(500).json({ error: "access_token_missing" });
+        return;
+      }
+
+      // ============================================
+      // ✅ STEP 1: CANCEL ORDER FIRST (CRITICAL!)
+      // ============================================
+      console.log(`\n--- Cancelling original order ${orderId} ---`);
+      const cancelUrl = `https://${shop}/admin/api/2025-01/orders/${orderId}/cancel.json`;
+
+      try {
+        const cancelResp = await fetch(cancelUrl, {
+          method: "POST",
+          headers: {
+            "X-Shopify-Access-Token": accessToken,
+            "Content-Type": "application/json",
+          },
+          body: JSON.stringify({
+            reason: "other",
+            email: false,
+            restock: true,
+          }),
+        });
+
+        if (!cancelResp.ok) {
+          const errorText = await cancelResp.text();
+          console.error(`❌ Cancel failed: ${cancelResp.status} - ${errorText}`);
+
+          // Mark order as failed to split
+          await orderRef.update({
+            "splitProcessing.status": "failed",
+            "splitProcessing.error": `Cancel failed: ${cancelResp.status} - ${errorText}`,
+            "splitProcessing.failedAt": FieldValue.serverTimestamp(),
+            "splitProcessing.cancelAttempted": true,
+            "splitProcessing.cancelFailed": true,
+          });
+
+          res.status(500).json({
+            error: "cancel_failed",
+            details: errorText,
+            statusCode: cancelResp.status,
+            message: "Original order could not be cancelled. No split orders were created.",
+          });
+          return; // ← STOP HERE - Don't create batch or jobs
+        }
+
+        console.log(`✅ Original order cancelled successfully`);
+      } catch (cancelError) {
+        const errorMsg = cancelError instanceof Error ? cancelError.message : "Cancel failed";
+        console.error(`❌ Cancel error:`, cancelError);
+
+        await orderRef.update({
+          "splitProcessing.status": "failed",
+          "splitProcessing.error": errorMsg,
+          "splitProcessing.failedAt": FieldValue.serverTimestamp(),
+          "splitProcessing.cancelAttempted": true,
+          "splitProcessing.cancelFailed": true,
+        });
+
+        res.status(500).json({
+          error: "cancel_failed",
+          details: errorMsg,
+          message: "Original order could not be cancelled. No split orders were created.",
+        });
+        return; // ← STOP HERE
+      }
+
+      // ============================================
+      // ✅ STEP 2: Cancel succeeded, create batch
+      // ============================================
+      console.log(`\n--- Creating batch and jobs ---`);
+
+      const vendorGroups = groupLineItemsByVendor(originalOrder.line_items);
+      console.log(`Found ${vendorGroups.length} vendor groups`);
+
+      // Create batch
+      const batchRef = db.collection("accounts").doc(shop).collection("order_split_batches").doc();
+
+      const batchData = {
+        originalOrderId: orderId,
+        originalOrderName: originalOrder.name,
+        originalFinancialStatus: originalOrder.financial_status,
+        originalTotal: parseFloat(originalOrder.total_price || "0"),
+        originalOutstanding: parseFloat(originalOrder.total_outstanding || "0"),
+        originalGateway:
+          originalOrder.gateway || originalOrder.payment_gateway_names?.[0] || "manual",
+        status: "pending",
+        totalJobs: vendorGroups.length,
+        processingJobs: 0,
+        successJobs: 0,
+        failedJobs: 0,
+        createdAt: FieldValue.serverTimestamp(),
+        vendorCount: vendorGroups.length,
+        originalCancelled: true, // ← Flag that original was cancelled
+        cancelledAt: FieldValue.serverTimestamp(),
+      };
+
+      await batchRef.set(batchData);
+      console.log(`✓ Created batch: ${batchRef.id}`);
+
+      // Create jobs for each vendor
+      const jobPromises = vendorGroups.map(async (group, index) => {
+        const jobRef = batchRef.collection("jobs").doc();
+        const jobData = {
+          vendorName: group.vendor,
+          status: "pending",
+          splitIndex: index + 1,
+          totalSplits: vendorGroups.length,
+          lineItems: group.lineItems,
+          subtotal: group.subtotal,
+          tax: group.tax,
+          total: group.total,
+          totalWeight: group.totalWeight,
+          attempts: 0,
+          createdAt: FieldValue.serverTimestamp(),
+        };
+        await jobRef.set(jobData);
+        console.log(
+          `  ✓ Job ${index + 1}/${vendorGroups.length}: ${group.vendor} (₹${group.total.toFixed(2)})`,
+        );
+        return jobRef.id;
+      });
+
+      const jobIds = await Promise.all(jobPromises);
+
+      // Update order with batch reference
+      await orderRef.update({
+        "splitProcessing.status": "pending",
+        "splitProcessing.batchId": batchRef.id,
+        "splitProcessing.detectedAt": FieldValue.serverTimestamp(),
+        "splitProcessing.vendorCount": vendorGroups.length,
+        "splitProcessing.originalCancelled": true, // ← Confirm original was cancelled
+        "splitProcessing.cancelledAt": FieldValue.serverTimestamp(),
+      });
+
+      // Enqueue tasks for each job
+      console.log(`\n--- Queueing ${jobIds.length} tasks ---`);
+      const workerUrl = process.env.ORDER_SPLIT_WORKER_URL || "";
+      const queueName = process.env.ORDER_SPLIT_QUEUE_NAME || "order-splits-queue";
+
+      if (!workerUrl) {
+        throw new Error("ORDER_SPLIT_WORKER_URL not configured");
+      }
+
+      const taskPromises = jobIds.map((jobId) =>
+        createTask(
+          { shop, batchId: batchRef.id, jobId },
+          {
+            tasksSecret: TASKS_SECRET.value() || "",
+            url: workerUrl,
+            queue: queueName,
+            delaySeconds: 0,
+          },
+        ),
+      );
+
+      await Promise.all(taskPromises);
+
+      console.log(`✅ Enqueued ${jobIds.length} split jobs for order ${orderId}`);
+      console.log(`========== ORDER SPLIT ENQUEUE COMPLETE ==========\n`);
+
+      res.status(200).json({
+        success: true,
+        batchId: batchRef.id,
+        jobCount: jobIds.length,
+        jobIds,
+        originalCancelled: true, // ← Confirm to caller
+        message: `Original order cancelled and ${jobIds.length} split jobs queued`,
+      });
+    } catch (error) {
+      console.error("\n========== ORDER SPLIT ENQUEUE ERROR ==========");
+      console.error(error);
+      const errorMsg = error instanceof Error ? error.message : "unknown_error";
+      res.status(500).json({ error: "enqueue_failed", details: errorMsg });
+    }
+  },
+);
+
+/**
+ * WORKER: Process individual split job
+ *
+ * NOTE: Original order cancellation is handled in enqueue function.
+ * This worker only creates the split order and handles payment.
+ */
+export const processOrderSplitJob = onRequest(
+  { timeoutSeconds: 300, secrets: [TASKS_SECRET] },
+  async (req: Request, res: Response): Promise<void> => {
+    try {
+      requireHeaderSecret(req, "x-tasks-secret", TASKS_SECRET.value() || "");
+
+      const { shop, batchId, jobId } = (req.body || {}) as {
+        shop?: string;
+        batchId?: string;
+        jobId?: string;
+      };
+
+      if (!shop || !batchId || !jobId) {
+        res.status(400).json({ error: "missing_params" });
+        return;
+      }
+
+      console.log(`\n========== SPLIT JOB START ==========`);
+      console.log(`Shop: ${shop} | Batch: ${batchId} | Job: ${jobId}`);
+
+      const batchRef = db
+        .collection("accounts")
+        .doc(shop)
+        .collection("order_split_batches")
+        .doc(batchId);
+      const jobRef = batchRef.collection("jobs").doc(jobId);
+
+      // Get batch and job data
+      const [batchSnap, jobSnap] = await Promise.all([batchRef.get(), jobRef.get()]);
+
+      if (!batchSnap.exists) {
+        console.error(`Batch not found: ${batchId}`);
+        res.status(404).json({ error: "batch_not_found" });
+        return;
+      }
+
+      if (!jobSnap.exists) {
+        console.error(`Job not found: ${jobId}`);
+        res.status(404).json({ error: "job_not_found" });
+        return;
+      }
+
+      const batchData = batchSnap.data()!;
+      const jobData = jobSnap.data()!;
+
+      // Check if already processed
+      if (jobData.status === "success") {
+        console.log(`Job already processed successfully`);
+        res.status(200).json({ message: "already_processed" });
+        return;
+      }
+
+      // Increment attempts and mark as processing
+      await db.runTransaction(async (tx: Transaction) => {
+        const j = await tx.get(jobRef);
+        const jd = j.data() || {};
+        if (jd.status === "success" || jd.status === "failed") return;
+
+        tx.update(jobRef, {
+          status: "processing",
+          attempts: FieldValue.increment(1),
+          lastAttemptAt: FieldValue.serverTimestamp(),
+        });
+        tx.update(batchRef, { processingJobs: FieldValue.increment(1) });
+      });
+
+      console.log(
+        `Processing job ${jobData.splitIndex}/${jobData.totalSplits} for vendor: ${jobData.vendorName}`,
+      );
+
+      // Get original order
+      const originalOrderRef = db
+        .collection("accounts")
+        .doc(shop)
+        .collection("orders")
+        .doc(batchData.originalOrderId);
+      const originalOrderSnap = await originalOrderRef.get();
+
+      if (!originalOrderSnap.exists) {
+        console.error(`Original order not found: ${batchData.originalOrderId}`);
+        await handleSplitJobFailure({
+          shop,
+          batchRef,
+          jobRef,
+          jobId,
+          errorCode: "ORIGINAL_ORDER_NOT_FOUND",
+          errorMessage: "Original order not found in Firestore",
+          isRetryable: false,
+        });
+        res.status(200).json({ error: "original_order_not_found" });
+        return;
+      }
+
+      const originalOrderData = originalOrderSnap.data()!;
+      const originalOrder = originalOrderData.raw;
+
+      // Get account for API access
+      const accountSnap = await db.collection("accounts").doc(shop).get();
+      if (!accountSnap.exists) {
+        console.error(`Account not found: ${shop}`);
+        await handleSplitJobFailure({
+          shop,
+          batchRef,
+          jobRef,
+          jobId,
+          errorCode: "ACCOUNT_NOT_FOUND",
+          errorMessage: "Account not found",
+          isRetryable: false,
+        });
+        res.status(500).json({ error: "account_not_found" });
+        return;
+      }
+
+      const accessToken = accountSnap.data()?.accessToken;
+      if (!accessToken) {
+        console.error(`Access token missing for: ${shop}`);
+        await handleSplitJobFailure({
+          shop,
+          batchRef,
+          jobRef,
+          jobId,
+          errorCode: "ACCESS_TOKEN_MISSING",
+          errorMessage: "Access token not found",
+          isRetryable: false,
+        });
+        res.status(500).json({ error: "access_token_missing" });
+        return;
+      }
+
+      // ============================================
+      // NOTE: Original order already cancelled in enqueue function
+      // No need to cancel here - just create split order
+      // ============================================
+
+      // Step 1: Create split order payload
+      const includeShipping = jobData.splitIndex === 1;
+
+      const lineItems = jobData.lineItems.map((item: any) => ({
+        variant_id: item.variant_id,
+        quantity: item.quantity,
+        price: item.price,
+        properties: item.properties || [],
+        taxable: item.taxable !== false,
+        requires_shipping: item.requires_shipping !== false,
+      }));
+
+      const originalGateway = batchData.originalGateway;
+
+      const payload: any = {
+        order: {
+          line_items: lineItems,
+          email: originalOrder.email,
+          phone: originalOrder.phone,
+          currency: originalOrder.currency,
+          send_receipt: false,
+          send_fulfillment_receipt: false,
+          inventory_behaviour: "decrement_obeying_policy",
+          note: `Split ${jobData.splitIndex}/${jobData.totalSplits} from order ${batchData.originalOrderName} | Vendor: ${jobData.vendorName}`,
+          note_attributes: [
+            { name: "_original_order_id", value: String(batchData.originalOrderId) },
+            { name: "_original_order_name", value: batchData.originalOrderName },
+            { name: "_split_vendor", value: jobData.vendorName },
+            { name: "_split_index", value: String(jobData.splitIndex) },
+            { name: "_total_splits", value: String(jobData.totalSplits) },
+            { name: "_original_financial_status", value: batchData.originalFinancialStatus },
+            { name: "_original_payment_gateway", value: originalGateway },
+          ],
+          tags: `split-order,original-${batchData.originalOrderName},vendor-${jobData.vendorName}`,
+          taxes_included: originalOrder.taxes_included || false,
+        },
+      };
+
+      // Add customer
+      if (originalOrder.customer?.id) {
+        payload.order.customer = { id: originalOrder.customer.id };
+      }
+
+      // Add addresses
+      if (originalOrder.billing_address) {
+        payload.order.billing_address = originalOrder.billing_address;
+      }
+      if (originalOrder.shipping_address) {
+        payload.order.shipping_address = originalOrder.shipping_address;
+      }
+
+      // Add shipping lines (only first split)
+      if (includeShipping && originalOrder.shipping_lines?.length > 0) {
+        payload.order.shipping_lines = originalOrder.shipping_lines.map((line: any) => ({
+          title: line.title,
+          price: line.price,
+          code: line.code,
+        }));
+      }
+
+      // Step 2: Create split order
+      console.log(`\n--- Creating split order for vendor: ${jobData.vendorName} ---`);
+      const createUrl = `https://${shop}/admin/api/2025-01/orders.json`;
+
+      let newOrder: any;
+      try {
+        const createResp = await fetch(createUrl, {
+          method: "POST",
+          headers: {
+            "X-Shopify-Access-Token": accessToken,
+            "Content-Type": "application/json",
+          },
+          body: JSON.stringify(payload),
+        });
+
+        if (!createResp.ok) {
+          const errorText = await createResp.text();
+
+          // Check for rate limit
+          if (createResp.status === 429) {
+            console.error(`⚠ Shopify rate limit hit`);
+            await handleSplitJobFailure({
+              shop,
+              batchRef,
+              jobRef,
+              jobId,
+              errorCode: "SHOPIFY_RATE_LIMIT",
+              errorMessage: "Shopify API rate limit exceeded",
+              isRetryable: true,
+            });
+            res.status(503).json({ error: "rate_limited" });
+            return;
+          }
+
+          throw new Error(`Create failed: ${createResp.status} - ${errorText}`);
+        }
+
+        const result = (await createResp.json()) as any;
+        newOrder = result.order;
+        console.log(`✓ Created split order ${newOrder.name} (ID: ${newOrder.id})`);
+      } catch (createError) {
+        const errorMsg = createError instanceof Error ? createError.message : "Create failed";
+        console.error(`❌ Create failed:`, createError);
+        await handleSplitJobFailure({
+          shop,
+          batchRef,
+          jobRef,
+          jobId,
+          errorCode: "CREATE_FAILED",
+          errorMessage: errorMsg,
+          isRetryable: true,
+        });
+        res.status(500).json({ error: "create_failed", details: errorMsg });
+        return;
+      }
+
+      // Step 3: Handle payment based on original order status
+      console.log(`\n--- Handling payment ---`);
+      let splitPaidAmount = 0;
+      let splitOutstanding = jobData.total;
+
+      if (batchData.originalFinancialStatus === "paid") {
+        // FULLY PAID - Mark split as paid
+        console.log(`💰 Original fully paid - marking split as paid`);
+        splitPaidAmount = jobData.total;
+        splitOutstanding = 0;
+
+        try {
+          const txUrl = `https://${shop}/admin/api/2025-01/orders/${newOrder.id}/transactions.json`;
+          const txResp = await fetch(txUrl, {
+            method: "POST",
+            headers: {
+              "X-Shopify-Access-Token": accessToken,
+              "Content-Type": "application/json",
+            },
+            body: JSON.stringify({
+              transaction: {
+                kind: "sale",
+                status: "success",
+                amount: jobData.total.toFixed(2),
+                gateway: originalGateway,
+                source: "external",
+              },
+            }),
+          });
+
+          if (!txResp.ok) {
+            const errorText = await txResp.text();
+            console.error(`⚠ Failed to create transaction: ${errorText}`);
+          } else {
+            console.log(`✓ Split marked as paid (₹${jobData.total.toFixed(2)})`);
+          }
+        } catch (txError) {
+          console.error(`⚠ Transaction creation error:`, txError);
+        }
+      } else if (batchData.originalFinancialStatus === "partially_paid") {
+        // PARTIALLY PAID - Distribute proportionally
+        console.log(`⚖️ Original partially paid - distributing proportionally`);
+
+        const originalPaid = batchData.originalTotal - batchData.originalOutstanding;
+        const splitProportion = jobData.total / batchData.originalTotal;
+        splitPaidAmount = originalPaid * splitProportion;
+        splitOutstanding = jobData.total - splitPaidAmount;
+
+        // Round to 2 decimals
+        splitPaidAmount = Math.round(splitPaidAmount * 100) / 100;
+        splitOutstanding = Math.round(splitOutstanding * 100) / 100;
+
+        console.log(`📊 Proportion: ${(splitProportion * 100).toFixed(2)}%`);
+        console.log(`💵 Paid: ₹${splitPaidAmount.toFixed(2)}`);
+        console.log(`💰 Outstanding (COD): ₹${splitOutstanding.toFixed(2)}`);
+
+        // Create partial transaction
+        if (splitPaidAmount > 0) {
+          try {
+            const txUrl = `https://${shop}/admin/api/2025-01/orders/${newOrder.id}/transactions.json`;
+            const txResp = await fetch(txUrl, {
+              method: "POST",
+              headers: {
+                "X-Shopify-Access-Token": accessToken,
+                "Content-Type": "application/json",
+              },
+              body: JSON.stringify({
+                transaction: {
+                  kind: "sale",
+                  status: "success",
+                  amount: splitPaidAmount.toFixed(2),
+                  gateway: originalGateway,
+                  source: "external",
+                },
+              }),
+            });
+
+            if (!txResp.ok) {
+              const errorText = await txResp.text();
+              console.error(`⚠ Failed to create partial transaction: ${errorText}`);
+            } else {
+              console.log(`✓ Partial payment recorded`);
+            }
+          } catch (txError) {
+            console.error(`⚠ Partial transaction error:`, txError);
+          }
+        }
+      } else {
+        // PENDING/COD - Leave as pending
+        console.log(
+          `💵 Original unpaid/COD - split left as pending (collect ₹${jobData.total.toFixed(2)} on delivery)`,
+        );
+        splitPaidAmount = 0;
+        splitOutstanding = jobData.total;
+      }
+
+      // Step 4: Save split order to Firestore
+      console.log(`\n--- Saving to Firestore ---`);
+      const splitOrderRef = db
+        .collection("accounts")
+        .doc(shop)
+        .collection("orders")
+        .doc(String(newOrder.id));
+
+      await splitOrderRef.set({
+        orderId: newOrder.id,
+        name: newOrder.name,
+        email: newOrder.email || "N/A",
+        createdAt: newOrder.created_at,
+        updatedAt: newOrder.updated_at,
+        financialStatus: newOrder.financial_status,
+        fulfillmentStatus: newOrder.fulfillment_status || "unfulfilled",
+        totalPrice: parseFloat(newOrder.total_price),
+        currency: newOrder.currency,
+        raw: newOrder,
+        customStatus: "New",
+        isDeleted: false,
+        isSplitOrder: true,
+        splitMetadata: {
+          originalOrderId: batchData.originalOrderId,
+          originalOrderName: batchData.originalOrderName,
+          vendor: jobData.vendorName,
+          splitIndex: jobData.splitIndex,
+          totalSplits: jobData.totalSplits,
+          batchId: batchId,
+          jobId: jobId,
+        },
+        receivedAt: FieldValue.serverTimestamp(),
+        lastWebhookTopic: "split-created",
+      });
+
+      console.log(`✓ Saved split order to Firestore`);
+
+      // Step 5: Mark job as success
+      await db.runTransaction(async (tx: Transaction) => {
+        tx.update(jobRef, {
+          status: "success",
+          splitOrderId: String(newOrder.id),
+          splitOrderName: newOrder.name,
+          paidAmount: splitPaidAmount,
+          outstandingAmount: splitOutstanding,
+          financialStatus:
+            splitPaidAmount >= jobData.total
+              ? "paid"
+              : splitPaidAmount > 0
+                ? "partially_paid"
+                : "pending",
+          completedAt: FieldValue.serverTimestamp(),
+        });
+
+        tx.update(batchRef, {
+          processingJobs: FieldValue.increment(-1),
+          successJobs: FieldValue.increment(1),
+        });
+      });
+
+      console.log(`✓ Job marked as success`);
+
+      // Check if batch complete
+      await maybeCompleteSplitBatch(batchRef);
+
+      // If last job, update original order
+      const allJobsSnap = await batchRef.collection("jobs").get();
+      const allJobsSuccess = allJobsSnap.docs.every((doc) => doc.data().status === "success");
+
+      if (allJobsSuccess) {
+        console.log(`\n--- All jobs complete, updating original order ---`);
+
+        const splitOrders = allJobsSnap.docs.map((doc) => ({
+          orderId: doc.data().splitOrderId,
+          orderName: doc.data().splitOrderName,
+          vendor: doc.data().vendorName,
+          total: doc.data().total,
+          paidAmount: doc.data().paidAmount,
+          outstandingAmount: doc.data().outstandingAmount,
+          financialStatus: doc.data().financialStatus,
+        }));
+
+        await originalOrderRef.update({
+          "splitProcessing.status": "completed",
+          "splitProcessing.completedAt": FieldValue.serverTimestamp(),
+          "splitProcessing.splitOrders": splitOrders,
+          customStatus: "Cancelled (Split)",
+        });
+
+        console.log(`✓ Original order updated with split results`);
+      }
+
+      console.log(`========== SPLIT JOB COMPLETE ==========\n`);
+
+      res.status(200).json({
+        success: true,
+        splitOrderId: newOrder.id,
+        splitOrderName: newOrder.name,
+        vendor: jobData.vendorName,
+        paidAmount: splitPaidAmount,
+        outstandingAmount: splitOutstanding,
+      });
+    } catch (error) {
+      console.error("\n========== SPLIT JOB ERROR ==========");
+      console.error(error);
+      const errorMsg = error instanceof Error ? error.message : "unknown_error";
+      res.status(500).json({ error: "job_failed", details: errorMsg });
+    }
+  },
+);
+
 // ============================================================================
 // RETURN SHIPMENT ERROR HANDLER (No Priority Fallback)
 // ============================================================================
@@ -2860,7 +3734,7 @@ export const processReturnShipmentTask = onRequest(
       });
 
       await maybeCompleteBatch(batchRef);
-      await sendDTOBookedOrderWhatsAppMessage(accountData, orderData);
+      sendDTOBookedOrderWhatsAppMessage(accountData, orderData);
 
       res.json({ ok: true, awb, carrierShipmentId: verdict.carrierShipmentId ?? null });
       return;
@@ -3301,7 +4175,7 @@ export const processFulfillmentTask = onRequest(
         ]);
 
         await maybeCompleteSummary(summaryRef);
-        await sendDispatchedOrderWhatsAppMessage(shopData, orderData);
+        sendDispatchedOrderWhatsAppMessage(shopData, orderData);
 
         res.json({ ok: true });
         return;
@@ -3555,11 +4429,7 @@ async function sendStatusChangeMessages(updates: OrderUpdate[], shop: any): Prom
       const order = orderDoc.data() as any;
 
       // Send the message
-      const resp = await messageFn(shop, order);
-
-      if (!resp) {
-        return;
-      }
+      messageFn(shop, order);
 
       console.log(`Sent ${newStatus} message for order ${orderDoc.id}`);
     } catch (error) {
