@@ -3,7 +3,7 @@ import { onRequest } from "firebase-functions/v2/https";
 import { onSchedule } from "firebase-functions/scheduler";
 import type { Request, Response } from "express";
 import fetch from "node-fetch";
-import { db, FieldValue } from "./firebaseAdmin";
+import { db, storage } from "./firebaseAdmin";
 import { createTask } from "./cloudTasks";
 import { allocateAwb, releaseAwb } from "./awb";
 import {
@@ -14,11 +14,21 @@ import {
 } from "./buildPayload";
 import { defineSecret } from "firebase-functions/params";
 import { setGlobalOptions } from "firebase-functions/options";
-import { DocumentReference, Filter, Timestamp, Transaction } from "firebase-admin/firestore";
+import {
+  DocumentReference,
+  FieldValue,
+  Filter,
+  Timestamp,
+  Transaction,
+} from "firebase-admin/firestore";
 // import { genkit } from 'genkit';
 // import vertexAI from "@genkit-ai/vertexai";
 import { QueryDocumentSnapshot } from "firebase-functions/firestore";
 import {
+  sendConfirmedDelayedLvl1WhatsAppMessage,
+  sendConfirmedDelayedLvl2WhatsAppMessage,
+  sendConfirmedDelayedLvl3WhatsAppMessage,
+  sendConfirmedDelayedOrdersPDFWhatsAppMessage,
   sendDeliveredOrderWhatsAppMessage,
   sendDispatchedOrderWhatsAppMessage,
   sendDTOBookedOrderWhatsAppMessage,
@@ -30,6 +40,7 @@ import {
   sendRTODeliveredOrderWhatsAppMessage,
   sendRTOInTransitOrderWhatsAppMessage,
 } from "./whatsappMessagesSendingFuncs";
+import PDFDocument from "pdfkit";
 
 setGlobalOptions({ region: process.env.LOCATION || "asia-south1" });
 
@@ -40,6 +51,19 @@ const ENQUEUE_FUNCTION_SECRET = defineSecret("ENQUEUE_FUNCTION_SECRET");
 function requireHeaderSecret(req: Request, header: string, expected: string) {
   const got = (req.get(header) || "").trim();
   if (!got || got !== (expected || "").trim()) throw new Error(`UNAUTH_${header}`);
+}
+
+/** For onTaskDispatched functions */
+export function requireTaskHeaderSecret(
+  req: Request, // ✅ Use TaskRequest type
+  header: string,
+  expected: string,
+) {
+  const headerValue = req.headers[header.toLowerCase()];
+  const got = (headerValue || "").toString().trim();
+  if (!got || got !== (expected || "").trim()) {
+    throw new Error(`UNAUTH_${header}`);
+  }
 }
 
 // // Add this helper function at the top with other helpers
@@ -2570,7 +2594,7 @@ export const enqueueOrderSplitBatch = onRequest(
 
       // Enqueue tasks for each job
       console.log(`\n--- Queueing ${jobIds.length} tasks ---`);
-      const workerUrl = process.env.ORDER_SPLIT_WORKER_URL || "";
+      const workerUrl = process.env.ORDER_SPLIT_TARGET_URL || "";
       const queueName = process.env.ORDER_SPLIT_QUEUE_NAME || "order-splits-queue";
 
       if (!workerUrl) {
@@ -2768,6 +2792,7 @@ export const processOrderSplitJob = onRequest(
       const payload: any = {
         order: {
           line_items: lineItems,
+          financial_status: originalOrder.financial_status,
           email: originalOrder.email,
           phone: originalOrder.phone,
           currency: originalOrder.currency,
@@ -2963,44 +2988,7 @@ export const processOrderSplitJob = onRequest(
         splitOutstanding = jobData.total;
       }
 
-      // Step 4: Save split order to Firestore
-      console.log(`\n--- Saving to Firestore ---`);
-      const splitOrderRef = db
-        .collection("accounts")
-        .doc(shop)
-        .collection("orders")
-        .doc(String(newOrder.id));
-
-      await splitOrderRef.set({
-        orderId: newOrder.id,
-        name: newOrder.name,
-        email: newOrder.email || "N/A",
-        createdAt: newOrder.created_at,
-        updatedAt: newOrder.updated_at,
-        financialStatus: newOrder.financial_status,
-        fulfillmentStatus: newOrder.fulfillment_status || "unfulfilled",
-        totalPrice: parseFloat(newOrder.total_price),
-        currency: newOrder.currency,
-        raw: newOrder,
-        customStatus: "New",
-        isDeleted: false,
-        isSplitOrder: true,
-        splitMetadata: {
-          originalOrderId: batchData.originalOrderId,
-          originalOrderName: batchData.originalOrderName,
-          vendor: jobData.vendorName,
-          splitIndex: jobData.splitIndex,
-          totalSplits: jobData.totalSplits,
-          batchId: batchId,
-          jobId: jobId,
-        },
-        receivedAt: FieldValue.serverTimestamp(),
-        lastWebhookTopic: "split-created",
-      });
-
-      console.log(`✓ Saved split order to Firestore`);
-
-      // Step 5: Mark job as success
+      // Step 4: Mark job as success
       await db.runTransaction(async (tx: Transaction) => {
         tx.update(jobRef, {
           status: "success",
@@ -4752,7 +4740,6 @@ async function processDelhiveryOrderChunk(
     "Lost",
     "Closed",
     "RTO Closed",
-    "RTO Delivered",
     "DTO Delivered",
     "Cancellation Requested",
     "Pending Refunds",
@@ -5291,7 +5278,6 @@ async function processShiprocketOrderChunk(
     "Lost",
     "Closed",
     "RTO Closed",
-    "RTO Delivered",
     "DTO Delivered",
     "Cancellation Requested",
     "Pending Refunds",
@@ -5856,7 +5842,6 @@ async function processXpressbeesOrderChunk(
     "Lost",
     "Closed",
     "RTO Closed",
-    "RTO Delivered",
     "DTO Delivered",
     "Cancellation Requested",
     "Pending Refunds",
@@ -6054,49 +6039,152 @@ function prepareXpressbeesOrderUpdates(orders: any[], trackingDataArray: any[]):
   return updates;
 }
 
+interface CloseDeliveredOrdersPayload {
+  accountId: string;
+  cutoffTime: string; // ISO string
+}
+
+const CLOSE_AFTER_HOURS = 360; // 15 days
+
 // ============================================================================
-// CRON JOB - Closes delivered orders after 144 hours
+// CRON JOB - Enqueue tasks to close delivered orders after 360 hours
 // ============================================================================
 export const closeDeliveredOrdersJob = onSchedule(
   {
     schedule: "0 3 * * *",
     timeZone: "Asia/Kolkata",
-    memory: "512MiB",
+    memory: "256MiB",
     timeoutSeconds: 540,
+    secrets: [TASKS_SECRET],
   },
   async () => {
-    console.log("Starting closeDeliveredOrdersJob");
+    console.log("🚀 Starting closeDeliveredOrdersJob - Enqueueing tasks");
 
-    const _360HrsInMs = 360 * 60 * 60 * 1000;
-    const cutoffTime = new Date(Date.now() - _360HrsInMs);
+    const cutoffTimeMs = CLOSE_AFTER_HOURS * 60 * 60 * 1000;
+    const cutoffTime = new Date(Date.now() - cutoffTimeMs);
 
-    console.log(`Cutoff time: ${cutoffTime.toISOString()}`);
+    console.log(`📅 Cutoff time: ${cutoffTime.toISOString()}`);
 
     const accountsSnapshot = await db.collection("accounts").get();
-    console.log(`Found ${accountsSnapshot.size} accounts to check`);
+    console.log(`📊 Found ${accountsSnapshot.size} accounts to check`);
 
-    let totalClosed = 0;
-    let accountsProcessed = 0;
-    let accountsFailed = 0;
+    let tasksEnqueued = 0;
+    let tasksFailed = 0;
+
+    const taskPromises: Promise<void>[] = [];
 
     for (const accountDoc of accountsSnapshot.docs) {
-      try {
-        const ordersToClose = await accountDoc.ref
-          .collection("orders")
-          .where("customStatus", "==", "Delivered")
-          .where("lastStatusUpdate", "<=", cutoffTime)
-          .limit(500)
-          .get();
+      const payload: CloseDeliveredOrdersPayload = {
+        accountId: accountDoc.id,
+        cutoffTime: cutoffTime.toISOString(),
+      };
 
-        console.log(`Account ${accountDoc.id}: found ${ordersToClose.size} orders to close`);
+      const taskPromise = createTask(payload, {
+        tasksSecret: TASKS_SECRET.value() || "",
+        queue: process.env.CLOSE_DELIVERED_QUEUE_NAME || "close-delivered-orders-queue",
+        url: process.env.CLOSE_DELIVERED_TARGET_URL!,
+      })
+        .then(() => {
+          tasksEnqueued++;
+        })
+        .catch((error) => {
+          tasksFailed++;
+          console.error(`❌ Failed to enqueue task for account ${accountDoc.id}:`, error);
+        });
 
-        if (ordersToClose.empty) {
-          accountsProcessed++;
-          continue;
-        }
+      taskPromises.push(taskPromise);
+    }
 
+    // Wait for all tasks to be enqueued
+    await Promise.allSettled(taskPromises);
+
+    console.log(`✅ Job complete - Tasks enqueued: ${tasksEnqueued}, Failed: ${tasksFailed}`);
+  },
+);
+
+// ============================================================================
+// HTTP ENDPOINT - Close delivered orders for one account
+// ============================================================================
+export const closeDeliveredOrdersTask = onRequest(
+  {
+    cors: true,
+    timeoutSeconds: 300,
+    secrets: [TASKS_SECRET],
+    memory: "512MiB",
+  },
+  async (req, res) => {
+    // ✅ AUTHENTICATION
+    try {
+      requireHeaderSecret(req, "x-tasks-secret", TASKS_SECRET.value() || "");
+    } catch (error: any) {
+      console.error("❌ Authentication failed:", error);
+      res.status(401).json({ error: "Unauthorized", message: error.message });
+      return;
+    }
+
+    // ✅ METHOD CHECK
+    if (req.method !== "POST") {
+      res.status(405).json({ error: "method_not_allowed" });
+      return;
+    }
+
+    // ✅ PARSE PAYLOAD
+    const payload = req.body as CloseDeliveredOrdersPayload;
+
+    if (!payload || !payload.accountId || !payload.cutoffTime) {
+      res.status(400).json({
+        error: "invalid_payload",
+        message: "Missing required fields: accountId, cutoffTime",
+      });
+      return;
+    }
+
+    const { accountId, cutoffTime } = payload;
+
+    console.log(`🔄 Processing account ${accountId} - closing delivered orders`);
+
+    try {
+      const accountDoc = await db.collection("accounts").doc(accountId).get();
+
+      if (!accountDoc.exists) {
+        console.warn(`⚠️ Account ${accountId} not found - skipping`);
+        res.status(404).json({
+          error: "account_not_found",
+          accountId,
+        });
+        return;
+      }
+
+      const cutoffDate = new Date(cutoffTime);
+
+      // Query orders that need to be closed
+      const ordersToClose = await accountDoc.ref
+        .collection("orders")
+        .where("customStatus", "==", "Delivered")
+        .where("lastStatusUpdate", "<=", cutoffDate)
+        .limit(500)
+        .get();
+
+      if (ordersToClose.empty) {
+        console.log(`✓ No orders to close for account ${accountId}`);
+        res.status(200).json({
+          success: true,
+          message: "No orders to close",
+          ordersClosed: 0,
+        });
+        return;
+      }
+
+      console.log(`📦 Found ${ordersToClose.size} orders to close for account ${accountId}`);
+
+      // Process in batches (Firestore batch limit is 500 operations)
+      const BATCH_SIZE = 500;
+      const orderChunks = chunkArray(ordersToClose.docs, BATCH_SIZE);
+
+      for (const chunk of orderChunks) {
         const batch = db.batch();
-        ordersToClose.docs.forEach((doc: QueryDocumentSnapshot) => {
+
+        chunk.forEach((doc) => {
           batch.update(doc.ref, {
             customStatus: "Closed",
             lastStatusUpdate: FieldValue.serverTimestamp(),
@@ -6109,22 +6197,706 @@ export const closeDeliveredOrdersJob = onSchedule(
         });
 
         await batch.commit();
-        totalClosed += ordersToClose.size;
-        accountsProcessed++;
-        console.log(
-          `Successfully closed ${ordersToClose.size} orders for account ${accountDoc.id}`,
-        );
-      } catch (error) {
-        accountsFailed++;
-        console.error(`Failed to close orders for account ${accountDoc.id}:`, error);
+        console.log(`✅ Closed batch of ${chunk.length} orders`);
+      }
+
+      console.log(`✅ Successfully closed ${ordersToClose.size} orders for account ${accountId}`);
+
+      // ✅ SUCCESS RESPONSE
+      res.status(200).json({
+        success: true,
+        accountId,
+        ordersClosed: ordersToClose.size,
+      });
+    } catch (error: any) {
+      console.error(`❌ Error closing orders for account ${accountId}:`, error);
+
+      // ✅ ERROR RESPONSE
+      res.status(500).json({
+        error: "processing_failed",
+        accountId,
+        message: error.message,
+      });
+    }
+  },
+);
+
+const DELAY_LEVELS = [
+  { hours: 44, tag: "Delay Level-1", handler: sendConfirmedDelayedLvl1WhatsAppMessage },
+  { hours: 96, tag: "Delay Level-2", handler: sendConfirmedDelayedLvl2WhatsAppMessage },
+  { hours: 144, tag: "Delay Level-3", handler: sendConfirmedDelayedLvl3WhatsAppMessage },
+] as const;
+
+interface ProcessDelayedOrdersPayload {
+  accountId: string;
+  delayLevel: {
+    hours: number;
+    tag: string;
+    handlerIndex: number; // Index into DELAY_LEVELS array
+  };
+}
+
+// ============================================================================
+// CRON JOB - Enqueue tasks for delayed confirmed orders
+// ============================================================================
+export const checkDelayedConfirmedOrders = onSchedule(
+  {
+    schedule: "0 2 * * *",
+    timeZone: "Asia/Kolkata",
+    memory: "256MiB",
+    timeoutSeconds: 540,
+    secrets: [TASKS_SECRET],
+  },
+  async () => {
+    console.log("🚀 Starting checkDelayedConfirmedOrders job - Enqueueing tasks");
+
+    const accountsSnapshot = await db.collection("accounts").get();
+    console.log(`📊 Found ${accountsSnapshot.size} accounts to check`);
+
+    let tasksEnqueued = 0;
+    let tasksFailed = 0;
+
+    // Create a task for each account x delay level combination
+    const taskPromises: Promise<void>[] = [];
+
+    for (const accountDoc of accountsSnapshot.docs) {
+      for (let i = 0; i < DELAY_LEVELS.length; i++) {
+        const level = DELAY_LEVELS[i];
+
+        const payload: ProcessDelayedOrdersPayload = {
+          accountId: accountDoc.id,
+          delayLevel: {
+            hours: level.hours,
+            tag: level.tag,
+            handlerIndex: i,
+          },
+        };
+
+        const taskPromise = createTask(payload, {
+          tasksSecret: TASKS_SECRET.value() || "",
+          url: process.env.CONFIRMED_DELAYED_TARGET_URL!,
+          queue: process.env.CONFIRMED_DELAYED_QUEUE_NAME || "confirmed-delayed-orders-queue",
+        })
+          .then(() => {
+            tasksEnqueued++;
+          })
+          .catch((error) => {
+            tasksFailed++;
+            console.error(
+              `❌ Failed to enqueue task for account ${accountDoc.id}, level ${level.tag}:`,
+              error,
+            );
+          });
+
+        taskPromises.push(taskPromise);
       }
     }
 
-    console.log(
-      `Job complete - Accounts: ${accountsProcessed} processed, ${accountsFailed} failed. Orders closed: ${totalClosed}`,
-    );
+    // Wait for all tasks to be enqueued
+    await Promise.allSettled(taskPromises);
+
+    console.log(`✅ Job complete - Tasks enqueued: ${tasksEnqueued}, Failed: ${tasksFailed}`);
   },
 );
+
+// ============================================================================
+// HTTP ENDPOINT - Process delayed orders for one account and one delay level
+// ============================================================================
+export const processDelayedOrdersTask = onRequest(
+  {
+    cors: true,
+    timeoutSeconds: 300,
+    secrets: [TASKS_SECRET],
+    memory: "512MiB",
+  },
+  async (req, res) => {
+    // ✅ AUTHENTICATION
+    try {
+      requireHeaderSecret(req, "x-tasks-secret", TASKS_SECRET.value() || "");
+    } catch (error: any) {
+      console.error("❌ Authentication failed:", error);
+      res.status(401).json({ error: "Unauthorized", message: error.message });
+      return;
+    }
+
+    // ✅ METHOD CHECK
+    if (req.method !== "POST") {
+      res.status(405).json({ error: "method_not_allowed" });
+      return;
+    }
+
+    // ✅ PARSE PAYLOAD
+    const payload = req.body as ProcessDelayedOrdersPayload;
+
+    if (!payload || !payload.accountId || !payload.delayLevel) {
+      res.status(400).json({
+        error: "invalid_payload",
+        message: "Missing required fields: accountId, delayLevel",
+      });
+      return;
+    }
+
+    const { accountId, delayLevel } = payload;
+
+    console.log(`🔄 Processing account ${accountId} for ${delayLevel.tag} (${delayLevel.hours}h)`);
+
+    try {
+      const accountDoc = await db.collection("accounts").doc(accountId).get();
+
+      if (!accountDoc.exists) {
+        console.warn(`⚠️ Account ${accountId} not found - skipping`);
+        res.status(404).json({
+          error: "account_not_found",
+          accountId,
+        });
+        return;
+      }
+
+      const shop = accountDoc.data() as any;
+      const cutoffTime = new Date(Date.now() - delayLevel.hours * 60 * 60 * 1000);
+
+      // ✅ FIXED: Use dedicated tracking field instead of array check
+      const ordersSnapshot = await accountDoc.ref
+        .collection("orders")
+        .where("customStatus", "==", "Confirmed")
+        .where("lastStatusUpdate", "<=", cutoffTime)
+        .where(`delayNotified_${delayLevel.hours}h`, "==", null) // ✅ Only get orders NOT yet notified
+        .limit(500)
+        .get();
+
+      if (ordersSnapshot.empty) {
+        console.log(`✓ No orders to process for account ${accountId}, level ${delayLevel.tag}`);
+        res.status(200).json({
+          success: true,
+          message: "No orders to process",
+          ordersProcessed: 0,
+        });
+        return;
+      }
+
+      console.log(`📦 Found ${ordersSnapshot.size} orders to process for account ${accountId}`);
+
+      // Process in batches (Firestore batch limit is 500 operations)
+      const BATCH_SIZE = 500;
+      const orderChunks = chunkArray(ordersSnapshot.docs, BATCH_SIZE);
+
+      for (const chunk of orderChunks) {
+        const batch = db.batch();
+        const messagePromises: Promise<any>[] = [];
+
+        chunk.forEach((doc) => {
+          // Update the order with the delay tag
+          batch.update(doc.ref, {
+            tags_confirmed: FieldValue.arrayUnion(delayLevel.tag),
+            [`delayNotified_${delayLevel.hours}h`]: FieldValue.serverTimestamp(),
+            delayNotificationAttempts: FieldValue.increment(1),
+          });
+
+          // Queue the message to be sent in parallel
+          const order = doc.data() as any;
+          const handler = DELAY_LEVELS[delayLevel.handlerIndex].handler;
+
+          messagePromises.push(
+            handler(shop, order).catch((error: Error) => {
+              console.error(
+                `❌ Failed to send ${delayLevel.tag} message for order ${doc.id}:`,
+                error.message,
+              );
+              // Don't throw - we still want to mark the order as processed
+            }),
+          );
+        });
+
+        // Execute batch update and send messages in parallel
+        await Promise.all([
+          batch.commit(),
+          ...messagePromises.map((p) => p.catch((e) => console.error(e))),
+        ]);
+
+        console.log(`✅ Processed batch of ${chunk.length} orders`);
+      }
+
+      console.log(
+        `✅ Completed processing ${ordersSnapshot.size} orders for account ${accountId}, level ${delayLevel.tag}`,
+      );
+
+      // ✅ SUCCESS RESPONSE
+      res.status(200).json({
+        success: true,
+        accountId,
+        delayLevel: delayLevel.tag,
+        ordersProcessed: ordersSnapshot.size,
+      });
+    } catch (error: any) {
+      console.error(`❌ Error processing account ${accountId}, level ${delayLevel.tag}:`, error);
+
+      // ✅ ERROR RESPONSE
+      res.status(500).json({
+        error: "processing_failed",
+        accountId,
+        delayLevel: delayLevel.tag,
+        message: error.message,
+      });
+    }
+  },
+);
+
+// ============================================================================
+// Utility Functions
+// ============================================================================
+
+function chunkArray<T>(array: T[], size: number): T[][] {
+  const chunks: T[][] = [];
+  for (let i = 0; i < array.length; i += size) {
+    chunks.push(array.slice(i, i + size));
+  }
+  return chunks;
+}
+
+/**
+ * Generates a PDF report of unavailable stock items from confirmed orders
+ * Runs daily at 9 AM IST
+ */
+export const generateUnavailableStockReport = onSchedule(
+  {
+    schedule: "0 20 * * *",
+    timeZone: "Asia/Kolkata",
+    memory: "1GiB",
+    timeoutSeconds: 540,
+  },
+  async () => {
+    await generatePDFFunc();
+  },
+);
+
+export const generateUnavailableStockReportOnRequest = onRequest(
+  {
+    cors: true,
+    timeoutSeconds: 300,
+    secrets: [ENQUEUE_FUNCTION_SECRET],
+    memory: "1GiB",
+  },
+  async (req, res) => {
+    // ✅ AUTHENTICATION
+    try {
+      requireHeaderSecret(req, "x-api-key", ENQUEUE_FUNCTION_SECRET.value() || "");
+    } catch (error: any) {
+      console.error("❌ Authentication failed:", error);
+      res.status(401).json({ error: "Unauthorized", message: error.message });
+      return;
+    }
+    try {
+      const { phone } = req.body;
+      // ✅ VALIDATE PHONE NUMBER
+      if (!phone) {
+        res.status(400).json({ error: "Bad Request", message: "phone is required" });
+        return;
+      }
+      await generatePDFFunc(phone);
+      res.status(200).json({ success: true, message: "PDF generated and sent" });
+    } catch (error: any) {
+      console.error("❌ Error in PDF generation:", error);
+      res.status(500).json({ error: "Internal server error", message: error.message });
+    }
+  },
+);
+
+async function generatePDFFunc(phone?: string) {
+  try {
+    console.log("🔄 Starting unavailable stock report generation...");
+
+    // Get all shops
+    const shopsSnapshot = await db.collection("accounts").get();
+
+    for (const shopDoc of shopsSnapshot.docs) {
+      const shop = shopDoc.id;
+      const shopData = shopDoc.data() as any;
+      console.log(`Processing shop: ${shop}`);
+      // Query confirmed orders with "Unavailable" tag
+      const ordersSnapshot = await db
+        .collection("accounts")
+        .doc(shop)
+        .collection("orders")
+        .where("customStatus", "==", "Confirmed")
+        .where("tags_confirmed", "array-contains", "Unavailable")
+        .get();
+
+      if (ordersSnapshot.empty) {
+        console.log(`No unavailable orders for shop: ${shop}`);
+        continue;
+      }
+
+      // Process orders to create summary and detail data
+      const itemSummary: Map<string, number> = new Map();
+      const orderDetails: Array<{
+        itemSku: string;
+        itemQty: number;
+        vendor: string;
+        orderName: string;
+      }> = [];
+
+      ordersSnapshot.forEach((orderDoc) => {
+        const order = orderDoc.data();
+        const items = order.raw?.line_items || [];
+
+        items.forEach((item: any) => {
+          // Add to summary (aggregate by SKU)
+          const currentQty = itemSummary.get(item.sku) || 0;
+          itemSummary.set(item.sku, currentQty + item.quantity);
+
+          // Add to order details (one row per item)
+          orderDetails.push({
+            itemSku: item.sku,
+            itemQty: item.quantity,
+            vendor: item.vendor || "N/A",
+            orderName: order.name || "N/A",
+          });
+        });
+      });
+
+      // Calculate totals
+      const totalQty = Array.from(itemSummary.values()).reduce((a, b) => a + b, 0);
+      const totalOrders = ordersSnapshot.size;
+
+      console.log(`📊 Found ${totalOrders} orders with ${totalQty} total items`);
+
+      // Generate PDF
+      const pdfBuffer = await generatePDF(itemSummary, orderDetails, totalQty, totalOrders);
+
+      // Upload to Firebase Storage
+      const date = new Date().toLocaleDateString("en-GB").replace(/\//g, "-");
+      const fileName = `Unavailable_Stock_Summary_${date}.pdf`;
+      const filePath = `unavailable_orders_pdf/${shop}/${fileName}`;
+
+      const bucket = storage.bucket();
+      const file = bucket.file(filePath);
+
+      await file.save(pdfBuffer, {
+        contentType: "application/pdf",
+        metadata: {
+          metadata: {
+            generatedAt: new Date().toISOString(),
+            shop: shop,
+            totalOrders: totalOrders,
+            totalItems: totalQty,
+          },
+        },
+      });
+
+      // Make the file publicly accessible and get download URL
+      await file.makePublic();
+      const downloadUrl = `https://storage.googleapis.com/${bucket.name}/${filePath}`;
+
+      console.log(`✅ PDF generated successfully for shop: ${shop}`);
+      console.log(`📊 Total Orders: ${totalOrders}, Total Items: ${totalQty}`);
+      console.log(`📄 Download URL: ${downloadUrl}`);
+
+      if (phone) {
+        // Send to specific user
+        await sendConfirmedDelayedOrdersPDFWhatsAppMessage(shopData, downloadUrl, phone);
+      } else {
+        // Send to default numbers (scheduled job)
+        await Promise.all([
+          sendConfirmedDelayedOrdersPDFWhatsAppMessage(shopData, downloadUrl, "8950188819"),
+          sendConfirmedDelayedOrdersPDFWhatsAppMessage(shopData, downloadUrl, "9132326000"),
+        ]);
+      }
+    }
+  } catch (error) {
+    console.error("❌ Error generating unavailable stock report:", error);
+    throw error;
+  }
+}
+
+/**
+ * Generates the PDF with two tables: Summary and Order Details
+ */
+async function generatePDF(
+  itemSummary: Map<string, number>,
+  orderDetails: Array<{
+    itemSku: string;
+    itemQty: number;
+    vendor: string;
+    orderName: string;
+  }>,
+  totalQty: number,
+  totalOrders: number,
+): Promise<Buffer> {
+  return new Promise((resolve, reject) => {
+    const doc = new PDFDocument({
+      size: "A4",
+      margins: { top: 40, bottom: 40, left: 40, right: 40 },
+      bufferPages: true,
+    });
+
+    const chunks: Buffer[] = [];
+
+    doc.on("data", (chunk) => chunks.push(chunk));
+    doc.on("end", () => resolve(Buffer.concat(chunks)));
+    doc.on("error", reject);
+
+    // Title and Summary Header
+    const date = new Date().toLocaleDateString("en-GB");
+    doc
+      .fontSize(16)
+      .fillColor("#FFFFFF")
+      .rect(40, 40, doc.page.width - 80, 35)
+      .fill("#4472C4");
+
+    doc.fillColor("#FFFFFF").text(`SUMMARY OF UNAVAILABLE STOCK (${date})`, 50, 50, {
+      align: "center",
+    });
+
+    doc.moveDown(0.3);
+
+    // Total summary box
+    const summaryY = doc.y + 10;
+    doc
+      .rect(40, summaryY, doc.page.width - 80, 25)
+      .fill("#4472C4")
+      .fillColor("#FFFFFF")
+      .fontSize(11)
+      .text(`Total Qty : ${totalQty}        Orders Delayed : ${totalOrders}`, 50, summaryY + 7, {
+        align: "center",
+      });
+
+    doc.moveDown(1.5);
+
+    // Table 1: Items Summary
+    drawSummaryTable(doc, itemSummary);
+
+    // Add some space before the second table
+    if (doc.y > 600) {
+      doc.addPage();
+    } else {
+      doc.moveDown(2);
+    }
+
+    // Table 2: Order Details
+    drawOrderDetailsTable(doc, orderDetails);
+
+    // Add page numbers
+    const pageCount = doc.bufferedPageRange().count;
+    for (let i = 0; i < pageCount; i++) {
+      doc.switchToPage(i);
+      doc
+        .fontSize(8)
+        .fillColor("#666666")
+        .text(`Page ${i + 1} of ${pageCount}`, 40, doc.page.height - 30, { align: "center" });
+    }
+
+    doc.end();
+  });
+}
+
+/**
+ * Draws the summary table (Items Required with quantities)
+ */
+function drawSummaryTable(doc: InstanceType<typeof PDFDocument>, itemSummary: Map<string, number>) {
+  const startX = 40;
+  const startY = doc.y;
+  const colWidths = [70, 390, 55];
+  const rowHeight = 20;
+  const totalWidth = colWidths.reduce((a, b) => a + b, 0);
+
+  // Header
+  doc.fontSize(10).fillColor("#FFFFFF").rect(startX, startY, totalWidth, rowHeight).fill("#4472C4");
+
+  doc
+    .fillColor("#FFFFFF")
+    .text("Serial No.", startX + 5, startY + 5, {
+      width: colWidths[0] - 10,
+      align: "left",
+    })
+    .text("Items Required", startX + colWidths[0] + 5, startY + 5, {
+      width: colWidths[1] - 10,
+      align: "left",
+    })
+    .text("Qty", startX + colWidths[0] + colWidths[1] + 5, startY + 5, {
+      width: colWidths[2] - 10,
+      align: "right",
+    });
+
+  let currentY = startY + rowHeight;
+  let serialNo = 1;
+
+  // Sort items by SKU for consistent ordering
+  const sortedItems = Array.from(itemSummary.entries()).sort((a, b) => a[0].localeCompare(b[0]));
+
+  // Data rows
+  sortedItems.forEach(([sku, qty]) => {
+    // Check if we need a new page
+    if (currentY > doc.page.height - 100) {
+      doc.addPage();
+      currentY = 50;
+
+      // Redraw header on new page
+      doc
+        .fontSize(10)
+        .fillColor("#FFFFFF")
+        .rect(startX, currentY, totalWidth, rowHeight)
+        .fill("#4472C4");
+
+      doc
+        .fillColor("#FFFFFF")
+        .text("Serial No.", startX + 5, currentY + 5, {
+          width: colWidths[0] - 10,
+        })
+        .text("Items Required", startX + colWidths[0] + 5, currentY + 5, {
+          width: colWidths[1] - 10,
+        })
+        .text("Qty", startX + colWidths[0] + colWidths[1] + 5, currentY + 5, {
+          width: colWidths[2] - 10,
+          align: "right",
+        });
+
+      currentY += rowHeight;
+    }
+
+    // Draw row with border
+    doc
+      .lineWidth(0.5)
+      .strokeColor("#CCCCCC")
+      .rect(startX, currentY, totalWidth, rowHeight)
+      .stroke();
+
+    // Draw cell content
+    doc
+      .fillColor("#000000")
+      .fontSize(9)
+      .text(serialNo.toString(), startX + 5, currentY + 6, {
+        width: colWidths[0] - 10,
+      })
+      .text(sku, startX + colWidths[0] + 5, currentY + 6, {
+        width: colWidths[1] - 10,
+      })
+      .text(qty.toString(), startX + colWidths[0] + colWidths[1] + 5, currentY + 6, {
+        width: colWidths[2] - 10,
+        align: "right",
+      });
+
+    currentY += rowHeight;
+    serialNo++;
+  });
+
+  doc.y = currentY + 10;
+}
+
+/**
+ * Draws the order details table (one row per item in each order)
+ */
+function drawOrderDetailsTable(
+  doc: InstanceType<typeof PDFDocument>,
+  orderDetails: Array<{
+    itemSku: string;
+    itemQty: number;
+    vendor: string;
+    orderName: string;
+  }>,
+) {
+  const startX = 40;
+  let startY = doc.y;
+  const colWidths = [50, 200, 65, 80, 120];
+  const rowHeight = 20;
+  const totalWidth = colWidths.reduce((a, b) => a + b, 0);
+
+  // Section header
+  doc.fontSize(12).fillColor("#FFFFFF").rect(startX, startY, totalWidth, 25).fill("#4472C4");
+
+  doc.fillColor("#FFFFFF").text("Order Wise Detail", startX + 5, startY + 6, { align: "left" });
+
+  startY += 25;
+
+  // Table header
+  doc.fontSize(10).rect(startX, startY, totalWidth, rowHeight).fill("#4472C4");
+
+  let currentX = startX;
+  doc.fillColor("#FFFFFF").text("Sr. No.", currentX + 5, startY + 5, { width: colWidths[0] - 10 });
+  currentX += colWidths[0];
+  doc.text("Item SKU", currentX + 5, startY + 5, { width: colWidths[1] - 10 });
+  currentX += colWidths[1];
+  doc.text("Item Qty", currentX + 5, startY + 5, { width: colWidths[2] - 10 });
+  currentX += colWidths[2];
+  doc.text("Vendor", currentX + 5, startY + 5, { width: colWidths[3] - 10 });
+  currentX += colWidths[3];
+  doc.text("Order Name", currentX + 5, startY + 5, {
+    width: colWidths[4] - 10,
+  });
+
+  let currentY = startY + rowHeight;
+  let serialNo = 1;
+
+  // Data rows
+  orderDetails.forEach((detail) => {
+    // Check if we need a new page
+    if (currentY > doc.page.height - 100) {
+      doc.addPage();
+      currentY = 50;
+
+      // Redraw header on new page
+      doc.fontSize(10).rect(startX, currentY, totalWidth, rowHeight).fill("#4472C4");
+
+      let headerX = startX;
+      doc.fillColor("#FFFFFF").text("Sr. No.", headerX + 5, currentY + 5, {
+        width: colWidths[0] - 10,
+      });
+      headerX += colWidths[0];
+      doc.text("Item SKU", headerX + 5, currentY + 5, {
+        width: colWidths[1] - 10,
+      });
+      headerX += colWidths[1];
+      doc.text("Item Qty", headerX + 5, currentY + 5, {
+        width: colWidths[2] - 10,
+      });
+      headerX += colWidths[2];
+      doc.text("Vendor", headerX + 5, currentY + 5, {
+        width: colWidths[3] - 10,
+      });
+      headerX += colWidths[3];
+      doc.text("Order Name", headerX + 5, currentY + 5, {
+        width: colWidths[4] - 10,
+      });
+
+      currentY += rowHeight;
+    }
+
+    // Draw row border
+    doc
+      .lineWidth(0.5)
+      .strokeColor("#CCCCCC")
+      .rect(startX, currentY, totalWidth, rowHeight)
+      .stroke();
+
+    // Draw cell content
+    doc.fillColor("#000000").fontSize(9);
+
+    currentX = startX;
+    doc.text(serialNo.toString(), currentX + 5, currentY + 6, {
+      width: colWidths[0] - 10,
+    });
+    currentX += colWidths[0];
+    doc.text(detail.itemSku, currentX + 5, currentY + 6, {
+      width: colWidths[1] - 10,
+    });
+    currentX += colWidths[1];
+    doc.text(detail.itemQty.toString(), currentX + 5, currentY + 6, {
+      width: colWidths[2] - 10,
+    });
+    currentX += colWidths[2];
+    doc.text(detail.vendor, currentX + 5, currentY + 6, {
+      width: colWidths[3] - 10,
+    });
+    currentX += colWidths[3];
+    doc.text(detail.orderName, currentX + 5, currentY + 6, {
+      width: colWidths[4] - 10,
+    });
+
+    currentY += rowHeight;
+    serialNo++;
+  });
+
+  doc.y = currentY;
+}
 
 // ============================================================================
 // MANUAL STATUS UPDATES

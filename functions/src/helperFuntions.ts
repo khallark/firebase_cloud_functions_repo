@@ -1,5 +1,5 @@
-import { DocumentReference, Timestamp } from "firebase-admin/firestore";
-import { db, FieldValue } from "./firebaseAdmin";
+import { DocumentReference, FieldValue, Timestamp } from "firebase-admin/firestore";
+import { db } from "./firebaseAdmin";
 import { Request } from "express";
 import { createTask } from "./cloudTasks";
 

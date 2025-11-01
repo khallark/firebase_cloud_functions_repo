@@ -27,11 +27,13 @@
     "genkit": "^1.21.0",
     "node-fetch": "^3.3.2",
     "pdf-lib": "^1.17.1",
+    "pdfkit": "^0.17.2",
     "winston": "^3.18.3"
   },
   "devDependencies": {
     "@eslint/js": "^9.35.0",
     "@types/node": "^24.3.1",
+    "@types/pdfkit": "^0.17.3",
     "@typescript-eslint/eslint-plugin": "^8.43.0",
     "@typescript-eslint/parser": "^8.43.0",
     "eslint": "^9.35.0",

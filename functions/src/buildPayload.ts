@@ -11,9 +11,7 @@ export function buildDelhiveryPayload(params: {
   const ship =
     order?.raw?.shipping_address || order?.shipping_address || order?.shippingAddress || {};
 
-  const paid =
-    !order.raw.payment_gateway_names.join(",").toLowerCase().includes("cod") &&
-    !Number(order.raw.total_outstanding);
+  const paid = !Number(order.raw.total_outstanding);
   const items =
     (Array.isArray(order?.raw?.line_items) && order.raw.line_items) || order?.lineItems || [];
 
@@ -163,11 +161,7 @@ export function buildShiprocketPayload(opts: {
 
   const sub_total = order?.raw?.total_outstanding;
 
-  const payment_method =
-    !order.raw.payment_gateway_names.join(",").toLowerCase().includes("cod") &&
-    !Number(order.raw.total_outstanding)
-      ? "Prepaid"
-      : "COD";
+  const payment_method = !Number(order.raw.total_outstanding) ? "Prepaid" : "COD";
 
   const weightingms = order?.raw?.total_weight ? Number(order?.raw.total_weight) : 250;
   const weight = weightingms / 1000;
@@ -199,7 +193,17 @@ export function buildShiprocketPayload(opts: {
     billing_pincode: pincode,
     billing_state: ship?.province ?? ship?.state ?? "",
     billing_country: ship?.country ?? "India",
-    billing_email: ship?.email ?? order?.email ?? "",
+    billing_email:
+      ship?.email ??
+      (order?.email === "N/A" ? "" : order?.email) ??
+      `${normalizePhoneNumber(
+        ship?.phone ||
+          order?.raw?.phone ||
+          ship?.phone ||
+          order?.raw?.billing_address?.phone ||
+          order?.raw?.customer?.phone ||
+          "unknown",
+      )}@majime.in`,
     billing_phone: normalizePhoneNumber(
       ship?.phone ||
         order?.raw?.phone ||
@@ -366,9 +370,7 @@ export function buildXpressbeesPayload(params: {
   const ship =
     order?.raw?.shipping_address || order?.shipping_address || order?.shippingAddress || {};
 
-  const paid =
-    !order.raw.payment_gateway_names.join(",").toLowerCase().includes("cod") &&
-    !Number(order.raw.total_outstanding);
+  const paid = !Number(order.raw.total_outstanding);
   const items =
     (Array.isArray(order?.raw?.line_items) && order.raw.line_items) || order?.lineItems || [];
 

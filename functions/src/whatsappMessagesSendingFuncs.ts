@@ -1,4 +1,5 @@
-import { db, FieldValue } from "./firebaseAdmin";
+import { FieldValue } from "firebase-admin/firestore";
+import { db } from "./firebaseAdmin";
 
 // Helper to normalize phone numbers for comparison
 function normalizePhoneNumber(phone: string): string {
@@ -1159,6 +1160,375 @@ export async function sendLostOrderWhatsAppMessage(shop: any, order: any) {
       });
 
     console.log(`✅ WhatsApp message sent for order ${orderName}`);
+    console.log(`   Message ID: ${messageId}`);
+    console.log(`   Sent to: ${sentTo}`);
+
+    return {
+      success: true,
+      messageId,
+      sentTo,
+    };
+  } catch (error) {
+    console.error("Error sending WhatsApp message:", error);
+    return null;
+  }
+}
+
+/**
+ * Send WhatsApp confirmed order delayed level 1 notification
+ */
+export async function sendConfirmedDelayedLvl1WhatsAppMessage(shop: any, order: any) {
+  try {
+    const customerName = getCustomerName(order);
+    const customerPhone = String("91" + normalizePhoneNumber(getCustomerPhone(order)));
+    const orderName = order.name;
+
+    if (!customerPhone) {
+      console.error("No phone number found for order:", orderName);
+      return null;
+    }
+
+    const payload = {
+      messaging_product: "whatsapp",
+      to: customerPhone,
+      type: "template",
+      template: {
+        name: "confirm_delay_1_order_1",
+        language: {
+          code: "en",
+        },
+        components: [
+          {
+            type: "body",
+            parameters: [
+              {
+                type: "text",
+                text: customerName,
+              },
+              {
+                type: "text",
+                text: orderName,
+              },
+            ],
+          },
+        ],
+      },
+    };
+
+    const response = await fetch(
+      `https://graph.facebook.com/v24.0/${shop.whatsappPhoneNumberId}/messages`,
+      {
+        method: "POST",
+        headers: {
+          Authorization: `Bearer ${shop.whatsappAccessToken}`,
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify(payload),
+      },
+    );
+
+    if (!response.ok) {
+      const error = await response.json();
+      console.error("WhatsApp API error:", error);
+      return null;
+    }
+
+    const result = (await response.json()) as any;
+    const messageId = result.messages[0].id;
+    const sentTo = result.contacts[0].input;
+
+    const messageDoc = {
+      orderName: orderName,
+      forStatus: "RTO In Transit",
+      orderId: order.orderId,
+      shopName: shop.shopName,
+      sentAt: FieldValue.serverTimestamp(),
+      messageStatus: "sent",
+      sentTo: sentTo,
+      messageId: messageId,
+    };
+
+    await db.collection("whatsapp_messages").doc(messageId).set(messageDoc);
+
+    await db
+      .collection("accounts")
+      .doc(shop.shopName)
+      .collection("orders")
+      .doc(String(order.orderId))
+      .update({
+        whatsapp_messages: FieldValue.arrayUnion(messageId),
+      });
+
+    console.log(`✅ WhatsApp message sent for order ${orderName}`);
+    console.log(`   Message ID: ${messageId}`);
+    console.log(`   Sent to: ${sentTo}`);
+
+    return {
+      success: true,
+      messageId,
+      sentTo,
+    };
+  } catch (error) {
+    console.error("Error sending WhatsApp message:", error);
+    return null;
+  }
+}
+
+/**
+ * Send WhatsApp confirmed order delayed level 2 notification
+ */
+export async function sendConfirmedDelayedLvl2WhatsAppMessage(shop: any, order: any) {
+  try {
+    const customerName = getCustomerName(order);
+    const customerPhone = String("91" + normalizePhoneNumber(getCustomerPhone(order)));
+    const orderName = order.name;
+
+    if (!customerPhone) {
+      console.error("No phone number found for order:", orderName);
+      return null;
+    }
+
+    const payload = {
+      messaging_product: "whatsapp",
+      to: customerPhone,
+      type: "template",
+      template: {
+        name: "confirm_delay_2_order_1",
+        language: {
+          code: "en",
+        },
+        components: [
+          {
+            type: "body",
+            parameters: [
+              {
+                type: "text",
+                text: customerName,
+              },
+              {
+                type: "text",
+                text: orderName,
+              },
+            ],
+          },
+        ],
+      },
+    };
+
+    const response = await fetch(
+      `https://graph.facebook.com/v24.0/${shop.whatsappPhoneNumberId}/messages`,
+      {
+        method: "POST",
+        headers: {
+          Authorization: `Bearer ${shop.whatsappAccessToken}`,
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify(payload),
+      },
+    );
+
+    if (!response.ok) {
+      const error = await response.json();
+      console.error("WhatsApp API error:", error);
+      return null;
+    }
+
+    const result = (await response.json()) as any;
+    const messageId = result.messages[0].id;
+    const sentTo = result.contacts[0].input;
+
+    const messageDoc = {
+      orderName: orderName,
+      forStatus: "RTO In Transit",
+      orderId: order.orderId,
+      shopName: shop.shopName,
+      sentAt: FieldValue.serverTimestamp(),
+      messageStatus: "sent",
+      sentTo: sentTo,
+      messageId: messageId,
+    };
+
+    await db.collection("whatsapp_messages").doc(messageId).set(messageDoc);
+
+    await db
+      .collection("accounts")
+      .doc(shop.shopName)
+      .collection("orders")
+      .doc(String(order.orderId))
+      .update({
+        whatsapp_messages: FieldValue.arrayUnion(messageId),
+      });
+
+    console.log(`✅ WhatsApp message sent for order ${orderName}`);
+    console.log(`   Message ID: ${messageId}`);
+    console.log(`   Sent to: ${sentTo}`);
+
+    return {
+      success: true,
+      messageId,
+      sentTo,
+    };
+  } catch (error) {
+    console.error("Error sending WhatsApp message:", error);
+    return null;
+  }
+}
+
+/**
+ * Send WhatsApp confirmed order delayed level 3 notification
+ */
+export async function sendConfirmedDelayedLvl3WhatsAppMessage(shop: any, order: any) {
+  try {
+    const customerName = getCustomerName(order);
+    const customerPhone = String("91" + normalizePhoneNumber(getCustomerPhone(order)));
+    const orderName = order.name;
+
+    if (!customerPhone) {
+      console.error("No phone number found for order:", orderName);
+      return null;
+    }
+
+    const payload = {
+      messaging_product: "whatsapp",
+      to: customerPhone,
+      type: "template",
+      template: {
+        name: "confirm_delay_3_order_1",
+        language: {
+          code: "en",
+        },
+        components: [
+          {
+            type: "body",
+            parameters: [
+              {
+                type: "text",
+                text: customerName,
+              },
+              {
+                type: "text",
+                text: orderName,
+              },
+            ],
+          },
+        ],
+      },
+    };
+
+    const response = await fetch(
+      `https://graph.facebook.com/v24.0/${shop.whatsappPhoneNumberId}/messages`,
+      {
+        method: "POST",
+        headers: {
+          Authorization: `Bearer ${shop.whatsappAccessToken}`,
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify(payload),
+      },
+    );
+
+    if (!response.ok) {
+      const error = await response.json();
+      console.error("WhatsApp API error:", error);
+      return null;
+    }
+
+    const result = (await response.json()) as any;
+    const messageId = result.messages[0].id;
+    const sentTo = result.contacts[0].input;
+
+    const messageDoc = {
+      orderName: orderName,
+      forStatus: "RTO In Transit",
+      orderId: order.orderId,
+      shopName: shop.shopName,
+      sentAt: FieldValue.serverTimestamp(),
+      messageStatus: "sent",
+      sentTo: sentTo,
+      messageId: messageId,
+    };
+
+    await db.collection("whatsapp_messages").doc(messageId).set(messageDoc);
+
+    await db
+      .collection("accounts")
+      .doc(shop.shopName)
+      .collection("orders")
+      .doc(String(order.orderId))
+      .update({
+        whatsapp_messages: FieldValue.arrayUnion(messageId),
+      });
+
+    console.log(`✅ WhatsApp message sent for order ${orderName}`);
+    console.log(`   Message ID: ${messageId}`);
+    console.log(`   Sent to: ${sentTo}`);
+
+    return {
+      success: true,
+      messageId,
+      sentTo,
+    };
+  } catch (error) {
+    console.error("Error sending WhatsApp message:", error);
+    return null;
+  }
+}
+
+/**
+ * Send WhatsApp confirmed order delayed level 3 notification
+ */
+export async function sendConfirmedDelayedOrdersPDFWhatsAppMessage(
+  shop: any,
+  url: string,
+  phone: string,
+) {
+  try {
+    const payload = {
+      messaging_product: "whatsapp",
+      to: phone,
+      type: "template",
+      template: {
+        name: "delayed_pdf_order_1",
+        language: {
+          code: "en",
+        },
+        components: [
+          {
+            type: "body",
+            parameters: [
+              {
+                type: "text",
+                text: url,
+              },
+            ],
+          },
+        ],
+      },
+    };
+
+    const response = await fetch(
+      `https://graph.facebook.com/v24.0/${shop.whatsappPhoneNumberId}/messages`,
+      {
+        method: "POST",
+        headers: {
+          Authorization: `Bearer ${shop.whatsappAccessToken}`,
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify(payload),
+      },
+    );
+
+    if (!response.ok) {
+      const error = await response.json();
+      console.error("WhatsApp API error:", error);
+      return null;
+    }
+
+    const result = (await response.json()) as any;
+    const messageId = result.messages[0].id;
+    const sentTo = result.contacts[0].input;
+
+    console.log(`✅ WhatsApp message sent.`);
     console.log(`   Message ID: ${messageId}`);
     console.log(`   Sent to: ${sentTo}`);
 
