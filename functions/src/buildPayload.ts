@@ -31,8 +31,30 @@ export function buildDelhiveryPayload(params: {
     0,
   );
 
-  const total = Number(order.raw.total_price);
-  const cod = Number(order.raw.total_outstanding);
+  // ========================================
+  // ✅ HANDLE DISCOUNT FOR SPLIT ORDERS
+  // ========================================
+  let total = Number(order.raw.total_price);
+  let cod = Number(order.raw.total_outstanding);
+  if (order.raw?.note_attributes) {
+    const discountAttr = order.raw.note_attributes.find(
+      (attr: any) => attr.name === "_proportional_discount",
+    );
+
+    if (discountAttr) {
+      const proportionalDiscount = Number(discountAttr.value || 0);
+      if (proportionalDiscount > 0) {
+        total = total - proportionalDiscount;
+        cod = cod - proportionalDiscount;
+
+        console.log(`📦 Discount from notes: -₹${proportionalDiscount.toFixed(2)}`);
+      }
+    }
+  }
+
+  // Ensure values don't go negative
+  total = Math.max(0, total);
+  cod = Math.max(0, cod);
 
   const _ = (v: any) => (v === undefined || v === null ? "" : String(v));
 
@@ -159,7 +181,28 @@ export function buildShiprocketPayload(opts: {
           },
         ];
 
-  const sub_total = order?.raw?.total_outstanding;
+  // ========================================
+  // ✅ HANDLE DISCOUNT FOR SPLIT ORDERS
+  // ========================================
+
+  let sub_total = Number(order?.raw?.total_outstanding);
+  if (order.raw?.note_attributes) {
+    const discountAttr = order.raw.note_attributes.find(
+      (attr: any) => attr.name === "_proportional_discount",
+    );
+
+    if (discountAttr) {
+      const proportionalDiscount = Number(discountAttr.value || 0);
+      if (proportionalDiscount > 0) {
+        sub_total = sub_total - proportionalDiscount;
+
+        console.log(`📦 Discount from notes: -₹${proportionalDiscount.toFixed(2)}`);
+      }
+    }
+  }
+
+  // Ensure value don't go negative
+  sub_total = Math.max(0, sub_total);
 
   const payment_method = !Number(order.raw.total_outstanding) ? "Prepaid" : "COD";
 
@@ -380,8 +423,30 @@ export function buildXpressbeesPayload(params: {
   }, 0);
   const packageWeight = totalQuantity * 250;
 
-  const total = Number(order.raw.total_price);
-  const cod = Number(order.raw.total_outstanding);
+  // ========================================
+  // ✅ HANDLE DISCOUNT FOR SPLIT ORDERS
+  // ========================================
+  let total = Number(order.raw.total_price);
+  let cod = Number(order.raw.total_outstanding);
+  if (order.raw?.note_attributes) {
+    const discountAttr = order.raw.note_attributes.find(
+      (attr: any) => attr.name === "_proportional_discount",
+    );
+
+    if (discountAttr) {
+      const proportionalDiscount = Number(discountAttr.value || 0);
+      if (proportionalDiscount > 0) {
+        total = total - proportionalDiscount;
+        cod = cod - proportionalDiscount;
+
+        console.log(`📦 Discount from notes: -₹${proportionalDiscount.toFixed(2)}`);
+      }
+    }
+  }
+
+  // Ensure values don't go negative
+  total = Math.max(0, total);
+  cod = Math.max(0, cod);
 
   function normalizePhoneNumber(phoneNumber: string): string {
     const cleanedNumber = phoneNumber.replace(/\s/g, "");

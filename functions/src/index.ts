@@ -291,6 +291,23 @@ function groupLineItemsByVendor(lineItems: any[]): VendorGroup[] {
 }
 
 /**
+ * Calculate proportional discount for a vendor group
+ */
+function calculateProportionalDiscount(
+  originalSubtotal: number,
+  originalDiscount: number,
+  vendorSubtotal: number,
+): number {
+  if (originalDiscount === 0 || originalSubtotal === 0) return 0;
+
+  const proportion = vendorSubtotal / originalSubtotal;
+  const proportionalDiscount = originalDiscount * proportion;
+
+  // Round to 2 decimals
+  return Math.round(proportionalDiscount * 100) / 100;
+}
+
+/**
  * Mark batch as completed if all jobs are done
  */
 async function maybeCompleteSplitBatch(batchRef: DocumentReference): Promise<void> {
@@ -2464,65 +2481,65 @@ export const enqueueOrderSplitBatch = onRequest(
       // ============================================
       // ✅ STEP 1: CANCEL ORDER FIRST (CRITICAL!)
       // ============================================
-      console.log(`\n--- Cancelling original order ${orderId} ---`);
-      const cancelUrl = `https://${shop}/admin/api/2025-01/orders/${orderId}/cancel.json`;
+      // console.log(`\n--- Cancelling original order ${orderId} ---`);
+      // const cancelUrl = `https://${shop}/admin/api/2025-01/orders/${orderId}/cancel.json`;
 
-      try {
-        const cancelResp = await fetch(cancelUrl, {
-          method: "POST",
-          headers: {
-            "X-Shopify-Access-Token": accessToken,
-            "Content-Type": "application/json",
-          },
-          body: JSON.stringify({
-            reason: "other",
-            email: false,
-            restock: true,
-          }),
-        });
+      // try {
+      //   const cancelResp = await fetch(cancelUrl, {
+      //     method: "POST",
+      //     headers: {
+      //       "X-Shopify-Access-Token": accessToken,
+      //       "Content-Type": "application/json",
+      //     },
+      //     body: JSON.stringify({
+      //       reason: "other",
+      //       email: false,
+      //       restock: true,
+      //     }),
+      //   });
 
-        if (!cancelResp.ok) {
-          const errorText = await cancelResp.text();
-          console.error(`❌ Cancel failed: ${cancelResp.status} - ${errorText}`);
+      //   if (!cancelResp.ok) {
+      //     const errorText = await cancelResp.text();
+      //     console.error(`❌ Cancel failed: ${cancelResp.status} - ${errorText}`);
 
-          // Mark order as failed to split
-          await orderRef.update({
-            "splitProcessing.status": "failed",
-            "splitProcessing.error": `Cancel failed: ${cancelResp.status} - ${errorText}`,
-            "splitProcessing.failedAt": FieldValue.serverTimestamp(),
-            "splitProcessing.cancelAttempted": true,
-            "splitProcessing.cancelFailed": true,
-          });
+      //     // Mark order as failed to split
+      //     await orderRef.update({
+      //       "splitProcessing.status": "failed",
+      //       "splitProcessing.error": `Cancel failed: ${cancelResp.status} - ${errorText}`,
+      //       "splitProcessing.failedAt": FieldValue.serverTimestamp(),
+      //       "splitProcessing.cancelAttempted": true,
+      //       "splitProcessing.cancelFailed": true,
+      //     });
 
-          res.status(500).json({
-            error: "cancel_failed",
-            details: errorText,
-            statusCode: cancelResp.status,
-            message: "Original order could not be cancelled. No split orders were created.",
-          });
-          return; // ← STOP HERE - Don't create batch or jobs
-        }
+      //     res.status(500).json({
+      //       error: "cancel_failed",
+      //       details: errorText,
+      //       statusCode: cancelResp.status,
+      //       message: "Original order could not be cancelled. No split orders were created.",
+      //     });
+      //     return; // ← STOP HERE - Don't create batch or jobs
+      //   }
 
-        console.log(`✅ Original order cancelled successfully`);
-      } catch (cancelError) {
-        const errorMsg = cancelError instanceof Error ? cancelError.message : "Cancel failed";
-        console.error(`❌ Cancel error:`, cancelError);
+      //   console.log(`✅ Original order cancelled successfully`);
+      // } catch (cancelError) {
+      //   const errorMsg = cancelError instanceof Error ? cancelError.message : "Cancel failed";
+      //   console.error(`❌ Cancel error:`, cancelError);
 
-        await orderRef.update({
-          "splitProcessing.status": "failed",
-          "splitProcessing.error": errorMsg,
-          "splitProcessing.failedAt": FieldValue.serverTimestamp(),
-          "splitProcessing.cancelAttempted": true,
-          "splitProcessing.cancelFailed": true,
-        });
+      //   await orderRef.update({
+      //     "splitProcessing.status": "failed",
+      //     "splitProcessing.error": errorMsg,
+      //     "splitProcessing.failedAt": FieldValue.serverTimestamp(),
+      //     "splitProcessing.cancelAttempted": true,
+      //     "splitProcessing.cancelFailed": true,
+      //   });
 
-        res.status(500).json({
-          error: "cancel_failed",
-          details: errorMsg,
-          message: "Original order could not be cancelled. No split orders were created.",
-        });
-        return; // ← STOP HERE
-      }
+      //   res.status(500).json({
+      //     error: "cancel_failed",
+      //     details: errorMsg,
+      //     message: "Original order could not be cancelled. No split orders were created.",
+      //   });
+      //   return; // ← STOP HERE
+      // }
 
       // ============================================
       // ✅ STEP 2: Cancel succeeded, create batch
@@ -2531,6 +2548,15 @@ export const enqueueOrderSplitBatch = onRequest(
 
       const vendorGroups = groupLineItemsByVendor(originalOrder.line_items);
       console.log(`Found ${vendorGroups.length} vendor groups`);
+
+      // Calculate total discount if any
+      const originalTotalDiscount = parseFloat(originalOrder.total_discounts || "0");
+      const originalSubtotal = parseFloat(originalOrder.subtotal_price || "0");
+      const hasDiscount = originalTotalDiscount > 0;
+
+      if (hasDiscount) {
+        console.log(`\n💰 Original order has discount: ₹${originalTotalDiscount.toFixed(2)}`);
+      }
 
       // Create batch
       const batchRef = db.collection("accounts").doc(shop).collection("order_split_batches").doc();
@@ -2560,6 +2586,15 @@ export const enqueueOrderSplitBatch = onRequest(
       // Create jobs for each vendor
       const jobPromises = vendorGroups.map(async (group, index) => {
         const jobRef = batchRef.collection("jobs").doc();
+
+        // Calculate proportional discount for this vendor group
+        const proportionalDiscount = hasDiscount
+          ? calculateProportionalDiscount(originalSubtotal, originalTotalDiscount, group.subtotal)
+          : 0;
+
+        // Calculate post-discount total
+        const postDiscountTotal = group.total - proportionalDiscount;
+
         const jobData = {
           vendorName: group.vendor,
           status: "pending",
@@ -2569,7 +2604,9 @@ export const enqueueOrderSplitBatch = onRequest(
           subtotal: group.subtotal,
           tax: group.tax,
           total: group.total,
+          postDiscountTotal,
           totalWeight: group.totalWeight,
+          proportionalDiscount,
           attempts: 0,
           createdAt: FieldValue.serverTimestamp(),
         };
@@ -2808,6 +2845,8 @@ export const processOrderSplitJob = onRequest(
             { name: "_total_splits", value: String(jobData.totalSplits) },
             { name: "_original_financial_status", value: batchData.originalFinancialStatus },
             { name: "_original_payment_gateway", value: originalGateway },
+            { name: "_proportional_discount", value: jobData.proportionalDiscount.toFixed(2) },
+            { name: "_discount_applied", value: "true" },
           ],
           tags: `split-order,original-${batchData.originalOrderName},vendor-${jobData.vendorName}`,
           taxes_included: originalOrder.taxes_included || false,
@@ -2834,6 +2873,25 @@ export const processOrderSplitJob = onRequest(
           price: line.price,
           code: line.code,
         }));
+      }
+
+      // Add discount if there's a proportional discount
+      if (jobData.proportionalDiscount > 0) {
+        const discountTitle = originalOrder.discount_codes?.[0]?.code
+          ? `Split discount (${originalOrder.discount_codes[0].code})`
+          : `Split from ${batchData.originalOrderName}`;
+
+        payload.order.applied_discount = {
+          description: `Proportional discount from split order`,
+          value_type: "fixed_amount",
+          value: jobData.proportionalDiscount.toFixed(2),
+          amount: jobData.proportionalDiscount.toFixed(2),
+          title: discountTitle,
+        };
+
+        console.log(
+          `💰 Applying proportional discount: ${discountTitle} - ₹${jobData.proportionalDiscount.toFixed(2)}`,
+        );
       }
 
       // Step 2: Create split order
@@ -2900,8 +2958,8 @@ export const processOrderSplitJob = onRequest(
       if (batchData.originalFinancialStatus === "paid") {
         // FULLY PAID - Mark split as paid
         console.log(`💰 Original fully paid - marking split as paid`);
-        splitPaidAmount = jobData.total;
-        splitOutstanding = 0;
+
+        const orderTotal = parseFloat(newOrder.total_price);
 
         try {
           const txUrl = `https://${shop}/admin/api/2025-01/orders/${newOrder.id}/transactions.json`;
@@ -2915,7 +2973,7 @@ export const processOrderSplitJob = onRequest(
               transaction: {
                 kind: "sale",
                 status: "success",
-                amount: jobData.total.toFixed(2),
+                amount: orderTotal.toFixed(2),
                 gateway: originalGateway,
                 source: "external",
               },
@@ -2931,14 +2989,18 @@ export const processOrderSplitJob = onRequest(
         } catch (txError) {
           console.error(`⚠ Transaction creation error:`, txError);
         }
+
+        splitPaidAmount = jobData.total;
+        splitOutstanding = 0;
       } else if (batchData.originalFinancialStatus === "partially_paid") {
         // PARTIALLY PAID - Distribute proportionally
         console.log(`⚖️ Original partially paid - distributing proportionally`);
 
+        const orderTotal = parseFloat(newOrder.total_price);
         const originalPaid = batchData.originalTotal - batchData.originalOutstanding;
-        const splitProportion = jobData.total / batchData.originalTotal;
+        const splitProportion = orderTotal / batchData.originalTotal;
         splitPaidAmount = originalPaid * splitProportion;
-        splitOutstanding = jobData.total - splitPaidAmount;
+        splitOutstanding = orderTotal - splitPaidAmount;
 
         // Round to 2 decimals
         splitPaidAmount = Math.round(splitPaidAmount * 100) / 100;
@@ -2982,10 +3044,10 @@ export const processOrderSplitJob = onRequest(
       } else {
         // PENDING/COD - Leave as pending
         console.log(
-          `💵 Original unpaid/COD - split left as pending (collect ₹${jobData.total.toFixed(2)} on delivery)`,
+          `💵 Original unpaid/COD - split left as pending (collect ₹${jobData.postDiscountTotal.toFixed(2)} on delivery)`,
         );
         splitPaidAmount = 0;
-        splitOutstanding = jobData.total;
+        splitOutstanding = jobData.postDiscountTotal;
       }
 
       // Step 4: Mark job as success
@@ -3037,7 +3099,6 @@ export const processOrderSplitJob = onRequest(
           "splitProcessing.status": "completed",
           "splitProcessing.completedAt": FieldValue.serverTimestamp(),
           "splitProcessing.splitOrders": splitOrders,
-          customStatus: "Cancelled (Split)",
         });
 
         console.log(`✓ Original order updated with split results`);
@@ -3052,6 +3113,7 @@ export const processOrderSplitJob = onRequest(
         vendor: jobData.vendorName,
         paidAmount: splitPaidAmount,
         outstandingAmount: splitOutstanding,
+        total: jobData.postDiscountTotal,
       });
     } catch (error) {
       console.error("\n========== SPLIT JOB ERROR ==========");
@@ -5839,7 +5901,7 @@ async function processXpressbeesOrderChunk(
     "Confirmed",
     "Ready To Dispatch",
     "DTO Requested",
-    "Lost",
+    // "Lost",
     "Closed",
     "RTO Closed",
     "DTO Delivered",
