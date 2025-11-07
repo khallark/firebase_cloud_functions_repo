@@ -36,25 +36,6 @@ export function buildDelhiveryPayload(params: {
   // ========================================
   let total = Number(order.raw.total_price);
   let cod = Number(order.raw.total_outstanding);
-  if (order.raw?.note_attributes) {
-    const discountAttr = order.raw.note_attributes.find(
-      (attr: any) => attr.name === "_proportional_discount",
-    );
-
-    if (discountAttr) {
-      const proportionalDiscount = Number(discountAttr.value || 0);
-      if (proportionalDiscount > 0) {
-        total = total - proportionalDiscount;
-        cod = cod - proportionalDiscount;
-
-        console.log(`📦 Discount from notes: -₹${proportionalDiscount.toFixed(2)}`);
-      }
-    }
-  }
-
-  // Ensure values don't go negative
-  total = Math.max(0, total);
-  cod = Math.max(0, cod);
 
   const _ = (v: any) => (v === undefined || v === null ? "" : String(v));
 
@@ -131,6 +112,8 @@ export function buildDelhiveryPayload(params: {
     shipments: [shipment],
     pickup_location: {
       name: pickupName ? "Majime Productions 2" : "Majime Productions 2",
+      // name: pickupName ? "Endora" : "Endora",
+      // name: pickupName ? "Sai arpan apartment" : "Sai arpan apartment",
     },
   };
 }
@@ -186,23 +169,6 @@ export function buildShiprocketPayload(opts: {
   // ========================================
 
   let sub_total = Number(order?.raw?.total_outstanding);
-  if (order.raw?.note_attributes) {
-    const discountAttr = order.raw.note_attributes.find(
-      (attr: any) => attr.name === "_proportional_discount",
-    );
-
-    if (discountAttr) {
-      const proportionalDiscount = Number(discountAttr.value || 0);
-      if (proportionalDiscount > 0) {
-        sub_total = sub_total - proportionalDiscount;
-
-        console.log(`📦 Discount from notes: -₹${proportionalDiscount.toFixed(2)}`);
-      }
-    }
-  }
-
-  // Ensure value don't go negative
-  sub_total = Math.max(0, sub_total);
 
   const payment_method = !Number(order.raw.total_outstanding) ? "Prepaid" : "COD";
 
@@ -227,6 +193,8 @@ export function buildShiprocketPayload(opts: {
     order_id: String(order?.name || orderId), // make order_id == jobId for idempotency
     order_date: new Date().toISOString().slice(0, 16).replace("T", " "), // "YYYY-MM-DD HH:mm"
     pickup_location: pickupName ? "Majime Productions 2" : "Majime Productions 2",
+    // pickup_location: pickupName ? "ENDORA" : "ENDORA",
+    // pickup_location: pickupName ? "Sai arpan apartment" : "Sai arpan apartment",
     comment: order?.note || "",
     billing_customer_name: name,
     billing_last_name: last,
@@ -428,25 +396,6 @@ export function buildXpressbeesPayload(params: {
   // ========================================
   let total = Number(order.raw.total_price);
   let cod = Number(order.raw.total_outstanding);
-  if (order.raw?.note_attributes) {
-    const discountAttr = order.raw.note_attributes.find(
-      (attr: any) => attr.name === "_proportional_discount",
-    );
-
-    if (discountAttr) {
-      const proportionalDiscount = Number(discountAttr.value || 0);
-      if (proportionalDiscount > 0) {
-        total = total - proportionalDiscount;
-        cod = cod - proportionalDiscount;
-
-        console.log(`📦 Discount from notes: -₹${proportionalDiscount.toFixed(2)}`);
-      }
-    }
-  }
-
-  // Ensure values don't go negative
-  total = Math.max(0, total);
-  cod = Math.max(0, cod);
 
   function normalizePhoneNumber(phoneNumber: string): string {
     const cleanedNumber = phoneNumber.replace(/\s/g, "");

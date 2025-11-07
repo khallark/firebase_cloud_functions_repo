@@ -23,7 +23,7 @@ import {
 } from "firebase-admin/firestore";
 // import { genkit } from 'genkit';
 // import vertexAI from "@genkit-ai/vertexai";
-import { QueryDocumentSnapshot } from "firebase-functions/firestore";
+import { onDocumentWritten, QueryDocumentSnapshot } from "firebase-functions/firestore";
 import {
   sendConfirmedDelayedLvl1WhatsAppMessage,
   sendConfirmedDelayedLvl2WhatsAppMessage,
@@ -39,6 +39,7 @@ import {
   sendOutForDeliveryOrderWhatsAppMessage,
   sendRTODeliveredOrderWhatsAppMessage,
   sendRTOInTransitOrderWhatsAppMessage,
+  sendSplitOrdersWhatsAppMessage,
 } from "./whatsappMessagesSendingFuncs";
 import PDFDocument from "pdfkit";
 
@@ -2749,11 +2750,8 @@ export const processOrderSplitJob = onRequest(
       );
 
       // Get original order
-      const originalOrderRef = db
-        .collection("accounts")
-        .doc(shop)
-        .collection("orders")
-        .doc(batchData.originalOrderId);
+      const shopRef = db.collection("accounts").doc(shop);
+      const originalOrderRef = shopRef.collection("orders").doc(batchData.originalOrderId);
       const originalOrderSnap = await originalOrderRef.get();
 
       if (!originalOrderSnap.exists) {
@@ -2812,13 +2810,14 @@ export const processOrderSplitJob = onRequest(
       // No need to cancel here - just create split order
       // ============================================
 
-      // Step 1: Create split order payload
+      // Step 1: Create DRAFT order payload (instead of direct order)
       const includeShipping = jobData.splitIndex === 1;
 
       const lineItems = jobData.lineItems.map((item: any) => ({
         variant_id: item.variant_id,
         quantity: item.quantity,
-        price: item.price,
+        // Note: Draft orders use 'original_unit_price' instead of 'price'
+        original_unit_price: item.price,
         properties: item.properties || [],
         taxable: item.taxable !== false,
         requires_shipping: item.requires_shipping !== false,
@@ -2826,16 +2825,13 @@ export const processOrderSplitJob = onRequest(
 
       const originalGateway = batchData.originalGateway;
 
-      const payload: any = {
-        order: {
+      // Draft order payload structure
+      const draftPayload: any = {
+        draft_order: {
           line_items: lineItems,
-          financial_status: originalOrder.financial_status,
           email: originalOrder.email,
           phone: originalOrder.phone,
           currency: originalOrder.currency,
-          send_receipt: false,
-          send_fulfillment_receipt: false,
-          inventory_behaviour: "decrement_obeying_policy",
           note: `Split ${jobData.splitIndex}/${jobData.totalSplits} from order ${batchData.originalOrderName} | Vendor: ${jobData.vendorName}`,
           note_attributes: [
             { name: "_original_order_id", value: String(batchData.originalOrderId) },
@@ -2849,43 +2845,45 @@ export const processOrderSplitJob = onRequest(
             { name: "_discount_applied", value: "true" },
           ],
           tags: `split-order,original-${batchData.originalOrderName},vendor-${jobData.vendorName}`,
+          tax_exempt: originalOrder.tax_exempt || false,
           taxes_included: originalOrder.taxes_included || false,
+          use_customer_default_address: false,
         },
       };
 
       // Add customer
       if (originalOrder.customer?.id) {
-        payload.order.customer = { id: originalOrder.customer.id };
+        draftPayload.draft_order.customer = { id: originalOrder.customer.id };
       }
 
       // Add addresses
       if (originalOrder.billing_address) {
-        payload.order.billing_address = originalOrder.billing_address;
+        draftPayload.draft_order.billing_address = originalOrder.billing_address;
       }
       if (originalOrder.shipping_address) {
-        payload.order.shipping_address = originalOrder.shipping_address;
+        draftPayload.draft_order.shipping_address = originalOrder.shipping_address;
       }
 
       // Add shipping lines (only first split)
       if (includeShipping && originalOrder.shipping_lines?.length > 0) {
-        payload.order.shipping_lines = originalOrder.shipping_lines.map((line: any) => ({
-          title: line.title,
-          price: line.price,
-          code: line.code,
-        }));
+        draftPayload.draft_order.shipping_line = {
+          title: originalOrder.shipping_lines[0].title,
+          price: originalOrder.shipping_lines[0].price,
+          custom: true,
+        };
       }
 
-      // Add discount if there's a proportional discount
+      // ✅ CRITICAL: Apply discount using Draft Order's applied_discount field
       if (jobData.proportionalDiscount > 0) {
         const discountTitle = originalOrder.discount_codes?.[0]?.code
           ? `Split discount (${originalOrder.discount_codes[0].code})`
           : `Split from ${batchData.originalOrderName}`;
 
-        payload.order.applied_discount = {
+        // Draft orders support applied_discount properly!
+        draftPayload.draft_order.applied_discount = {
           description: `Proportional discount from split order`,
           value_type: "fixed_amount",
           value: jobData.proportionalDiscount.toFixed(2),
-          amount: jobData.proportionalDiscount.toFixed(2),
           title: discountTitle,
         };
 
@@ -2894,26 +2892,26 @@ export const processOrderSplitJob = onRequest(
         );
       }
 
-      // Step 2: Create split order
-      console.log(`\n--- Creating split order for vendor: ${jobData.vendorName} ---`);
-      const createUrl = `https://${shop}/admin/api/2025-01/orders.json`;
+      // Step 2: Create DRAFT order
+      console.log(`\n--- Creating DRAFT order for vendor: ${jobData.vendorName} ---`);
+      const draftUrl = `https://${shop}/admin/api/2025-01/draft_orders.json`;
 
-      let newOrder: any;
+      let draftOrder: any;
       try {
-        const createResp = await fetch(createUrl, {
+        const draftResp = await fetch(draftUrl, {
           method: "POST",
           headers: {
             "X-Shopify-Access-Token": accessToken,
             "Content-Type": "application/json",
           },
-          body: JSON.stringify(payload),
+          body: JSON.stringify(draftPayload),
         });
 
-        if (!createResp.ok) {
-          const errorText = await createResp.text();
+        if (!draftResp.ok) {
+          const errorText = await draftResp.text();
 
           // Check for rate limit
-          if (createResp.status === 429) {
+          if (draftResp.status === 429) {
             console.error(`⚠ Shopify rate limit hit`);
             await handleSplitJobFailure({
               shop,
@@ -2928,41 +2926,125 @@ export const processOrderSplitJob = onRequest(
             return;
           }
 
-          throw new Error(`Create failed: ${createResp.status} - ${errorText}`);
+          throw new Error(`Draft creation failed: ${draftResp.status} - ${errorText}`);
         }
 
-        const result = (await createResp.json()) as any;
-        newOrder = result.order;
-        console.log(`✓ Created split order ${newOrder.name} (ID: ${newOrder.id})`);
+        const result = (await draftResp.json()) as any;
+        draftOrder = result.draft_order;
+        console.log(`✓ Created draft order (ID: ${draftOrder.id})`);
+        console.log(`  Subtotal: ₹${draftOrder.subtotal_price}`);
+        console.log(`  Total Tax: ₹${draftOrder.total_tax}`);
+        console.log(`  Total Price: ₹${draftOrder.total_price}`);
+
+        // Verify discount was applied
+        if (jobData.proportionalDiscount > 0) {
+          const appliedDiscount = parseFloat(draftOrder.total_discounts || "0");
+          console.log(`  Applied Discount: ₹${appliedDiscount.toFixed(2)}`);
+
+          if (Math.abs(appliedDiscount - jobData.proportionalDiscount) > 0.01) {
+            console.warn(
+              `⚠ Discount mismatch! Expected: ₹${jobData.proportionalDiscount.toFixed(2)}, Got: ₹${appliedDiscount.toFixed(2)}`,
+            );
+          }
+        }
       } catch (createError) {
-        const errorMsg = createError instanceof Error ? createError.message : "Create failed";
-        console.error(`❌ Create failed:`, createError);
+        const errorMsg =
+          createError instanceof Error ? createError.message : "Draft creation failed";
+        console.error(`❌ Draft creation failed:`, createError);
         await handleSplitJobFailure({
           shop,
           batchRef,
           jobRef,
           jobId,
-          errorCode: "CREATE_FAILED",
+          errorCode: "DRAFT_CREATE_FAILED",
           errorMessage: errorMsg,
           isRetryable: true,
         });
-        res.status(500).json({ error: "create_failed", details: errorMsg });
+        res.status(500).json({ error: "draft_create_failed", details: errorMsg });
         return;
       }
 
-      // Step 3: Handle payment based on original order status
+      // Step 3: Complete the draft order to convert it to a regular order
+      console.log(`\n--- Completing draft order ---`);
+      const completeUrl = `https://${shop}/admin/api/2025-01/draft_orders/${draftOrder.id}/complete.json`;
+
+      let newOrder: any;
+      try {
+        // Determine payment_pending based on original order's financial status
+        const paymentPending = batchData.originalFinancialStatus !== "paid";
+
+        const completeResp = await fetch(completeUrl, {
+          method: "PUT",
+          headers: {
+            "X-Shopify-Access-Token": accessToken,
+            "Content-Type": "application/json",
+          },
+          body: JSON.stringify({
+            payment_pending: paymentPending, // false = mark as paid, true = mark as pending
+          }),
+        });
+
+        if (!completeResp.ok) {
+          const errorText = await completeResp.text();
+
+          // Check for rate limit
+          if (completeResp.status === 429) {
+            console.error(`⚠ Shopify rate limit hit`);
+            await handleSplitJobFailure({
+              shop,
+              batchRef,
+              jobRef,
+              jobId,
+              errorCode: "SHOPIFY_RATE_LIMIT",
+              errorMessage: "Shopify API rate limit exceeded",
+              isRetryable: true,
+            });
+            res.status(503).json({ error: "rate_limited" });
+            return;
+          }
+
+          throw new Error(`Draft completion failed: ${completeResp.status} - ${errorText}`);
+        }
+
+        const result = (await completeResp.json()) as any;
+        newOrder = result.draft_order;
+        console.log(`✓ Completed draft order → Order ${newOrder.name} (ID: ${newOrder.order_id})`);
+        console.log(`  Financial Status: ${newOrder.status}`);
+        console.log(`  Total: ₹${newOrder.total_price}`);
+        console.log(`  Discount: ₹${newOrder.total_discounts || "0.00"}`);
+      } catch (completeError) {
+        const errorMsg =
+          completeError instanceof Error ? completeError.message : "Draft completion failed";
+        console.error(`❌ Draft completion failed:`, completeError);
+        await handleSplitJobFailure({
+          shop,
+          batchRef,
+          jobRef,
+          jobId,
+          errorCode: "DRAFT_COMPLETE_FAILED",
+          errorMessage: errorMsg,
+          isRetryable: true,
+        });
+        res.status(500).json({ error: "draft_complete_failed", details: errorMsg });
+        return;
+      }
+
+      // Get the actual order ID (draft_order.order_id is the real order ID after completion)
+      const actualOrderId = newOrder.order_id;
+
+      // Step 4: Handle payment based on original order status
       console.log(`\n--- Handling payment ---`);
       let splitPaidAmount = 0;
-      let splitOutstanding = jobData.total;
+      let splitOutstanding = parseFloat(newOrder.total_price);
 
       if (batchData.originalFinancialStatus === "paid") {
-        // FULLY PAID - Mark split as paid
+        // FULLY PAID - Create a transaction to mark as paid
         console.log(`💰 Original fully paid - marking split as paid`);
 
         const orderTotal = parseFloat(newOrder.total_price);
 
         try {
-          const txUrl = `https://${shop}/admin/api/2025-01/orders/${newOrder.id}/transactions.json`;
+          const txUrl = `https://${shop}/admin/api/2025-01/orders/${actualOrderId}/transactions.json`;
           const txResp = await fetch(txUrl, {
             method: "POST",
             headers: {
@@ -2984,14 +3066,13 @@ export const processOrderSplitJob = onRequest(
             const errorText = await txResp.text();
             console.error(`⚠ Failed to create transaction: ${errorText}`);
           } else {
-            console.log(`✓ Split marked as paid (₹${jobData.total.toFixed(2)})`);
+            console.log(`✓ Split marked as paid (₹${orderTotal.toFixed(2)})`);
+            splitPaidAmount = orderTotal;
+            splitOutstanding = 0;
           }
         } catch (txError) {
           console.error(`⚠ Transaction creation error:`, txError);
         }
-
-        splitPaidAmount = jobData.total;
-        splitOutstanding = 0;
       } else if (batchData.originalFinancialStatus === "partially_paid") {
         // PARTIALLY PAID - Distribute proportionally
         console.log(`⚖️ Original partially paid - distributing proportionally`);
@@ -3003,8 +3084,8 @@ export const processOrderSplitJob = onRequest(
         splitOutstanding = orderTotal - splitPaidAmount;
 
         // Round to 2 decimals
-        splitPaidAmount = Math.round(splitPaidAmount * 100) / 100;
-        splitOutstanding = Math.round(splitOutstanding * 100) / 100;
+        splitPaidAmount = Math.ceil(splitPaidAmount * 100) / 100;
+        splitOutstanding = Math.ceil(splitOutstanding * 100) / 100;
 
         console.log(`📊 Proportion: ${(splitProportion * 100).toFixed(2)}%`);
         console.log(`💵 Paid: ₹${splitPaidAmount.toFixed(2)}`);
@@ -3013,7 +3094,7 @@ export const processOrderSplitJob = onRequest(
         // Create partial transaction
         if (splitPaidAmount > 0) {
           try {
-            const txUrl = `https://${shop}/admin/api/2025-01/orders/${newOrder.id}/transactions.json`;
+            const txUrl = `https://${shop}/admin/api/2025-01/orders/${actualOrderId}/transactions.json`;
             const txResp = await fetch(txUrl, {
               method: "POST",
               headers: {
@@ -3042,28 +3123,35 @@ export const processOrderSplitJob = onRequest(
           }
         }
       } else {
-        // PENDING/COD - Leave as pending
-        console.log(
-          `💵 Original unpaid/COD - split left as pending (collect ₹${jobData.postDiscountTotal.toFixed(2)} on delivery)`,
-        );
+        const orderTotal = parseFloat(newOrder.total_price);
+        // PENDING/COD - Leave as pending (draft order already created with payment_pending: true)
+        console.log(`💵 Original unpaid/COD - split left as pending (₹${orderTotal.toFixed(2)})`);
         splitPaidAmount = 0;
-        splitOutstanding = jobData.postDiscountTotal;
+        splitOutstanding = parseFloat(newOrder.total_price);
       }
 
-      // Step 4: Mark job as success
+      // Step 5: Mark job as success
+      const finalFinancialStatus =
+        splitPaidAmount >= parseFloat(newOrder.total_price)
+          ? "paid"
+          : splitPaidAmount > 0
+            ? "partially_paid"
+            : "pending";
+
       await db.runTransaction(async (tx: Transaction) => {
         tx.update(jobRef, {
           status: "success",
-          splitOrderId: String(newOrder.id),
+          newOrderName: newOrder.name,
+          product_name: newOrder?.line_items?.[0]?.name ?? "---",
+          product_quantity: newOrder?.line_items?.[0]?.quantity ?? "---",
+          draftOrderId: String(draftOrder.id),
+          splitOrderId: String(actualOrderId),
           splitOrderName: newOrder.name,
           paidAmount: splitPaidAmount,
           outstandingAmount: splitOutstanding,
-          financialStatus:
-            splitPaidAmount >= jobData.total
-              ? "paid"
-              : splitPaidAmount > 0
-                ? "partially_paid"
-                : "pending",
+          financialStatus: finalFinancialStatus,
+          actualTotal: parseFloat(newOrder.total_price),
+          actualDiscount: parseFloat(newOrder.total_discounts || "0"),
           completedAt: FieldValue.serverTimestamp(),
         });
 
@@ -3074,6 +3162,9 @@ export const processOrderSplitJob = onRequest(
       });
 
       console.log(`✓ Job marked as success`);
+      console.log(`  Order ID: ${actualOrderId}`);
+      console.log(`  Order Name: ${newOrder.name}`);
+      console.log(`  Financial Status: ${finalFinancialStatus}`);
 
       // Check if batch complete
       await maybeCompleteSplitBatch(batchRef);
@@ -3100,6 +3191,17 @@ export const processOrderSplitJob = onRequest(
           "splitProcessing.completedAt": FieldValue.serverTimestamp(),
           "splitProcessing.splitOrders": splitOrders,
         });
+        const shopDoc = (await shopRef.get()).data() as any;
+        const oldOrder = originalOrderSnap.data() as any;
+        const newOrders = allJobsSnap.docs.map((doc) => {
+          const jobData = doc.data();
+          return {
+            name: jobData.newOrderName,
+            product_name: jobData.product_name,
+            quantity: jobData.product_quantity,
+          };
+        });
+        sendSplitOrdersWhatsAppMessage(shopDoc, oldOrder, newOrders);
 
         console.log(`✓ Original order updated with split results`);
       }
@@ -7712,6 +7814,483 @@ export const migrateCourierProviders = onRequest(
       }
     } catch (authError) {
       res.status(401).json({ error: `Unauthorized ${authError}` });
+    }
+  },
+);
+
+// functions/src/index.ts
+
+// ============================================================================
+// MIGRATION: ADD VENDORS ARRAY FIELD
+// ============================================================================
+
+/**
+ * Extracts unique vendor names from line items
+ */
+function extractVendors(lineItems: any[]): string[] {
+  if (!Array.isArray(lineItems) || lineItems.length === 0) {
+    return [];
+  }
+
+  const vendorSet = new Set<string>();
+
+  for (const item of lineItems) {
+    if (item.vendor && typeof item.vendor === "string") {
+      const trimmedVendor = item.vendor.trim();
+      if (trimmedVendor.length > 0) {
+        vendorSet.add(trimmedVendor);
+      }
+    }
+  }
+
+  return Array.from(vendorSet).sort(); // Sort for consistency
+}
+
+interface VendorsMigrationStats {
+  accountsProcessed: number;
+  ordersScanned: number;
+  ordersUpdated: number;
+  ordersSkipped: number;
+  errors: number;
+}
+
+async function migrateAccountVendors(accountId: string): Promise<{
+  scanned: number;
+  updated: number;
+  skipped: number;
+}> {
+  const BATCH_SIZE = 500;
+  let scanned = 0;
+  let updated = 0;
+  let skipped = 0;
+  let lastDoc: QueryDocumentSnapshot | null = null;
+
+  while (true) {
+    let query = db.collection("accounts").doc(accountId).collection("orders").limit(BATCH_SIZE);
+
+    if (lastDoc) {
+      query = query.startAfter(lastDoc);
+    }
+
+    const snapshot = await query.get();
+
+    if (snapshot.empty) {
+      break;
+    }
+
+    const batch = db.batch();
+    let batchCount = 0;
+
+    for (const doc of snapshot.docs) {
+      scanned++;
+      const data = doc.data();
+
+      // Skip if already has vendors field
+      if (data.vendors && Array.isArray(data.vendors)) {
+        skipped++;
+        continue;
+      }
+
+      // Extract vendors from line items
+      const lineItems = data.raw?.line_items;
+      if (!lineItems || !Array.isArray(lineItems)) {
+        skipped++;
+        continue;
+      }
+
+      const vendors = extractVendors(lineItems);
+
+      // Add to batch
+      batch.update(doc.ref, { vendors });
+      batchCount++;
+      updated++;
+    }
+
+    // Commit batch if there are updates
+    if (batchCount > 0) {
+      await batch.commit();
+      console.log(`  💾 Committed batch: ${batchCount} orders updated`);
+    }
+
+    lastDoc = snapshot.docs[snapshot.docs.length - 1];
+
+    // Progress update
+    if (scanned % 1000 === 0) {
+      console.log(`  📈 Progress: ${scanned} scanned, ${updated} updated`);
+    }
+  }
+
+  return { scanned, updated, skipped };
+}
+
+export const migrateVendorsField = onRequest(
+  {
+    cors: true,
+    timeoutSeconds: 540,
+    memory: "1GiB",
+    region: process.env.LOCATION || "asia-south1",
+    secrets: [ENQUEUE_FUNCTION_SECRET],
+  },
+  async (req: Request, res: Response): Promise<void> => {
+    try {
+      // Validate secret
+      requireHeaderSecret(req, "x-api-key", ENQUEUE_FUNCTION_SECRET.value() || "");
+
+      console.log("🚀 Starting Vendors Field Migration...\n");
+
+      const stats: VendorsMigrationStats = {
+        accountsProcessed: 0,
+        ordersScanned: 0,
+        ordersUpdated: 0,
+        ordersSkipped: 0,
+        errors: 0,
+      };
+
+      try {
+        // Get all accounts
+        const accountsSnapshot = await db.collection("accounts").get();
+        console.log(`Found ${accountsSnapshot.size} accounts to process\n`);
+
+        // Process each account
+        for (const accountDoc of accountsSnapshot.docs) {
+          const accountId = accountDoc.id;
+          console.log(`\n📦 Processing account: ${accountId}`);
+
+          try {
+            const accountStats = await migrateAccountVendors(accountId);
+            stats.accountsProcessed++;
+            stats.ordersScanned += accountStats.scanned;
+            stats.ordersUpdated += accountStats.updated;
+            stats.ordersSkipped += accountStats.skipped;
+
+            console.log(
+              `  ✅ Account completed: ${accountStats.updated} updated, ${accountStats.skipped} skipped`,
+            );
+          } catch (error) {
+            stats.errors++;
+            console.error(`  ❌ Error processing account ${accountId}:`, error);
+          }
+
+          // Small delay between accounts
+          await sleep(100);
+        }
+
+        // Print final summary
+        console.log("\n" + "=".repeat(60));
+        console.log("📊 VENDORS FIELD MIGRATION SUMMARY");
+        console.log("=".repeat(60));
+        console.log(`Accounts processed: ${stats.accountsProcessed}`);
+        console.log(`Orders scanned:     ${stats.ordersScanned}`);
+        console.log(`Orders updated:     ${stats.ordersUpdated}`);
+        console.log(`Orders skipped:     ${stats.ordersSkipped}`);
+        console.log(`Errors:             ${stats.errors}`);
+        console.log("=".repeat(60));
+        console.log("✨ Migration completed!\n");
+
+        res.json({
+          success: true,
+          summary: stats,
+          message: "Vendors field migration completed successfully",
+        });
+      } catch (error) {
+        console.error("\n❌ Migration failed:", error);
+        res.status(500).json({
+          success: false,
+          error: error instanceof Error ? error.message : String(error),
+          stats,
+        });
+      }
+    } catch (authError) {
+      res.status(401).json({ error: `Unauthorized ${authError}` });
+    }
+  },
+);
+
+// ============================================================================
+// HTTP FUNCTION: Initialize Order Counts Metadata
+// ============================================================================
+
+interface InitializeStats {
+  accountsProcessed: number;
+  totalOrders: number;
+  metadataCreated: number;
+  errors: number;
+}
+
+async function initializeAccountMetadata(accountId: string): Promise<{
+  totalOrders: number;
+  counts: Record<string, number>;
+}> {
+  console.log(`  📊 Counting orders for account: ${accountId}`);
+
+  const ordersSnapshot = await db.collection("accounts").doc(accountId).collection("orders").get();
+
+  const counts: Record<string, number> = {
+    "All Orders": 0,
+    New: 0,
+    Confirmed: 0,
+    "Ready To Dispatch": 0,
+    Dispatched: 0,
+    "In Transit": 0,
+    "Out For Delivery": 0,
+    Delivered: 0,
+    "RTO In Transit": 0,
+    "RTO Delivered": 0,
+    "DTO Requested": 0,
+    "DTO Booked": 0,
+    "DTO In Transit": 0,
+    "DTO Delivered": 0,
+    "Pending Refunds": 0,
+    Lost: 0,
+    Closed: 0,
+    "RTO Closed": 0,
+    "Cancellation Requested": 0,
+    Cancelled: 0,
+  };
+
+  let allOrdersCount = 0;
+
+  ordersSnapshot.docs.forEach((doc) => {
+    const order = doc.data();
+    const isShopifyCancelled = !!order.raw?.cancelled_at;
+
+    if (isShopifyCancelled) {
+      counts["Cancelled"]++;
+    } else {
+      allOrdersCount++;
+      const status = order.customStatus || "New";
+      if (counts[status] !== undefined) {
+        counts[status]++;
+      } else {
+        console.warn(`  ⚠️ Unknown status found: ${status}`);
+      }
+    }
+  });
+
+  counts["All Orders"] = allOrdersCount;
+
+  // Save to metadata document
+  await db.collection("accounts").doc(accountId).collection("metadata").doc("orderCounts").set({
+    counts,
+    lastUpdated: FieldValue.serverTimestamp(),
+  });
+
+  console.log(`  ✅ Metadata created: ${ordersSnapshot.size} orders counted`);
+
+  return {
+    totalOrders: ordersSnapshot.size,
+    counts,
+  };
+}
+
+export const initializeMetadata = onRequest(
+  {
+    cors: true,
+    timeoutSeconds: 540,
+    memory: "1GiB",
+    region: process.env.LOCATION || "asia-south1",
+    secrets: [ENQUEUE_FUNCTION_SECRET],
+  },
+  async (req, res): Promise<void> => {
+    try {
+      // Validate secret
+      requireHeaderSecret(req, "x-api-key", ENQUEUE_FUNCTION_SECRET.value() || "");
+
+      console.log("🚀 Starting Order Counts Metadata Initialization...\n");
+
+      const stats: InitializeStats = {
+        accountsProcessed: 0,
+        totalOrders: 0,
+        metadataCreated: 0,
+        errors: 0,
+      };
+
+      try {
+        // Get all accounts
+        const accountsSnapshot = await db.collection("accounts").get();
+        console.log(`Found ${accountsSnapshot.size} accounts to process\n`);
+
+        // Process each account
+        for (const accountDoc of accountsSnapshot.docs) {
+          const accountId = accountDoc.id;
+          console.log(`\n📦 Processing account: ${accountId}`);
+
+          try {
+            const result = await initializeAccountMetadata(accountId);
+            stats.accountsProcessed++;
+            stats.totalOrders += result.totalOrders;
+            stats.metadataCreated++;
+
+            console.log(`  ✅ Account completed: ${result.totalOrders} orders`);
+          } catch (error) {
+            stats.errors++;
+            console.error(`  ❌ Error processing account ${accountId}:`, error);
+          }
+
+          // Small delay between accounts
+          await sleep(100);
+        }
+
+        // Print final summary
+        console.log("\n" + "=".repeat(60));
+        console.log("📊 INITIALIZATION SUMMARY");
+        console.log("=".repeat(60));
+        console.log(`Accounts processed:   ${stats.accountsProcessed}`);
+        console.log(`Total orders counted: ${stats.totalOrders}`);
+        console.log(`Metadata created:     ${stats.metadataCreated}`);
+        console.log(`Errors:               ${stats.errors}`);
+        console.log("=".repeat(60));
+        console.log("✨ Initialization completed!\n");
+
+        res.json({
+          success: true,
+          summary: stats,
+          message: "Metadata initialization completed successfully",
+        });
+      } catch (error) {
+        console.error("\n❌ Initialization failed:", error);
+        res.status(500).json({
+          success: false,
+          error: error instanceof Error ? error.message : String(error),
+          stats,
+        });
+      }
+    } catch (authError) {
+      res.status(401).json({ error: `Unauthorized ${authError}` });
+    }
+  },
+);
+
+// ============================================================================
+// BACKGROUND FUNCTION: Auto-Update Order Counts
+// ============================================================================
+
+export const updateOrderCounts = onDocumentWritten(
+  {
+    document: "accounts/{storeId}/orders/{orderId}",
+    region: process.env.LOCATION || "asia-south1",
+    memory: "256MiB",
+  },
+  async (event) => {
+    const storeId = event.params.storeId;
+    const orderId = event.params.orderId;
+
+    console.log(`📝 Order ${orderId} changed in store ${storeId}`);
+
+    const metadataRef = db
+      .collection("accounts")
+      .doc(storeId)
+      .collection("metadata")
+      .doc("orderCounts");
+
+    try {
+      const change = event.data;
+      if (!change) return;
+
+      // ============================================================
+      // CASE 1: Order Deleted
+      // ============================================================
+      if (!change.after.exists) {
+        const oldOrder = change.before.data();
+        if (!oldOrder) return;
+
+        const oldStatus = oldOrder.raw?.cancelled_at ? "Cancelled" : oldOrder.customStatus || "New";
+
+        await metadataRef.set(
+          {
+            counts: {
+              "All Orders": FieldValue.increment(oldOrder.raw?.cancelled_at ? 0 : -1),
+              [oldStatus]: FieldValue.increment(-1),
+            },
+            lastUpdated: FieldValue.serverTimestamp(),
+          },
+          { merge: true },
+        );
+
+        console.log(`✅ Decremented count for deleted order (${oldStatus})`);
+        return;
+      }
+
+      // ============================================================
+      // CASE 2: New Order Created
+      // ============================================================
+      if (!change.before.exists) {
+        const newOrder = change.after.data();
+        if (!newOrder) return;
+
+        const newStatus = newOrder.raw?.cancelled_at ? "Cancelled" : newOrder.customStatus || "New";
+
+        await metadataRef.set(
+          {
+            counts: {
+              "All Orders": FieldValue.increment(newOrder.raw?.cancelled_at ? 0 : 1),
+              [newStatus]: FieldValue.increment(1),
+            },
+            lastUpdated: FieldValue.serverTimestamp(),
+          },
+          { merge: true },
+        );
+
+        console.log(`✅ Incremented count for new order (${newStatus})`);
+        return;
+      }
+
+      // ============================================================
+      // CASE 3: Order Updated (Status Changed)
+      // ============================================================
+      const oldOrder = change.before.data();
+      const newOrder = change.after.data();
+
+      if (!oldOrder || !newOrder) return;
+
+      const oldStatus = oldOrder.raw?.cancelled_at ? "Cancelled" : oldOrder.customStatus || "New";
+      const newStatus = newOrder.raw?.cancelled_at ? "Cancelled" : newOrder.customStatus || "New";
+
+      // If status hasn't changed, do nothing
+      if (oldStatus === newStatus) {
+        console.log(`⏭️ No status change for order ${orderId}, skipping`);
+        return;
+      }
+
+      // Calculate "All Orders" change
+      const oldWasCancelled = !!oldOrder.raw?.cancelled_at;
+      const newIsCancelled = !!newOrder.raw?.cancelled_at;
+      let allOrdersDelta = 0;
+
+      if (!oldWasCancelled && newIsCancelled) {
+        allOrdersDelta = -1; // Moved to cancelled
+      } else if (oldWasCancelled && !newIsCancelled) {
+        allOrdersDelta = 1; // Moved from cancelled
+      }
+
+      // Update counts atomically
+      const updates: any = {
+        lastUpdated: FieldValue.serverTimestamp(),
+      };
+
+      // Decrement old status
+      updates[`counts.${oldStatus}`] = FieldValue.increment(-1);
+
+      // Increment new status
+      updates[`counts.${newStatus}`] = FieldValue.increment(1);
+
+      // Update "All Orders" if needed
+      if (allOrdersDelta !== 0) {
+        updates["counts.All Orders"] = FieldValue.increment(allOrdersDelta);
+      }
+
+      await metadataRef.update(updates);
+
+      console.log(`✅ Updated counts: ${oldStatus} → ${newStatus}`);
+    } catch (error) {
+      console.error(`❌ Error updating counts for ${storeId}:`, error);
+
+      // If metadata doesn't exist, log warning
+      if ((error as any).code === "not-found") {
+        console.error(
+          `⚠️ Metadata not found for ${storeId}. Please run initializeMetadata function first.`,
+        );
+      }
     }
   },
 );
