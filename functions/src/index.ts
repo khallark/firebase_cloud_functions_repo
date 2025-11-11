@@ -269,8 +269,7 @@ function groupLineItemsByVendor(lineItems: any[]): VendorGroup[] {
     group.lineItems.push(item);
 
     // Calculate subtotal
-    const itemSubtotal =
-      parseFloat(item.price) * item.quantity - parseFloat(item.total_discount || "0");
+    const itemSubtotal = parseFloat(item.price) * item.quantity;
     group.subtotal += itemSubtotal;
 
     // Calculate tax
@@ -2593,9 +2592,6 @@ export const enqueueOrderSplitBatch = onRequest(
           ? calculateProportionalDiscount(originalSubtotal, originalTotalDiscount, group.subtotal)
           : 0;
 
-        // Calculate post-discount total
-        const postDiscountTotal = group.total - proportionalDiscount;
-
         const jobData = {
           vendorName: group.vendor,
           status: "pending",
@@ -2605,7 +2601,6 @@ export const enqueueOrderSplitBatch = onRequest(
           subtotal: group.subtotal,
           tax: group.tax,
           total: group.total,
-          postDiscountTotal,
           totalWeight: group.totalWeight,
           proportionalDiscount,
           attempts: 0,
@@ -3012,6 +3007,18 @@ export const processOrderSplitJob = onRequest(
         console.log(`  Financial Status: ${newOrder.status}`);
         console.log(`  Total: ₹${newOrder.total_price}`);
         console.log(`  Discount: ₹${newOrder.total_discounts || "0.00"}`);
+
+        const actualTotal = parseFloat(newOrder.total_price);
+        const actualDiscount = parseFloat(newOrder.total_discounts || "0");
+
+        console.log(`\n🔍 VERIFICATION:`);
+        console.log(`  Expected total: ₹${jobData.total.toFixed(2)}`);
+        console.log(`  Expected discount: ₹${jobData.proportionalDiscount.toFixed(2)}`);
+        console.log(`  Shopify actual total: ₹${actualTotal.toFixed(2)}`);
+        console.log(`  Shopify actual discount: ₹${actualDiscount.toFixed(2)}`);
+        console.log(
+          `  Difference: ₹${Math.abs(jobData.total - jobData.proportionalDiscount - actualTotal).toFixed(2)}`,
+        );
       } catch (completeError) {
         const errorMsg =
           completeError instanceof Error ? completeError.message : "Draft completion failed";
@@ -3036,48 +3043,19 @@ export const processOrderSplitJob = onRequest(
       console.log(`\n--- Handling payment ---`);
       let splitPaidAmount = 0;
       let splitOutstanding = parseFloat(newOrder.total_price);
+      const orderTotal = parseFloat(newOrder.total_price);
 
       if (batchData.originalFinancialStatus === "paid") {
-        // FULLY PAID - Create a transaction to mark as paid
-        console.log(`💰 Original fully paid - marking split as paid`);
-
-        const orderTotal = parseFloat(newOrder.total_price);
-
-        try {
-          const txUrl = `https://${shop}/admin/api/2025-01/orders/${actualOrderId}/transactions.json`;
-          const txResp = await fetch(txUrl, {
-            method: "POST",
-            headers: {
-              "X-Shopify-Access-Token": accessToken,
-              "Content-Type": "application/json",
-            },
-            body: JSON.stringify({
-              transaction: {
-                kind: "sale",
-                status: "success",
-                amount: orderTotal.toFixed(2),
-                gateway: originalGateway,
-                source: "external",
-              },
-            }),
-          });
-
-          if (!txResp.ok) {
-            const errorText = await txResp.text();
-            console.error(`⚠ Failed to create transaction: ${errorText}`);
-          } else {
-            console.log(`✓ Split marked as paid (₹${orderTotal.toFixed(2)})`);
-            splitPaidAmount = orderTotal;
-            splitOutstanding = 0;
-          }
-        } catch (txError) {
-          console.error(`⚠ Transaction creation error:`, txError);
-        }
+        // ✅ FULLY PAID - Draft was completed with payment_pending: false
+        // Shopify automatically creates a transaction, so we DON'T create another one
+        console.log(`💰 Original fully paid - draft auto-marked as paid by Shopify`);
+        splitPaidAmount = orderTotal;
+        splitOutstanding = 0;
+        console.log(`✓ Split marked as paid (₹${orderTotal.toFixed(2)})`);
       } else if (batchData.originalFinancialStatus === "partially_paid") {
         // PARTIALLY PAID - Distribute proportionally
         console.log(`⚖️ Original partially paid - distributing proportionally`);
 
-        const orderTotal = parseFloat(newOrder.total_price);
         const originalPaid = batchData.originalTotal - batchData.originalOutstanding;
         const splitProportion = orderTotal / batchData.originalTotal;
         splitPaidAmount = originalPaid * splitProportion;
@@ -3091,7 +3069,7 @@ export const processOrderSplitJob = onRequest(
         console.log(`💵 Paid: ₹${splitPaidAmount.toFixed(2)}`);
         console.log(`💰 Outstanding (COD): ₹${splitOutstanding.toFixed(2)}`);
 
-        // Create partial transaction
+        // Create partial transaction (draft was completed with payment_pending: true)
         if (splitPaidAmount > 0) {
           try {
             const txUrl = `https://${shop}/admin/api/2025-01/orders/${actualOrderId}/transactions.json`;
@@ -3123,11 +3101,10 @@ export const processOrderSplitJob = onRequest(
           }
         }
       } else {
-        const orderTotal = parseFloat(newOrder.total_price);
-        // PENDING/COD - Leave as pending (draft order already created with payment_pending: true)
+        // PENDING/COD - Leave as pending (draft completed with payment_pending: true)
         console.log(`💵 Original unpaid/COD - split left as pending (₹${orderTotal.toFixed(2)})`);
         splitPaidAmount = 0;
-        splitOutstanding = parseFloat(newOrder.total_price);
+        splitOutstanding = orderTotal;
       }
 
       // Step 5: Mark job as success
@@ -3180,11 +3157,15 @@ export const processOrderSplitJob = onRequest(
           orderId: doc.data().splitOrderId,
           orderName: doc.data().splitOrderName,
           vendor: doc.data().vendorName,
-          total: doc.data().total,
+          total: doc.data().actualTotal,
           paidAmount: doc.data().paidAmount,
           outstandingAmount: doc.data().outstandingAmount,
           financialStatus: doc.data().financialStatus,
         }));
+
+        // After all splits complete, verify total
+        const totalOfAllSplits = splitOrders.reduce((sum, o) => sum + o.total, 0);
+        console.log(`Original: ₹${batchData.originalTotal}, Splits: ₹${totalOfAllSplits}`);
 
         await originalOrderRef.update({
           "splitProcessing.status": "completed",
@@ -3215,7 +3196,7 @@ export const processOrderSplitJob = onRequest(
         vendor: jobData.vendorName,
         paidAmount: splitPaidAmount,
         outstandingAmount: splitOutstanding,
-        total: jobData.postDiscountTotal,
+        total: parseFloat(newOrder.total_price),
       });
     } catch (error) {
       console.error("\n========== SPLIT JOB ERROR ==========");

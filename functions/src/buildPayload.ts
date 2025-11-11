@@ -31,9 +31,6 @@ export function buildDelhiveryPayload(params: {
     0,
   );
 
-  // ========================================
-  // ✅ HANDLE DISCOUNT FOR SPLIT ORDERS
-  // ========================================
   let total = Number(order.raw.total_price);
   let cod = Number(order.raw.total_outstanding);
 
@@ -164,9 +161,6 @@ export function buildShiprocketPayload(opts: {
           },
         ];
 
-  // ========================================
-  // ✅ HANDLE DISCOUNT FOR SPLIT ORDERS
-  // ========================================
 
   let sub_total = Number(order?.raw?.total_outstanding);
 
@@ -391,9 +385,6 @@ export function buildXpressbeesPayload(params: {
   }, 0);
   const packageWeight = totalQuantity * 250;
 
-  // ========================================
-  // ✅ HANDLE DISCOUNT FOR SPLIT ORDERS
-  // ========================================
   let total = Number(order.raw.total_price);
   let cod = Number(order.raw.total_outstanding);
 
