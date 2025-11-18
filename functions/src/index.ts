@@ -47,6 +47,7 @@ setGlobalOptions({ region: process.env.LOCATION || "asia-south1" });
 
 const TASKS_SECRET = defineSecret("TASKS_SECRET");
 const ENQUEUE_FUNCTION_SECRET = defineSecret("ENQUEUE_FUNCTION_SECRET");
+const SHARED_STORE_ID = "nfkjgp-sv.myshopify.com";
 
 /** Small helper to require a shared secret header */
 function requireHeaderSecret(req: Request, header: string, expected: string) {
@@ -110,7 +111,65 @@ async function maybeCompleteBatch(batchRef: DocumentReference): Promise<void> {
   });
 }
 
+const SUPER_ADMIN_ID = "vD8UJMLtHNefUfkMgbcF605SNAm2";
+
+function BusinessIsAuthorisedToProcessThisOrder(
+  businessId: string,
+  vendorName: string,
+  vendors: any,
+) {
+  try {
+    if (businessId === SUPER_ADMIN_ID) {
+      return {
+        authorised: true,
+      };
+    }
+    if (!vendorName) {
+      return {
+        authorised: false,
+        error: "No vendorName provided",
+        status: 400,
+      };
+    }
+    if (!vendors || !Array.isArray(vendors) || !vendors.length) {
+      return {
+        authorised: false,
+        error: "Invalid vendors array",
+        status: 400,
+      };
+    }
+
+    const isAuthorized =
+      vendorName !== "OWR"
+        ? vendors.includes(vendorName)
+        : (vendors.includes(vendorName) ||
+            vendors.includes("Ghamand") ||
+            vendors.includes("BBB")) &&
+          !vendors.includes("ENDORA") &&
+          !vendors.includes("STYLE 05");
+
+    if (!isAuthorized) {
+      return {
+        authorised: false,
+        error: "Not authorised to process this order",
+        status: 403,
+      };
+    }
+
+    return {
+      authorised: true,
+    };
+  } catch (error: any) {
+    return {
+      authorised: false,
+      error: error?.message ?? "Unknown error occurred",
+      status: 500,
+    };
+  }
+}
+
 async function handleJobFailure(params: {
+  businessId: string;
   shop: string;
   batchRef: DocumentReference;
   jobRef: DocumentReference;
@@ -120,7 +179,17 @@ async function handleJobFailure(params: {
   isRetryable: boolean;
   apiResp?: any;
 }): Promise<{ shouldReturnFailure: boolean; statusCode: number; reason: string }> {
-  const { shop, batchRef, jobRef, jobId, errorCode, errorMessage, isRetryable, apiResp } = params;
+  const {
+    businessId,
+    shop,
+    batchRef,
+    jobRef,
+    jobId,
+    errorCode,
+    errorMessage,
+    isRetryable,
+    apiResp,
+  } = params;
 
   // FIX: Use transaction for atomic updates
   const result = await db.runTransaction(async (tx: Transaction) => {
@@ -142,6 +211,7 @@ async function handleJobFailure(params: {
     const isExceptionError =
       errorCode === "INSUFFICIENT_BALANCE" ||
       errorCode === "ORDER_ALREADY_SHIPPED" ||
+      errorCode === "NOT_AUTHORIZED_TO_PROCESS_THIS_ORDER" ||
       errorCode === "ORDER_NOT_FOUND" ||
       errorCode === "COURIER_SELECTION_FAILED";
 
@@ -199,7 +269,7 @@ async function handleJobFailure(params: {
     try {
       const fallbackUrl = process.env.PRIORITY_FALLBACK_HANDLER_URL!;
       await createTask(
-        { shop, batchId: batchRef.id, jobId },
+        { businessId, shop, batchId: batchRef.id, jobId },
         {
           tasksSecret: TASKS_SECRET.value() || "",
           url: fallbackUrl,
@@ -332,7 +402,6 @@ async function maybeCompleteSplitBatch(batchRef: DocumentReference): Promise<voi
  * Handle job failure with retry logic
  */
 async function handleSplitJobFailure(params: {
-  shop: string;
   batchRef: DocumentReference;
   jobRef: DocumentReference;
   jobId: string;
@@ -408,19 +477,21 @@ export const enqueueShipmentTasks = onRequest(
         return;
       }
 
-      const { shop, orders, courier, pickupName, shippingMode, requestedBy } = (req.body || {}) as {
+      const { businessId, shop, orders, courier, shippingMode, requestedBy } = (req.body || {}) as {
+        businessId?: string;
         shop?: string;
         orders?: string;
         courier?: string;
-        pickupName?: string;
+        // pickupName?: string;
         shippingMode?: string;
         requestedBy?: string;
       };
 
       if (
+        !businessId ||
         !shop ||
         !courier ||
-        !pickupName ||
+        // !pickupName ||
         !shippingMode ||
         !Array.isArray(orders) ||
         orders.length === 0
@@ -429,15 +500,16 @@ export const enqueueShipmentTasks = onRequest(
         return;
       }
 
-      const shopDoc = (await db.collection("accounts").doc(shop).get()).data();
-      if (!shopDoc) {
-        res.status(400).json({ error: "shop_not_found" });
+      const businessRef = await db.collection("users").doc(businessId).get();
+      if (!businessRef.exists) {
+        res.status(400).json({ error: "business_not_found" });
         return;
       }
+      const businessDoc = businessRef.data();
 
       const priorityCourier =
         courier === "Priority"
-          ? shopDoc?.integrations?.couriers?.priorityList?.[0]?.name.toLowerCase()
+          ? businessDoc?.integrations?.couriers?.priorityList?.[0]?.name.toLowerCase()
           : null;
 
       const url = (() => {
@@ -462,7 +534,9 @@ export const enqueueShipmentTasks = onRequest(
       })();
 
       // 1) Create batch header
-      const batchRef = db.collection("accounts").doc(shop).collection("shipment_batches").doc();
+      const batchRef = businessRef.ref.collection("shipment_batches").doc();
+
+      const pickupName = businessDoc?.pickupName;
 
       await batchRef.set({
         shop,
@@ -503,11 +577,14 @@ export const enqueueShipmentTasks = onRequest(
       // Create one Cloud Task per job
       await Promise.all(
         jobIds.map((jobId) =>
-          createTask({ shop, batchId, courier, jobId, pickupName, shippingMode } as any, {
-            tasksSecret: TASKS_SECRET.value() || "",
-            url,
-            queue: String(process.env.SHIPMENT_QUEUE_NAME) || "shipments-queue",
-          }),
+          createTask(
+            { businessId, shop, batchId, courier, jobId, pickupName, shippingMode } as any,
+            {
+              tasksSecret: TASKS_SECRET.value() || "",
+              url,
+              queue: String(process.env.SHIPMENT_QUEUE_NAME) || "shipments-queue",
+            },
+          ),
         ),
       );
 
@@ -523,6 +600,7 @@ export const enqueueShipmentTasks = onRequest(
 );
 
 // outer catch non-retryable error codes
+
 const NON_RETRYABLE = new Set(["CARRIER_KEY_MISSING", "ORDER_NOT_FOUND"]);
 
 // ============================================================================
@@ -543,34 +621,34 @@ export const handlePriorityFallback = onRequest(
         return;
       }
 
-      const { shop, batchId, jobId } = req.body;
-      if (!shop || !batchId || !jobId) {
+      const { businessId, shop, batchId, jobId } = req.body;
+      if (!businessId || !shop || !batchId || !jobId) {
         res.status(400).json({ error: "missing_required_params" });
         return;
       }
 
       const batchRef = db
-        .collection("accounts")
-        .doc(shop)
+        .collection("users")
+        .doc(businessId)
         .collection("shipment_batches")
         .doc(batchId);
       const jobRef = batchRef.collection("jobs").doc(jobId);
 
       // FIX: Atomic status check and update inside transaction
       const fallbackInfo = await db.runTransaction(async (tx: Transaction) => {
-        const [jobSnap, batchSnap, shopSnap] = await Promise.all([
+        const [jobSnap, batchSnap, businessSnap] = await Promise.all([
           tx.get(jobRef),
           tx.get(batchRef),
-          tx.get(db.collection("accounts").doc(shop)),
+          tx.get(db.collection("user").doc(businessId)),
         ]);
 
-        if (!jobSnap.exists || !batchSnap.exists || !shopSnap.exists) {
+        if (!jobSnap.exists || !batchSnap.exists || !businessSnap.exists) {
           throw new Error("DOCUMENTS_NOT_FOUND");
         }
 
         const jobData = jobSnap.data()!;
         const batchData = batchSnap.data()!;
-        const shopDoc = shopSnap.data()!;
+        const businessDoc = businessSnap.data()!;
 
         // FIX: Check terminal states atomically
         if (["processing", "success", "failed"].includes(jobData.status)) {
@@ -586,7 +664,7 @@ export const handlePriorityFallback = onRequest(
           throw new Error("NOT_PRIORITY_JOB");
         }
 
-        const priorityList = shopDoc?.integrations?.couriers?.priorityList || [];
+        const priorityList = businessDoc?.integrations?.couriers?.priorityList || [];
         if (!Array.isArray(priorityList) || priorityList.length === 0) {
           tx.update(jobRef, {
             status: "failed",
@@ -686,6 +764,7 @@ export const handlePriorityFallback = onRequest(
 
         await createTask(
           {
+            businessId,
             shop,
             batchId,
             jobId,
@@ -712,11 +791,11 @@ export const handlePriorityFallback = onRequest(
 
       // Mark job as failed on handler error
       try {
-        const { shop, batchId, jobId } = req.body;
-        if (shop && batchId && jobId) {
+        const { businessId, batchId, jobId } = req.body;
+        if (businessId && batchId && jobId) {
           const batchRef = db
-            .collection("accounts")
-            .doc(shop)
+            .collection("users")
+            .doc(businessId)
             .collection("shipment_batches")
             .doc(batchId);
           const jobRef = batchRef.collection("jobs").doc(jobId);
@@ -852,26 +931,27 @@ export const processShipmentTask = onRequest(
         return;
       }
 
-      const { shop, batchId, jobId, pickupName, shippingMode } = (req.body || {}) as {
+      const { businessId, shop, batchId, jobId, pickupName, shippingMode } = (req.body || {}) as {
+        businessId?: string;
         shop?: string;
         batchId?: string;
         jobId?: string;
         pickupName?: string;
         shippingMode?: string;
       };
-      if (!shop || !batchId || !jobId || !pickupName || !shippingMode) {
+      if (!businessId || !shop || !batchId || !jobId || !pickupName || !shippingMode) {
         res.status(400).json({ error: "bad_payload" });
         return;
       }
 
       const batchRef = db
-        .collection("accounts")
-        .doc(shop)
+        .collection("users")
+        .doc(businessId)
         .collection("shipment_batches")
         .doc(batchId);
       const jobRef = batchRef.collection("jobs").doc(String(jobId));
       const orderRef = db.collection("accounts").doc(shop).collection("orders").doc(String(jobId));
-      const accountRef = db.collection("accounts").doc(shop);
+      const businessRef = db.collection("users").doc(businessId);
 
       // FIX: Atomic idempotency check and status update
       const shouldProceed = await db.runTransaction(async (tx: Transaction) => {
@@ -931,9 +1011,54 @@ export const processShipmentTask = onRequest(
       if (!ordSnap.exists) throw new Error("ORDER_NOT_FOUND");
       const order = ordSnap.data();
 
+      // Carrier API key
+      const businessDoc = await businessRef.get();
+
+      // Cache data to avoid repeated lookups
+      const batchData = (await batchRef.get()).data();
+      const businessData = businessDoc.data();
+
+      // Check if the shop is exceptional one, if yes, then check if the given business is authorised to process this order or not
+      if (shop === SHARED_STORE_ID) {
+        const vendorName = businessData?.vendorName;
+        const vendors = order?.vendors;
+        const canProcess = BusinessIsAuthorisedToProcessThisOrder(businessId, vendorName, vendors);
+
+        if (!canProcess.authorised) {
+          const failure = await handleJobFailure({
+            businessId,
+            shop,
+            batchRef,
+            jobRef,
+            jobId,
+            errorCode: "NOT_AUTHORIZED_TO_PROCESS_THIS_ORDER",
+            errorMessage:
+              canProcess.status === 500
+                ? "Some internal error occured while checking for authorization"
+                : "The current business is not authorized to process this Order.",
+            isRetryable: false,
+          });
+
+          if (failure.shouldReturnFailure) {
+            res.status(failure.statusCode).json({
+              ok: false,
+              reason: failure.reason,
+              code: "NOT_AUTHORIZED_TO_PROCESS_THIS_ORDER",
+            });
+          } else {
+            res.status(failure.statusCode).json({
+              ok: true,
+              action: failure.reason,
+            });
+          }
+          return;
+        }
+      }
+
       // Check if order is in correct status for shipping
       if (order?.customStatus !== "Confirmed") {
         const failure = await handleJobFailure({
+          businessId,
           shop,
           batchRef,
           jobRef,
@@ -959,14 +1084,7 @@ export const processShipmentTask = onRequest(
       }
 
       // Allocate AWB
-      awb = await allocateAwb(shop);
-
-      // Carrier API key
-      const accSnap = await accountRef.get();
-
-      // Cache data to avoid repeated lookups
-      const batchData = (await batchRef.get()).data();
-      const accountData = accSnap.data();
+      awb = await allocateAwb(businessId);
 
       // Determine if this is a priority shipment
       const isPriority = batchData?.courier === "Priority";
@@ -975,7 +1093,7 @@ export const processShipmentTask = onRequest(
       const payloadShippingMode = (() => {
         if (!isPriority) return shippingMode; // Use default shipping mode
 
-        const priorityCouriers = accountData?.integrations?.couriers?.priorityList;
+        const priorityCouriers = businessData?.integrations?.couriers?.priorityList;
         const delhiveryConfig = priorityCouriers?.find(
           (courier: any) => courier.name === "delhivery",
         );
@@ -992,7 +1110,7 @@ export const processShipmentTask = onRequest(
         shippingMode: payloadShippingMode,
       });
 
-      const apiKey = accSnap.data()?.integrations?.couriers?.delhivery?.apiKey as
+      const apiKey = businessDoc.data()?.integrations?.couriers?.delhivery?.apiKey as
         | string
         | undefined;
       if (!apiKey) throw new Error("CARRIER_KEY_MISSING");
@@ -1017,7 +1135,7 @@ export const processShipmentTask = onRequest(
       if (!resp.ok) {
         if (awb && !awbReleased) {
           try {
-            await releaseAwb(shop, awb);
+            await releaseAwb(businessId, awb);
             awbReleased = true;
           } catch (e) {
             console.error("Failed to release AWB:", e);
@@ -1025,6 +1143,7 @@ export const processShipmentTask = onRequest(
         }
 
         const failure = await handleJobFailure({
+          businessId,
           shop,
           batchRef,
           jobRef,
@@ -1056,7 +1175,7 @@ export const processShipmentTask = onRequest(
       if (!verdict.ok) {
         if (awb && !awbReleased) {
           try {
-            await releaseAwb(shop, awb);
+            await releaseAwb(businessId, awb);
             awbReleased = true;
           } catch (e) {
             console.error("Failed to release AWB:", e);
@@ -1064,6 +1183,7 @@ export const processShipmentTask = onRequest(
         }
 
         const failure = await handleJobFailure({
+          businessId,
           shop,
           batchRef,
           jobRef,
@@ -1148,16 +1268,17 @@ export const processShipmentTask = onRequest(
       const isRetryable = !NON_RETRYABLE.has(code);
 
       try {
-        const { shop, batchId, jobId } = (req.body || {}) as {
+        const { businessId, shop, batchId, jobId } = (req.body || {}) as {
+          businessId?: string;
           shop?: string;
           batchId?: string;
           jobId?: string;
         };
 
-        if (shop && batchId && jobId) {
+        if (businessId && shop && batchId && jobId) {
           if (awb && !awbReleased) {
             try {
-              await releaseAwb(shop, awb);
+              await releaseAwb(businessId, awb);
               awbReleased = true;
             } catch (e) {
               console.error("Failed to release AWB:", e);
@@ -1165,13 +1286,14 @@ export const processShipmentTask = onRequest(
           }
 
           const batchRef = db
-            .collection("accounts")
-            .doc(shop)
+            .collection("users")
+            .doc(businessId)
             .collection("shipment_batches")
             .doc(batchId);
           const jobRef = batchRef.collection("jobs").doc(String(jobId));
 
           const failure = await handleJobFailure({
+            businessId,
             shop,
             batchRef,
             jobRef,
@@ -1370,25 +1492,26 @@ export const processShipmentTask2 = onRequest(
       requireHeaderSecret(req, "x-tasks-secret", TASKS_SECRET.value() || "");
       if (req.method !== "POST") return void res.status(405).json({ error: "method_not_allowed" });
 
-      const { shop, batchId, jobId, pickupName, shippingMode } = (req.body || {}) as {
+      const { businessId, shop, batchId, jobId, pickupName, shippingMode } = (req.body || {}) as {
+        businessId?: string;
         shop?: string;
         batchId?: string;
         jobId?: string;
         pickupName?: string;
         shippingMode?: string;
       };
-      if (!shop || !batchId || !jobId || !pickupName || !shippingMode) {
+      if (!businessId || !shop || !batchId || !jobId || !pickupName || !shippingMode) {
         return void res.status(400).json({ error: "bad_payload" });
       }
 
       const batchRef = db
-        .collection("accounts")
-        .doc(shop)
+        .collection("users")
+        .doc(businessId)
         .collection("shipment_batches")
         .doc(batchId);
       const jobRef = batchRef.collection("jobs").doc(String(jobId));
       const orderRef = db.collection("accounts").doc(shop).collection("orders").doc(String(jobId));
-      const accountRef = db.collection("accounts").doc(shop);
+      const businessRef = db.collection("users").doc(businessId);
 
       // FIX: Atomic idempotency check inside transaction
       const shouldProceed = await db.runTransaction(async (tx: Transaction) => {
@@ -1446,8 +1569,49 @@ export const processShipmentTask2 = onRequest(
       if (!ordSnap.exists) throw new Error("ORDER_NOT_FOUND");
       const order = ordSnap.data();
 
+      // Carrier token/config
+      const businessDoc = await businessRef.get();
+      const businessData = businessDoc.data();
+
+      // Check if the shop is exceptional one, if yes, then check if the given business is authorised to process this order or not
+      if (shop === SHARED_STORE_ID) {
+        const vendorName = businessData?.vendorName;
+        const vendors = order?.vendors;
+        const canProcess = BusinessIsAuthorisedToProcessThisOrder(businessId, vendorName, vendors);
+        if (!canProcess.authorised) {
+          const failure = await handleJobFailure({
+            businessId,
+            shop,
+            batchRef,
+            jobRef,
+            jobId,
+            errorCode: "NOT_AUTHORIZED_TO_PROCESS_THIS_ORDER",
+            errorMessage:
+              canProcess.status === 500
+                ? "Some internal error occured while checking for authorization"
+                : "The current business is not authorized to process this Order.",
+            isRetryable: false,
+          });
+
+          if (failure.shouldReturnFailure) {
+            res.status(failure.statusCode).json({
+              ok: false,
+              reason: failure.reason,
+              code: "NOT_AUTHORIZED_TO_PROCESS_THIS_ORDER",
+            });
+          } else {
+            res.status(failure.statusCode).json({
+              ok: true,
+              action: failure.reason,
+            });
+          }
+          return;
+        }
+      }
+
       if (order?.customStatus !== "Confirmed") {
         const failure = await handleJobFailure({
+          businessId,
           shop,
           batchRef,
           jobRef,
@@ -1472,11 +1636,7 @@ export const processShipmentTask2 = onRequest(
       }
       // ----------------------------------------------------------------------
 
-      // Carrier token/config
-      const accSnap = await accountRef.get();
-      const accountData = accSnap.data();
-
-      const shiprocketCfg = accountData?.integrations?.couriers?.shiprocket || {};
+      const shiprocketCfg = businessData?.integrations?.couriers?.shiprocket || {};
       const srToken =
         shiprocketCfg?.accessToken ||
         shiprocketCfg?.token ||
@@ -1495,7 +1655,7 @@ export const processShipmentTask2 = onRequest(
       const payloadShippingMode = (() => {
         if (!isPriority) return shippingMode;
 
-        const priorityCouriers = accountData?.integrations?.couriers?.priorityList;
+        const priorityCouriers = businessData?.integrations?.couriers?.priorityList;
         const shiprocketConfig = priorityCouriers?.find(
           (courier: any) => courier.name === "shiprocket",
         );
@@ -1546,6 +1706,7 @@ export const processShipmentTask2 = onRequest(
           const isRetryable = verdict.retryable;
 
           const failure = await handleJobFailure({
+            businessId,
             shop,
             batchRef,
             jobRef,
@@ -1577,6 +1738,7 @@ export const processShipmentTask2 = onRequest(
         if (!srShipmentId) {
           // This shouldn't happen with successful verdict, but handle gracefully
           const failure = await handleJobFailure({
+            businessId,
             shop,
             batchRef,
             jobRef,
@@ -1651,6 +1813,7 @@ export const processShipmentTask2 = onRequest(
         const isRetryable = awbVerdict.retryable;
 
         const failure = await handleJobFailure({
+          businessId,
           shop,
           batchRef,
           jobRef,
@@ -1684,6 +1847,7 @@ export const processShipmentTask2 = onRequest(
       if (!awbCode) {
         // This shouldn't happen with successful verdict, but handle gracefully
         const failure = await handleJobFailure({
+          businessId,
           shop,
           batchRef,
           jobRef,
@@ -1795,16 +1959,17 @@ export const processShipmentTask2 = onRequest(
       const isRetryable = !NON_RETRYABLE.has(code);
 
       try {
-        const { shop, batchId, jobId } = (req.body || {}) as {
+        const { businessId, shop, batchId, jobId } = (req.body || {}) as {
+          businessId?: string;
           shop?: string;
           batchId?: string;
           jobId?: string;
         };
 
-        if (shop && batchId && jobId) {
+        if (businessId && shop && batchId && jobId) {
           if (awb && !awbReleased) {
             try {
-              await releaseAwb(shop, awb);
+              await releaseAwb(businessId, awb);
               awbReleased = true;
             } catch (e) {
               console.error("Failed to release AWB:", e);
@@ -1813,12 +1978,13 @@ export const processShipmentTask2 = onRequest(
 
           const batchRef = db
             .collection("accounts")
-            .doc(shop)
+            .doc(businessId)
             .collection("shipment_batches")
             .doc(batchId);
           const jobRef = batchRef.collection("jobs").doc(String(jobId));
 
           const failure = await handleJobFailure({
+            businessId,
             shop,
             batchRef,
             jobRef,
@@ -2030,7 +2196,8 @@ export const processShipmentTask3 = onRequest(
         return;
       }
 
-      const { shop, batchId, jobId, pickupName, shippingMode } = (req.body || {}) as {
+      const { businessId, shop, batchId, jobId, pickupName, shippingMode } = (req.body || {}) as {
+        businessId?: string;
         shop?: string;
         batchId?: string;
         jobId?: string;
@@ -2038,19 +2205,19 @@ export const processShipmentTask3 = onRequest(
         shippingMode?: string;
       };
 
-      if (!shop || !batchId || !jobId || !pickupName || !shippingMode) {
+      if (!businessId || !shop || !batchId || !jobId || !pickupName || !shippingMode) {
         res.status(400).json({ error: "bad_payload" });
         return;
       }
 
       const batchRef = db
-        .collection("accounts")
-        .doc(shop)
+        .collection("users")
+        .doc(businessId)
         .collection("shipment_batches")
         .doc(batchId);
       const jobRef = batchRef.collection("jobs").doc(String(jobId));
       const orderRef = db.collection("accounts").doc(shop).collection("orders").doc(String(jobId));
-      const accountRef = db.collection("accounts").doc(shop);
+      const businessRef = db.collection("users").doc(businessId);
 
       // FIX: Atomic idempotency check inside transaction
       const shouldProceed = await db.runTransaction(async (tx: Transaction) => {
@@ -2108,8 +2275,48 @@ export const processShipmentTask3 = onRequest(
       if (!ordSnap.exists) throw new Error("ORDER_NOT_FOUND");
       const order = ordSnap.data();
 
+      const businessDoc = await businessRef.get();
+      const businessData = businessDoc.data();
+
+      // Check if the shop is exceptional one, if yes, then check if the given business is authorised to process this order or not
+      if (shop === SHARED_STORE_ID) {
+        const vendorName = businessData?.vendorName;
+        const vendors = order?.vendors;
+        const canProcess = BusinessIsAuthorisedToProcessThisOrder(businessId, vendorName, vendors);
+        if (!canProcess.authorised) {
+          const failure = await handleJobFailure({
+            businessId,
+            shop,
+            batchRef,
+            jobRef,
+            jobId,
+            errorCode: "NOT_AUTHORIZED_TO_PROCESS_THIS_ORDER",
+            errorMessage:
+              canProcess.status === 500
+                ? "Some internal error occured while checking for authorization"
+                : "The current business is not authorized to process this Order.",
+            isRetryable: false,
+          });
+
+          if (failure.shouldReturnFailure) {
+            res.status(failure.statusCode).json({
+              ok: false,
+              reason: failure.reason,
+              code: "NOT_AUTHORIZED_TO_PROCESS_THIS_ORDER",
+            });
+          } else {
+            res.status(failure.statusCode).json({
+              ok: true,
+              action: failure.reason,
+            });
+          }
+          return;
+        }
+      }
+
       if (order?.customStatus !== "Confirmed") {
         const failure = await handleJobFailure({
+          businessId,
           shop,
           batchRef,
           jobRef,
@@ -2135,9 +2342,7 @@ export const processShipmentTask3 = onRequest(
       }
 
       // Get Xpressbees API key
-      const accSnap = await accountRef.get();
-      const accountData = accSnap.data();
-      const xpressbeesCfg = accSnap.data()?.integrations?.couriers?.xpressbees || {};
+      const xpressbeesCfg = businessData?.integrations?.couriers?.xpressbees || {};
       const apiKey = xpressbeesCfg?.apiKey || xpressbeesCfg?.token;
 
       if (!apiKey) throw new Error("CARRIER_KEY_MISSING");
@@ -2161,7 +2366,7 @@ export const processShipmentTask3 = onRequest(
       const payloadShippingMode = (() => {
         if (!isPriority) return shippingMode; // Use default shipping mode
 
-        const priorityCouriers = accountData?.integrations?.couriers?.priorityList;
+        const priorityCouriers = businessData?.integrations?.couriers?.priorityList;
         const xpressbeesConfig = priorityCouriers?.find(
           (courier: any) => courier.name === "xpressbees",
         );
@@ -2175,6 +2380,7 @@ export const processShipmentTask3 = onRequest(
       } catch (error) {
         const msg = error instanceof Error ? error.message : String(error);
         const failure = await handleJobFailure({
+          businessId,
           shop,
           batchRef,
           jobRef,
@@ -2228,6 +2434,7 @@ export const processShipmentTask3 = onRequest(
       if (!resp.ok && !carrier?.status) {
         // This is a network/gateway error (502, 503, etc.) - not a proper Xpressbees API response
         const failure = await handleJobFailure({
+          businessId,
           shop,
           batchRef,
           jobRef,
@@ -2258,6 +2465,7 @@ export const processShipmentTask3 = onRequest(
       // Handle API errors (proper Xpressbees error responses)
       if (!verdict.ok) {
         const failure = await handleJobFailure({
+          businessId,
           shop,
           batchRef,
           jobRef,
@@ -2345,21 +2553,23 @@ export const processShipmentTask3 = onRequest(
       const isRetryable = !NON_RETRYABLE.has(code);
 
       try {
-        const { shop, batchId, jobId } = (req.body || {}) as {
+        const { businessId, shop, batchId, jobId } = (req.body || {}) as {
+          businessId?: string;
           shop?: string;
           batchId?: string;
           jobId?: string;
         };
 
-        if (shop && batchId && jobId) {
+        if (businessId && shop && batchId && jobId) {
           const batchRef = db
-            .collection("accounts")
-            .doc(shop)
+            .collection("users")
+            .doc(businessId)
             .collection("shipment_batches")
             .doc(batchId);
           const jobRef = batchRef.collection("jobs").doc(String(jobId));
 
           const failure = await handleJobFailure({
+            businessId,
             shop,
             batchRef,
             jobRef,
@@ -2414,13 +2624,19 @@ export const enqueueOrderSplitBatch = onRequest(
         return;
       }
 
-      const { shop, orderId } = (req.body || {}) as {
+      const { shop, orderId, requestedBy } = (req.body || {}) as {
         shop?: string;
         orderId?: string;
+        requestedBy?: string;
       };
 
-      if (!shop || !orderId) {
+      if (!shop || !orderId || !requestedBy) {
         res.status(400).json({ error: "missing_shop_or_orderId" });
+        return;
+      }
+
+      if (shop !== SHARED_STORE_ID) {
+        res.status(403).json({ error: "invalid_shop_order_for_splitting" });
         return;
       }
 
@@ -2439,6 +2655,11 @@ export const enqueueOrderSplitBatch = onRequest(
 
       const orderData = orderSnap.data()!;
       const originalOrder = orderData.raw;
+
+      if (orderData.customStatus !== "New") {
+        res.status(403).json({ error: "cannot_perform_splitting_on_any_status_but_new" });
+        return;
+      }
 
       if (!originalOrder || !originalOrder.line_items) {
         console.error(`Invalid order data for: ${orderId}`);
@@ -2481,65 +2702,65 @@ export const enqueueOrderSplitBatch = onRequest(
       // ============================================
       // ✅ STEP 1: CANCEL ORDER FIRST (CRITICAL!)
       // ============================================
-      // console.log(`\n--- Cancelling original order ${orderId} ---`);
-      // const cancelUrl = `https://${shop}/admin/api/2025-01/orders/${orderId}/cancel.json`;
+      console.log(`\n--- Cancelling original order ${orderId} ---`);
+      const cancelUrl = `https://${shop}/admin/api/2025-01/orders/${orderId}/cancel.json`;
 
-      // try {
-      //   const cancelResp = await fetch(cancelUrl, {
-      //     method: "POST",
-      //     headers: {
-      //       "X-Shopify-Access-Token": accessToken,
-      //       "Content-Type": "application/json",
-      //     },
-      //     body: JSON.stringify({
-      //       reason: "other",
-      //       email: false,
-      //       restock: true,
-      //     }),
-      //   });
+      try {
+        const cancelResp = await fetch(cancelUrl, {
+          method: "POST",
+          headers: {
+            "X-Shopify-Access-Token": accessToken,
+            "Content-Type": "application/json",
+          },
+          body: JSON.stringify({
+            reason: "other",
+            email: false,
+            restock: true,
+          }),
+        });
 
-      //   if (!cancelResp.ok) {
-      //     const errorText = await cancelResp.text();
-      //     console.error(`❌ Cancel failed: ${cancelResp.status} - ${errorText}`);
+        if (!cancelResp.ok) {
+          const errorText = await cancelResp.text();
+          console.error(`❌ Cancel failed: ${cancelResp.status} - ${errorText}`);
 
-      //     // Mark order as failed to split
-      //     await orderRef.update({
-      //       "splitProcessing.status": "failed",
-      //       "splitProcessing.error": `Cancel failed: ${cancelResp.status} - ${errorText}`,
-      //       "splitProcessing.failedAt": FieldValue.serverTimestamp(),
-      //       "splitProcessing.cancelAttempted": true,
-      //       "splitProcessing.cancelFailed": true,
-      //     });
+          // Mark order as failed to split
+          await orderRef.update({
+            "splitProcessing.status": "failed",
+            "splitProcessing.error": `Cancel failed: ${cancelResp.status} - ${errorText}`,
+            "splitProcessing.failedAt": FieldValue.serverTimestamp(),
+            "splitProcessing.cancelAttempted": true,
+            "splitProcessing.cancelFailed": true,
+          });
 
-      //     res.status(500).json({
-      //       error: "cancel_failed",
-      //       details: errorText,
-      //       statusCode: cancelResp.status,
-      //       message: "Original order could not be cancelled. No split orders were created.",
-      //     });
-      //     return; // ← STOP HERE - Don't create batch or jobs
-      //   }
+          res.status(500).json({
+            error: "cancel_failed",
+            details: errorText,
+            statusCode: cancelResp.status,
+            message: "Original order could not be cancelled. No split orders were created.",
+          });
+          return; // ← STOP HERE - Don't create batch or jobs
+        }
 
-      //   console.log(`✅ Original order cancelled successfully`);
-      // } catch (cancelError) {
-      //   const errorMsg = cancelError instanceof Error ? cancelError.message : "Cancel failed";
-      //   console.error(`❌ Cancel error:`, cancelError);
+        console.log(`✅ Original order cancelled successfully`);
+      } catch (cancelError) {
+        const errorMsg = cancelError instanceof Error ? cancelError.message : "Cancel failed";
+        console.error(`❌ Cancel error:`, cancelError);
 
-      //   await orderRef.update({
-      //     "splitProcessing.status": "failed",
-      //     "splitProcessing.error": errorMsg,
-      //     "splitProcessing.failedAt": FieldValue.serverTimestamp(),
-      //     "splitProcessing.cancelAttempted": true,
-      //     "splitProcessing.cancelFailed": true,
-      //   });
+        await orderRef.update({
+          "splitProcessing.status": "failed",
+          "splitProcessing.error": errorMsg,
+          "splitProcessing.failedAt": FieldValue.serverTimestamp(),
+          "splitProcessing.cancelAttempted": true,
+          "splitProcessing.cancelFailed": true,
+        });
 
-      //   res.status(500).json({
-      //     error: "cancel_failed",
-      //     details: errorMsg,
-      //     message: "Original order could not be cancelled. No split orders were created.",
-      //   });
-      //   return; // ← STOP HERE
-      // }
+        res.status(500).json({
+          error: "cancel_failed",
+          details: errorMsg,
+          message: "Original order could not be cancelled. No split orders were created.",
+        });
+        return; // ← STOP HERE
+      }
 
       // ============================================
       // ✅ STEP 2: Cancel succeeded, create batch
@@ -2562,6 +2783,7 @@ export const enqueueOrderSplitBatch = onRequest(
       const batchRef = db.collection("accounts").doc(shop).collection("order_split_batches").doc();
 
       const batchData = {
+        requestedBy,
         originalOrderId: orderId,
         originalOrderName: originalOrder.name,
         originalFinancialStatus: originalOrder.financial_status,
@@ -2752,7 +2974,6 @@ export const processOrderSplitJob = onRequest(
       if (!originalOrderSnap.exists) {
         console.error(`Original order not found: ${batchData.originalOrderId}`);
         await handleSplitJobFailure({
-          shop,
           batchRef,
           jobRef,
           jobId,
@@ -2772,7 +2993,6 @@ export const processOrderSplitJob = onRequest(
       if (!accountSnap.exists) {
         console.error(`Account not found: ${shop}`);
         await handleSplitJobFailure({
-          shop,
           batchRef,
           jobRef,
           jobId,
@@ -2788,7 +3008,6 @@ export const processOrderSplitJob = onRequest(
       if (!accessToken) {
         console.error(`Access token missing for: ${shop}`);
         await handleSplitJobFailure({
-          shop,
           batchRef,
           jobRef,
           jobId,
@@ -2909,7 +3128,6 @@ export const processOrderSplitJob = onRequest(
           if (draftResp.status === 429) {
             console.error(`⚠ Shopify rate limit hit`);
             await handleSplitJobFailure({
-              shop,
               batchRef,
               jobRef,
               jobId,
@@ -2947,7 +3165,6 @@ export const processOrderSplitJob = onRequest(
           createError instanceof Error ? createError.message : "Draft creation failed";
         console.error(`❌ Draft creation failed:`, createError);
         await handleSplitJobFailure({
-          shop,
           batchRef,
           jobRef,
           jobId,
@@ -2986,7 +3203,6 @@ export const processOrderSplitJob = onRequest(
           if (completeResp.status === 429) {
             console.error(`⚠ Shopify rate limit hit`);
             await handleSplitJobFailure({
-              shop,
               batchRef,
               jobRef,
               jobId,
@@ -3024,7 +3240,6 @@ export const processOrderSplitJob = onRequest(
           completeError instanceof Error ? completeError.message : "Draft completion failed";
         console.error(`❌ Draft completion failed:`, completeError);
         await handleSplitJobFailure({
-          shop,
           batchRef,
           jobRef,
           jobId,
@@ -3292,10 +3507,11 @@ async function handleReturnJobFailure(params: {
   };
 }
 
-// ============================================================================
-// RETURN SHIPMENT TASK ENQUEUER
-// ============================================================================
-
+/* 
+============================================================================
+ RETURN SHIPMENT TASK ENQUEUER
+============================================================================
+*/
 export const enqueueReturnShipmentTasks = onRequest(
   { cors: true, timeoutSeconds: 60, secrets: [ENQUEUE_FUNCTION_SECRET, TASKS_SECRET] },
   async (req: Request, res: Response): Promise<void> => {
@@ -3307,7 +3523,9 @@ export const enqueueReturnShipmentTasks = onRequest(
         return;
       }
 
-      const { shop, orderIds, pickupName, shippingMode, requestedBy } = (req.body || {}) as {
+      const { businessId, shop, orderIds, pickupName, shippingMode, requestedBy } = (req.body ||
+        {}) as {
+        businessId?: string;
         shop?: string;
         orderIds?: string[];
         pickupName?: string;
@@ -3316,6 +3534,7 @@ export const enqueueReturnShipmentTasks = onRequest(
       };
 
       if (
+        !businessId ||
         !shop ||
         !pickupName ||
         !shippingMode ||
@@ -3378,7 +3597,11 @@ export const enqueueReturnShipmentTasks = onRequest(
       }
 
       // Create batch header
-      const batchRef = db.collection("accounts").doc(shop).collection("book_return_batches").doc();
+      const batchRef = db
+        .collection("users")
+        .doc(businessId)
+        .collection("book_return_batches")
+        .doc();
 
       await batchRef.set({
         shop,
@@ -3425,6 +3648,7 @@ export const enqueueReturnShipmentTasks = onRequest(
         taskPromises.push(
           createTask(
             {
+              businessId,
               shop,
               batchId: batchRef.id,
               jobId: String(o),
@@ -3497,6 +3721,7 @@ export const enqueueReturnShipmentTasks = onRequest(
 // ============================================================================
 
 // Non-retryable error codes for returns
+
 const RETURN_NON_RETRYABLE = new Set([
   "CARRIER_KEY_MISSING",
   "ORDER_NOT_FOUND",
@@ -3602,7 +3827,8 @@ export const processReturnShipmentTask = onRequest(
         return;
       }
 
-      const { shop, batchId, jobId, pickupName, shippingMode } = (req.body || {}) as {
+      const { businessId, shop, batchId, jobId, pickupName, shippingMode } = (req.body || {}) as {
+        businessId?: string;
         shop?: string;
         batchId?: string;
         jobId?: string;
@@ -3610,21 +3836,22 @@ export const processReturnShipmentTask = onRequest(
         shippingMode?: string;
       };
 
-      if (!shop || !batchId || !jobId || !pickupName) {
+      if (!businessId || !shop || !batchId || !jobId || !pickupName) {
         res.status(400).json({ error: "bad_payload" });
         return;
       }
 
       const batchRef = db
-        .collection("accounts")
-        .doc(shop)
+        .collection("users")
+        .doc(businessId)
         .collection("book_return_batches")
         .doc(batchId);
       const jobRef = batchRef.collection("jobs").doc(String(jobId));
       const orderRef = db.collection("accounts").doc(shop).collection("orders").doc(String(jobId));
-      const accountRef = db.collection("accounts").doc(shop);
       const orderData = (await orderRef.get()).data() as any;
-      const accountData = (await accountRef.get()).data() as any;
+      const businessRef = db.collection("users").doc(businessId);
+      const businessData = (await businessRef.get()).data() as any;
+      const shopData = (await db.collection("accounts").doc(shop).get()).data() as any;
 
       // FIX: Atomic idempotency check and status update
       const shouldProceed = await db.runTransaction(async (tx: Transaction) => {
@@ -3680,6 +3907,41 @@ export const processReturnShipmentTask = onRequest(
       if (!ordSnap.exists) throw new Error("ORDER_NOT_FOUND");
       const order = ordSnap.data();
 
+      // Check if the shop is exceptional one, if yes, then chekc if the given business is authorised to process this order or not
+      if (shop === SHARED_STORE_ID) {
+        const vendorName = businessData?.vendorName;
+        const vendors = order?.vendors;
+        const canProcess = BusinessIsAuthorisedToProcessThisOrder(businessId, vendorName, vendors);
+        if (!canProcess.authorised) {
+          const failure = await handleReturnJobFailure({
+            shop,
+            batchRef,
+            jobRef,
+            jobId,
+            errorCode: "NOT_AUTHORIZED_TO_PROCESS_THIS_ORDER",
+            errorMessage:
+              canProcess.status === 500
+                ? "Some internal error occured while checking for authorization"
+                : "The current business is not authorized to process this Order.",
+            isRetryable: false,
+          });
+
+          if (failure.shouldReturnFailure) {
+            res.status(failure.statusCode).json({
+              ok: false,
+              reason: failure.reason,
+              code: "NOT_AUTHORIZED_TO_PROCESS_THIS_ORDER",
+            });
+          } else {
+            res.status(failure.statusCode).json({
+              ok: true,
+              action: failure.reason,
+            });
+          }
+          return;
+        }
+      }
+
       // Check if order is in correct status for return shipment
       const status = order?.customStatus;
       if (status !== "Delivered" && status !== "DTO Requested") {
@@ -3709,7 +3971,7 @@ export const processReturnShipmentTask = onRequest(
       }
 
       // Allocate AWB
-      awb = await allocateAwb(shop);
+      awb = await allocateAwb(businessId);
 
       // Build payload for Delhivery return
       const payload = buildDelhiveryReturnPayload({
@@ -3721,10 +3983,7 @@ export const processReturnShipmentTask = onRequest(
       });
 
       // Carrier API key
-      const accSnap = await accountRef.get();
-      const apiKey = accSnap.data()?.integrations?.couriers?.delhivery?.apiKey as
-        | string
-        | undefined;
+      const apiKey = businessData?.integrations?.couriers?.delhivery?.apiKey as string | undefined;
       if (!apiKey) throw new Error("CARRIER_KEY_MISSING");
 
       // Call Delhivery
@@ -3747,7 +4006,7 @@ export const processReturnShipmentTask = onRequest(
       if (!resp.ok) {
         if (awb && !awbReleased) {
           try {
-            await releaseAwb(shop, awb);
+            await releaseAwb(businessId, awb);
             awbReleased = true;
           } catch (e) {
             console.error("Failed to release AWB:", e);
@@ -3786,7 +4045,7 @@ export const processReturnShipmentTask = onRequest(
       if (!verdict.ok) {
         if (awb && !awbReleased) {
           try {
-            await releaseAwb(shop, awb);
+            await releaseAwb(businessId, awb);
             awbReleased = true;
           } catch (e) {
             console.error("Failed to release AWB:", e);
@@ -3867,7 +4126,7 @@ export const processReturnShipmentTask = onRequest(
       });
 
       await maybeCompleteBatch(batchRef);
-      sendDTOBookedOrderWhatsAppMessage(accountData, orderData);
+      sendDTOBookedOrderWhatsAppMessage(shopData, orderData);
 
       res.json({ ok: true, awb, carrierShipmentId: verdict.carrierShipmentId ?? null });
       return;
@@ -3878,16 +4137,17 @@ export const processReturnShipmentTask = onRequest(
       const isRetryable = !RETURN_NON_RETRYABLE.has(code);
 
       try {
-        const { shop, batchId, jobId } = (req.body || {}) as {
+        const { businessId, shop, batchId, jobId } = (req.body || {}) as {
+          businessId?: string;
           shop?: string;
           batchId?: string;
           jobId?: string;
         };
 
-        if (shop && batchId && jobId) {
+        if (businessId && shop && batchId && jobId) {
           if (awb && !awbReleased) {
             try {
-              await releaseAwb(shop, awb);
+              await releaseAwb(businessId, awb);
               awbReleased = true;
             } catch (e) {
               console.error("Failed to release AWB:", e);
@@ -3895,8 +4155,8 @@ export const processReturnShipmentTask = onRequest(
           }
 
           const batchRef = db
-            .collection("accounts")
-            .doc(shop)
+            .collection("users")
+            .doc(businessId)
             .collection("book_return_batches")
             .doc(batchId);
           const jobRef = batchRef.collection("jobs").doc(String(jobId));
@@ -3950,32 +4210,38 @@ export const enqueueOrdersFulfillmentTasks = onRequest(
         return;
       }
 
-      const { shop, orderIds, requestedBy } = (req.body || {}) as {
+      const { businessId, shop, orderIds, requestedBy } = (req.body || {}) as {
+        businessId?: string;
         shop?: string;
         orderIds?: Array<string | number>;
         requestedBy?: string;
       };
 
-      if (!shop || !Array.isArray(orderIds) || orderIds.length === 0) {
+      if (!businessId || !shop || !Array.isArray(orderIds) || orderIds.length === 0) {
         res.status(400).json({ error: "bad_payload" });
         return;
       }
 
       // Validate account + token
-      const accountRef = db.collection("accounts").doc(shop);
-      const accountSnap = await accountRef.get();
-      if (!accountSnap.exists) {
+      const businessRef = db.collection("users").doc(businessId);
+      const businessDoc = await businessRef.get();
+      if (!businessDoc.exists) {
         res.status(404).json({ error: "shop_not_found" });
         return;
       }
-      const accessToken = accountSnap.get("accessToken");
+      const shopDoc = await db.collection("accounts").doc(shop).get();
+      if (!shopDoc.exists) {
+        res.status(404).json({ error: "shop_not_found" });
+        return;
+      }
+      const accessToken = shopDoc.get("accessToken");
       if (!accessToken) {
         res.status(500).json({ error: "missing_access_token" });
         return;
       }
 
       // Create summary doc
-      const summaryRef = accountRef.collection("orders_fulfillment_summary").doc();
+      const summaryRef = businessRef.collection("orders_fulfillment_summary").doc();
       const summaryId = summaryRef.id;
       const now = FieldValue.serverTimestamp();
       const total = orderIds.length;
@@ -4016,6 +4282,7 @@ export const enqueueOrdersFulfillmentTasks = onRequest(
         orderIds.map((oid) =>
           createTask(
             {
+              businessId,
               shop,
               summaryId,
               jobId: String(oid),
@@ -4042,7 +4309,7 @@ export const enqueueOrdersFulfillmentTasks = onRequest(
   },
 );
 
-// Fulfill ONE Shopify order (handles on_hold/scheduled → open)
+/* Fulfill ONE Shopify order (handles on_hold/scheduled → open) */
 async function fulfillOrderOnShopify(
   shop: string,
   accessToken: string,
@@ -4193,9 +4460,6 @@ async function fulfillOrderOnShopify(
 export const processFulfillmentTask = onRequest(
   { cors: true, timeoutSeconds: 60, secrets: [TASKS_SECRET] },
   async (req: Request, res: Response): Promise<void> => {
-    function httpRetryable(status: number): boolean {
-      return status === 408 || status === 429 || (status >= 500 && status <= 599);
-    }
     try {
       requireHeaderSecret(req, "x-tasks-secret", TASKS_SECRET.value() || "");
       if (req.method !== "POST") {
@@ -4203,164 +4467,267 @@ export const processFulfillmentTask = onRequest(
         return;
       }
 
-      const { shop, summaryId, jobId, orderId } = (req.body || {}) as {
+      const { businessId, shop, summaryId, jobId, orderId } = (req.body || {}) as {
+        businessId?: string;
         shop?: string;
         summaryId?: string;
         jobId?: string;
         orderId?: string;
       };
-      if (!shop || !summaryId || !jobId || !orderId) {
+
+      if (!businessId || !shop || !summaryId || !jobId || !orderId) {
         res.status(400).json({ error: "bad_payload" });
         return;
       }
 
       const summaryRef = db
-        .collection("accounts")
-        .doc(shop)
+        .collection("users")
+        .doc(businessId)
         .collection("orders_fulfillment_summary")
         .doc(summaryId);
       const jobRef = summaryRef.collection("jobs").doc(jobId);
-      const shopRef = db.collection("accounts").doc(shop);
-      const orderRef = shopRef.collection("orders").doc(String(jobId));
-      const orderData = (await orderRef.get()).data() as any;
-      const shopData = (await shopRef.get()).data() as any;
-      const order = await orderRef.get();
-      let awb = "";
-      let courier = "";
-      if (order.exists) {
-        awb = order.get("awb");
-        courier = order.get("courierProvider");
-      }
 
-      const [accountSnap, jobSnap] = await Promise.all([
-        db.collection("accounts").doc(shop).get(),
-        jobRef.get(),
-      ]);
-
-      if (!accountSnap.exists) {
-        res.status(404).json({ error: "shop_not_found" });
-        return;
-      }
-      const accessToken = accountSnap.get("accessToken");
-      if (!accessToken) {
-        res.status(500).json({ error: "missing_access_token" });
-        return;
-      }
+      // ✅ Get job first to see if we need cleanup
+      const jobSnap = await jobRef.get();
 
       if (!jobSnap.exists) {
-        // Deleted or missing job: ack and move on (idempotency)
+        // Idempotency: job was deleted or never created
         res.json({ noop: true });
         return;
       }
 
       const job = jobSnap.data()!;
+
       if (job.status === "success") {
         res.json({ alreadyDone: true });
         return;
       }
 
-      const MAX_ATTEMPTS = Number(process.env.FULFILLMENT_QUEUE_MAX_ATTEMPTS || 3);
+      function httpRetryable(status: number): boolean {
+        return status === 408 || status === 429 || (status >= 500 && status <= 599);
+      }
 
-      // mark processing + attempt++
-      await Promise.all([
-        jobRef.set(
-          {
-            status: "processing",
-            attempts: FieldValue.increment(1),
-            updatedAt: FieldValue.serverTimestamp(),
-          },
-          { merge: true },
-        ),
-        summaryRef.update({ processing: FieldValue.increment(1) }),
-      ]);
-
-      try {
-        const result = await fulfillOrderOnShopify(shop, accessToken, orderId, awb, courier);
-
+      // ✅ Helper function to mark job as failed and update summary
+      const markJobFailed = async (errorCode: string, errorMessage: string) => {
         await Promise.all([
           jobRef.set(
             {
-              status: "success",
-              fulfillmentId: result.fulfillmentId ?? null,
-              nothingToDo: !!result.nothingToDo,
-              errorCode: FieldValue.delete(),
-              errorMessage: FieldValue.delete(),
+              status: "failed",
+              errorCode,
+              errorMessage: errorMessage.slice(0, 400),
               updatedAt: FieldValue.serverTimestamp(),
             },
             { merge: true },
           ),
           summaryRef.update({
             processing: FieldValue.increment(-1),
-            success: FieldValue.increment(1),
+            failed: FieldValue.increment(1),
           }),
-          orderRef.set(
-            {
-              customStatus: "Dispatched",
-              lastStatusUpdate: FieldValue.serverTimestamp(),
-              customStatusesLogs: FieldValue.arrayUnion({
-                status: "Dispatched",
-                createdAt: Timestamp.now(),
-                remarks: `The order's shipment was dipatched from the warehouse.`,
-              }),
-            },
-            { merge: true },
-          ),
         ]);
-
         await maybeCompleteSummary(summaryRef);
-        sendDispatchedOrderWhatsAppMessage(shopData, orderData);
+      };
 
-        res.json({ ok: true });
-        return;
-      } catch (err: any) {
-        const attempts = (job.attempts ?? 0) + 1;
-        const codeStr: string = err?.code || "UNKNOWN";
-        const httpCode = /^HTTP_(\d+)$/.exec(codeStr)?.[1];
-        const retryable = httpCode ? httpRetryable(Number(httpCode)) : true;
+      // ✅ Now wrap all validation in try-catch
+      try {
+        const shopRef = db.collection("accounts").doc(shop);
+        const orderRef = shopRef.collection("orders").doc(String(jobId));
 
-        if (retryable) {
-          const areAttempsExhausted = attempts >= Number(MAX_ATTEMPTS);
+        const shopDoc = await shopRef.get();
+        if (!shopDoc.exists) {
+          await markJobFailed("shop_not_found", `Shop ${shop} not found`);
+          res.status(404).json({ error: "shop_not_found" });
+          return;
+        }
+
+        const shopData = shopDoc.data() as any;
+
+        const businessDoc = await db.collection("users").doc(businessId).get();
+        if (!businessDoc.exists) {
+          await markJobFailed("business_not_found", `Business ${businessId} not found`);
+          res.status(404).json({ error: "business_not_found" });
+          return;
+        }
+
+        const order = await orderRef.get();
+        if (!order.exists) {
+          await markJobFailed("order_not_found", `Order ${orderId} not found`);
+          res.status(404).json({ error: "order_not_found" });
+          return;
+        }
+
+        const orderData = order.data() as any;
+
+        // ✅ NEW: Check if order is already fulfilled
+        const fulfillmentStatus =
+          orderData?.raw?.fulfillment_status || orderData?.fulfillmentStatus;
+        if (fulfillmentStatus === "fulfilled" || fulfillmentStatus === "partial") {
+          // Order already fulfilled - mark job as success with nothingToDo flag
           await Promise.all([
             jobRef.set(
               {
-                status: areAttempsExhausted ? "failed" : "retrying",
-                errorCode: codeStr,
-                errorMessage: (err?.detail || err?.message || "").slice(0, 400),
+                status: "success",
+                fulfillmentId: null,
+                nothingToDo: true,
+                skipReason: "already_fulfilled",
+                errorCode: FieldValue.delete(),
+                errorMessage: FieldValue.delete(),
                 updatedAt: FieldValue.serverTimestamp(),
               },
               { merge: true },
             ),
-            summaryRef.update(
-              areAttempsExhausted
-                ? { processing: FieldValue.increment(-1), failed: FieldValue.increment(1) }
-                : { processing: FieldValue.increment(-1) },
-            ),
+            summaryRef.update({
+              success: FieldValue.increment(1),
+            }),
           ]);
 
           await maybeCompleteSummary(summaryRef);
-          // 503 tells Cloud Tasks to retry per queue policy
-          res.status(503).json({ retry: true, reason: codeStr });
+
+          res.json({
+            ok: true,
+            alreadyFulfilled: true,
+            message: "Order already fulfilled on Shopify",
+          });
           return;
-        } else {
+        }
+
+        // Check if the shop is exceptional one
+        if (shop === SHARED_STORE_ID) {
+          const businessData = businessDoc.data();
+          const vendorName = businessData?.vendorName;
+          const vendors = orderData?.vendors;
+          const canProcess = BusinessIsAuthorisedToProcessThisOrder(
+            businessId,
+            vendorName,
+            vendors,
+          );
+          if (!canProcess.authorised) {
+            await markJobFailed("not_authorized", `Business not authorized to process this order`);
+            res.status(403).json({ error: "not_authorized_to_process" });
+            return;
+          }
+        }
+
+        const accessToken = shopDoc.get("accessToken");
+        if (!accessToken) {
+          await markJobFailed("missing_access_token", `Access token missing for shop ${shop}`);
+          res.status(500).json({ error: "missing_access_token" });
+          return;
+        }
+
+        let awb = order.get("awb") || "";
+        let courier = order.get("courierProvider") || "";
+
+        const MAX_ATTEMPTS = Number(process.env.FULFILLMENT_QUEUE_MAX_ATTEMPTS || 3);
+
+        // ✅ Mark processing + attempt++
+        await Promise.all([
+          jobRef.set(
+            {
+              status: "processing",
+              attempts: FieldValue.increment(1),
+              updatedAt: FieldValue.serverTimestamp(),
+            },
+            { merge: true },
+          ),
+          summaryRef.update({ processing: FieldValue.increment(1) }),
+        ]);
+
+        // ✅ Try fulfillment
+        try {
+          const result = await fulfillOrderOnShopify(shop, accessToken, orderId, awb, courier);
+
           await Promise.all([
             jobRef.set(
               {
-                status: "failed",
-                errorCode: codeStr,
-                errorMessage: (err?.detail || err?.message || "").slice(0, 400),
+                status: "success",
+                fulfillmentId: result.fulfillmentId ?? null,
+                nothingToDo: !!result.nothingToDo,
+                errorCode: FieldValue.delete(),
+                errorMessage: FieldValue.delete(),
                 updatedAt: FieldValue.serverTimestamp(),
               },
               { merge: true },
             ),
             summaryRef.update({
               processing: FieldValue.increment(-1),
-              failed: FieldValue.increment(1),
+              success: FieldValue.increment(1),
             }),
+            orderRef.set(
+              {
+                customStatus: "Dispatched",
+                lastStatusUpdate: FieldValue.serverTimestamp(),
+                customStatusesLogs: FieldValue.arrayUnion({
+                  status: "Dispatched",
+                  createdAt: Timestamp.now(),
+                  remarks: `The order's shipment was dispatched from the warehouse.`,
+                }),
+              },
+              { merge: true },
+            ),
           ]);
+
           await maybeCompleteSummary(summaryRef);
-          res.json({ failed: true, reason: codeStr });
+          sendDispatchedOrderWhatsAppMessage(shopData, orderData);
+
+          res.json({ ok: true });
           return;
+        } catch (err: any) {
+          // ✅ Fulfillment failure handling
+          const attempts = (job.attempts ?? 0) + 1;
+          const codeStr: string = err?.code || "UNKNOWN";
+          const httpCode = /^HTTP_(\d+)$/.exec(codeStr)?.[1];
+          const retryable = httpCode ? httpRetryable(Number(httpCode)) : true;
+
+          if (retryable) {
+            const areAttempsExhausted = attempts >= Number(MAX_ATTEMPTS);
+            await Promise.all([
+              jobRef.set(
+                {
+                  status: areAttempsExhausted ? "failed" : "retrying",
+                  errorCode: codeStr,
+                  errorMessage: (err?.detail || err?.message || "").slice(0, 400),
+                  updatedAt: FieldValue.serverTimestamp(),
+                },
+                { merge: true },
+              ),
+              summaryRef.update(
+                areAttempsExhausted
+                  ? { processing: FieldValue.increment(-1), failed: FieldValue.increment(1) }
+                  : { processing: FieldValue.increment(-1) },
+              ),
+            ]);
+
+            await maybeCompleteSummary(summaryRef);
+            res.status(503).json({ retry: true, reason: codeStr });
+            return;
+          } else {
+            await Promise.all([
+              jobRef.set(
+                {
+                  status: "failed",
+                  errorCode: codeStr,
+                  errorMessage: (err?.detail || err?.message || "").slice(0, 400),
+                  updatedAt: FieldValue.serverTimestamp(),
+                },
+                { merge: true },
+              ),
+              summaryRef.update({
+                processing: FieldValue.increment(-1),
+                failed: FieldValue.increment(1),
+              }),
+            ]);
+
+            await maybeCompleteSummary(summaryRef);
+            res.json({ failed: true, reason: codeStr });
+            return;
+          }
         }
+      } catch (validationError: any) {
+        // ✅ Catch any unexpected validation errors
+        console.error("Validation error:", validationError);
+        await markJobFailed("validation_error", validationError.message || "Validation failed");
+        res.status(500).json({ error: "validation_failed", details: validationError.message });
+        return;
       }
     } catch (e: any) {
       console.error("processFulfillmentTask error:", e);
@@ -4399,6 +4766,7 @@ function determineNewDelhiveryStatus(status: any): string | null {
     RTO: { DL: "RTO Delivered" },
     DTO: { DL: "DTO Delivered" },
     Lost: { LT: "Lost" },
+    LOST: { LT: "Lost" },
     Closed: { CN: "Closed/Cancelled Conditional" },
     Cancelled: { CN: "Closed/Cancelled Conditional" },
     Canceled: { CN: "Closed/Cancelled Conditional" },
@@ -4426,35 +4794,7 @@ function sleep(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
-// HELPER FUNCTIONS
-async function validateUsers(accountId: string, userIds: string[]): Promise<string[]> {
-  const results = await Promise.all(
-    userIds.map(async (userId) => {
-      try {
-        const userDoc = await db.collection("users").doc(userId).get();
-        if (!userDoc.exists) return null;
-        if (userDoc.get("activeAccountId") !== accountId) return null;
-        return userId;
-      } catch {
-        return null;
-      }
-    }),
-  );
-  return results.filter((id): id is string => id !== null);
-}
-
-async function queueNextChunk(
-  tasksSecret: string,
-  targetUrl: string,
-  params: {
-    accountId: string;
-    userIds: string[];
-    batchId: string;
-    jobId: string;
-    cursor: string;
-    chunkIndex: number;
-  },
-): Promise<void> {
+async function queueNextChunk(tasksSecret: string, targetUrl: string, params: any): Promise<void> {
   await createTask(params, {
     tasksSecret,
     url: targetUrl,
@@ -4575,9 +4915,35 @@ async function sendStatusChangeMessages(updates: OrderUpdate[], shop: any): Prom
   await Promise.allSettled(messagePromises);
 }
 
-// ============================================================================
-// SCHEDULED DELHIVERY STATUS UPDATES
-// ============================================================================
+async function hasActiveShipments(stores: string[]): Promise<boolean> {
+  for (const store of stores) {
+    const snapshot = await db
+      .collection("accounts")
+      .doc(store)
+      .collection("orders")
+      .where("customStatus", "in", [
+        "Dispatched",
+        "In Transit",
+        "Out For Delivery",
+        "RTO In Transit",
+      ])
+      .limit(1)
+      .get();
+
+    if (!snapshot.empty) return true;
+  }
+  return false;
+}
+
+interface BusinessData {
+  stores: string[];
+}
+
+/*
+============================================================================
+SCHEDULED DELHIVERY STATUS UPDATES
+============================================================================
+*/
 
 // 1. SCHEDULER - Enqueues initial tasks (one per account)
 export const enqueueDelhiveryStatusUpdateTasksScheduled = onSchedule(
@@ -4593,47 +4959,37 @@ export const enqueueDelhiveryStatusUpdateTasksScheduled = onSchedule(
     console.log(`Starting scheduled status update batch processing...${event ? "" : ""}`);
 
     try {
-      const usersSnapshot = await db.collection("users").where("activeAccountId", "!=", null).get();
+      console.log("Looking for active businesses, so that redundant updates can be avoided...");
+      // Get all the Business (User) docs
+      const businessesSnapshot = await db.collection("users").get();
 
-      if (usersSnapshot.empty) {
-        console.log("No users with active accounts found");
+      if (businessesSnapshot.empty) {
+        console.log("No users with business found");
         return;
       }
 
-      // Group users by account and filter for Delhivery integration
-      const accountToUsers = new Map<string, string[]>();
-      let totalUsersCount = 0;
-
-      for (const userDoc of usersSnapshot.docs) {
-        const userId = userDoc.id;
-        const activeAccountId = userDoc.get("activeAccountId");
-        if (!activeAccountId) continue;
-
-        try {
-          const accountDoc = await db.collection("accounts").doc(activeAccountId).get();
-          if (!accountDoc.exists) continue;
-
-          const apiKey = accountDoc.data()?.integrations?.couriers?.delhivery?.apiKey;
-          if (apiKey) {
-            if (!accountToUsers.has(activeAccountId)) {
-              accountToUsers.set(activeAccountId, []);
-            }
-            accountToUsers.get(activeAccountId)!.push(userId);
-            totalUsersCount++;
-          }
-        } catch (error) {
-          console.error(`Error checking account ${activeAccountId}:`, error);
+      // Only process businesses that have orders in active shipping states
+      const activeBusinesses = [];
+      for (const doc of businessesSnapshot.docs) {
+        const data = doc.data() as BusinessData;
+        if (data.stores?.length && (await hasActiveShipments(data.stores))) {
+          activeBusinesses.push(doc);
         }
       }
 
-      if (accountToUsers.size === 0) {
-        console.log("No accounts with Delhivery integration found");
-        return;
-      }
-
+      console.log(`Found ${activeBusinesses.length} businesses`);
       console.log(
-        `Found ${accountToUsers.size} accounts with Delhivery (${totalUsersCount} users)`,
+        "Creating the individual batches of the shops, which are within these active businesses...",
       );
+
+      let allShopIds = new Set<{ accountId: string; businessId: string }>();
+      activeBusinesses.forEach((doc) => {
+        const data = doc.data() as BusinessData;
+        data.stores.forEach((acc) => allShopIds.add({ accountId: acc, businessId: doc.id }));
+      });
+
+      console.log(`Found ${allShopIds.size} shops to process.`);
+      console.log("Proceeding to create a batch and enqueueing all the shops as batch's jobs");
 
       // Create batch header
       const batchRef = db.collection("status_update_batches").doc();
@@ -4642,26 +4998,24 @@ export const enqueueDelhiveryStatusUpdateTasksScheduled = onSchedule(
       await batchRef.set({
         createdAt: FieldValue.serverTimestamp(),
         createdBy: "system-scheduled",
-        total: accountToUsers.size,
-        totalUsers: totalUsersCount,
-        queued: accountToUsers.size,
+        queued: allShopIds.size,
         status: "running",
         processing: 0,
         success: 0,
         failed: 0,
         type: "status_update",
         schedule: "6x_daily",
+        courier: "Delhivery",
       });
 
       // Create job documents (one per account)
       const writer = db.bulkWriter();
-      for (const [accountId, userIds] of accountToUsers) {
+      for (const { accountId, businessId } of allShopIds) {
         writer.set(
           batchRef.collection("jobs").doc(accountId),
           {
             accountId,
-            userIds,
-            userCount: userIds.length,
+            businessId,
             status: "queued",
             attempts: 0,
             createdAt: FieldValue.serverTimestamp(),
@@ -4680,11 +5034,11 @@ export const enqueueDelhiveryStatusUpdateTasksScheduled = onSchedule(
       }
 
       // Create initial tasks (chunk 0 for each account)
-      const taskPromises = Array.from(accountToUsers.entries()).map(([accountId, userIds], index) =>
+      const taskPromises = Array.from(allShopIds).map(({ accountId, businessId }, index) =>
         createTask(
           {
             accountId,
-            userIds,
+            businessId,
             batchId,
             jobId: accountId,
             chunkIndex: 0,
@@ -4701,7 +5055,7 @@ export const enqueueDelhiveryStatusUpdateTasksScheduled = onSchedule(
 
       await Promise.all(taskPromises);
 
-      console.log(`Enqueued ${accountToUsers.size} initial tasks for batch ${batchId}`);
+      console.log(`Enqueued ${allShopIds.size} initial tasks for batch ${batchId}`);
     } catch (error) {
       console.error("enqueueStatusUpdateTasks failed:", error);
       throw error;
@@ -4709,7 +5063,7 @@ export const enqueueDelhiveryStatusUpdateTasksScheduled = onSchedule(
   },
 );
 
-// 2. MAIN TASK HANDLER - Processes one chunk and queues next if needed
+/* 2. MAIN TASK HANDLER - Processes one chunk and queues next if needed */
 export const updateDelhiveryStatusesJob = onRequest(
   { cors: true, timeoutSeconds: 540, secrets: [TASKS_SECRET], memory: "512MiB" },
   async (req: Request, res: Response): Promise<void> => {
@@ -4723,21 +5077,21 @@ export const updateDelhiveryStatusesJob = onRequest(
 
       const {
         accountId,
-        userIds,
+        businessId,
         batchId,
         jobId,
         cursor = null,
         chunkIndex = 0,
       } = req.body as {
         accountId?: string;
-        userIds?: string[];
+        businessId?: string;
         batchId?: string;
         jobId?: string;
         cursor?: string | null;
         chunkIndex?: number;
       };
 
-      if (!accountId || !userIds?.length || !batchId || !jobId) {
+      if (!accountId || !businessId || !batchId || !jobId) {
         res.status(400).json({ error: "missing_required_params" });
         return;
       }
@@ -4754,11 +5108,6 @@ export const updateDelhiveryStatusesJob = onRequest(
 
       // Initialize job on first chunk
       if (chunkIndex === 0) {
-        const validUserIds = await validateUsers(accountId, userIds);
-        if (validUserIds.length === 0) {
-          throw new Error("NO_VALID_USERS_FOR_ACCOUNT");
-        }
-
         await db.runTransaction(async (tx: Transaction) => {
           const snap = await tx.get(jobRef);
           const data = snap.data() || {};
@@ -4772,8 +5121,7 @@ export const updateDelhiveryStatusesJob = onRequest(
               attempts: (prevAttempts || 0) + 1,
               lastAttemptAt: FieldValue.serverTimestamp(),
               accountId,
-              userIds: validUserIds,
-              userCount: validUserIds.length,
+              businessId,
               processedOrders: 0,
               updatedOrders: 0,
               totalChunks: 0,
@@ -4788,10 +5136,10 @@ export const updateDelhiveryStatusesJob = onRequest(
       }
 
       // Verify account and get API key
-      const accountDoc = await db.collection("accounts").doc(accountId).get();
-      if (!accountDoc.exists) throw new Error("ACCOUNT_NOT_FOUND");
+      const businessDoc = await db.collection("users").doc(businessId).get();
+      if (!businessDoc.exists) throw new Error("ACCOUNT_NOT_FOUND");
 
-      const apiKey = accountDoc.data()?.integrations?.couriers?.delhivery?.apiKey;
+      const apiKey = businessDoc.data()?.integrations?.couriers?.delhivery?.apiKey;
       if (!apiKey) throw new Error("API_KEY_MISSING");
 
       // Process one chunk of orders
@@ -4813,11 +5161,11 @@ export const updateDelhiveryStatusesJob = onRequest(
           process.env.UPDATE_STATUS_TASK_JOB_TARGET_URL!,
           {
             accountId,
-            userIds,
+            businessId,
             batchId,
             jobId,
-            cursor: result.nextCursor,
             chunkIndex: chunkIndex + 1,
+            cursor: result.nextCursor,
           },
         );
 
@@ -4888,6 +5236,7 @@ async function processDelhiveryOrderChunk(
     "DTO Delivered",
     "Cancellation Requested",
     "Pending Refunds",
+    "DTO Refunded",
   ]);
 
   const shopRef = db.collection("accounts").doc(accountId);
@@ -5110,9 +5459,11 @@ function determineNewShiprocketStatus(currentStatus: string): string | null {
   return statusMap[currentStatus] || null;
 }
 
-// ============================================================================
-// SCHEDULED SHIPROCKET STATUS UPDATES
-// ============================================================================
+/*
+============================================================================
+SCHEDULED SHIPROCKET STATUS UPDATES
+============================================================================
+*/
 
 // 1. SCHEDULER - Enqueues initial tasks (one per account)
 export const enqueueShiprocketStatusUpdateTasksScheduled = onSchedule(
@@ -5125,52 +5476,40 @@ export const enqueueShiprocketStatusUpdateTasksScheduled = onSchedule(
     secrets: [TASKS_SECRET],
   },
   async (event) => {
-    console.log(
-      `Starting scheduled Shiprocket status update batch processing...${event ? "" : ""}`,
-    );
+    console.log(`Starting scheduled status update batch processing...${event ? "" : ""}`);
 
     try {
-      const usersSnapshot = await db.collection("users").where("activeAccountId", "!=", null).get();
+      console.log("Looking for active businesses, so that redundant updates can be avoided...");
+      // Get all the Business (User) docs
+      const businessesSnapshot = await db.collection("users").get();
 
-      if (usersSnapshot.empty) {
-        console.log("No users with active accounts found");
+      if (businessesSnapshot.empty) {
+        console.log("No users with business found");
         return;
       }
 
-      // Group users by account and filter for Shiprocket integration
-      const accountToUsers = new Map<string, string[]>();
-      let totalUsersCount = 0;
-
-      for (const userDoc of usersSnapshot.docs) {
-        const userId = userDoc.id;
-        const activeAccountId = userDoc.get("activeAccountId");
-        if (!activeAccountId) continue;
-
-        try {
-          const accountDoc = await db.collection("accounts").doc(activeAccountId).get();
-          if (!accountDoc.exists) continue;
-
-          const apiKey = accountDoc.data()?.integrations?.couriers?.shiprocket?.apiKey;
-          if (apiKey) {
-            if (!accountToUsers.has(activeAccountId)) {
-              accountToUsers.set(activeAccountId, []);
-            }
-            accountToUsers.get(activeAccountId)!.push(userId);
-            totalUsersCount++;
-          }
-        } catch (error) {
-          console.error(`Error checking account ${activeAccountId}:`, error);
+      // Only process businesses that have orders in active shipping states
+      const activeBusinesses = [];
+      for (const doc of businessesSnapshot.docs) {
+        const data = doc.data() as BusinessData;
+        if (data.stores?.length && (await hasActiveShipments(data.stores))) {
+          activeBusinesses.push(doc);
         }
       }
 
-      if (accountToUsers.size === 0) {
-        console.log("No accounts with Shiprocket integration found");
-        return;
-      }
-
+      console.log(`Found ${activeBusinesses.length} businesses`);
       console.log(
-        `Found ${accountToUsers.size} accounts with Shiprocket (${totalUsersCount} users)`,
+        "Creating the individual batches of the shops, which are within these active businesses...",
       );
+
+      let allShopIds = new Set<{ accountId: string; businessId: string }>();
+      activeBusinesses.forEach((doc) => {
+        const data = doc.data() as BusinessData;
+        data.stores.forEach((acc) => allShopIds.add({ accountId: acc, businessId: doc.id }));
+      });
+
+      console.log(`Found ${allShopIds.size} shops to process.`);
+      console.log("Proceeding to create a batch and enqueueing all the shops as batch's jobs");
 
       // Create batch header
       const batchRef = db.collection("status_update_batches").doc();
@@ -5179,27 +5518,24 @@ export const enqueueShiprocketStatusUpdateTasksScheduled = onSchedule(
       await batchRef.set({
         createdAt: FieldValue.serverTimestamp(),
         createdBy: "system-scheduled",
-        total: accountToUsers.size,
-        totalUsers: totalUsersCount,
-        queued: accountToUsers.size,
+        queued: allShopIds.size,
         status: "running",
         processing: 0,
         success: 0,
         failed: 0,
         type: "status_update",
         schedule: "6x_daily",
-        courier: "shiprocket",
+        courier: "Shiprocket",
       });
 
       // Create job documents (one per account)
       const writer = db.bulkWriter();
-      for (const [accountId, userIds] of accountToUsers) {
+      for (const { accountId, businessId } of allShopIds) {
         writer.set(
           batchRef.collection("jobs").doc(accountId),
           {
             accountId,
-            userIds,
-            userCount: userIds.length,
+            businessId,
             status: "queued",
             attempts: 0,
             createdAt: FieldValue.serverTimestamp(),
@@ -5214,15 +5550,15 @@ export const enqueueShiprocketStatusUpdateTasksScheduled = onSchedule(
 
       const targetUrl = process.env.UPDATE_STATUS_TASK_JOB_TARGET_URL_SHIPROCKET;
       if (!targetUrl) {
-        throw new Error("UPDATE_STATUS_TASK_TARGET_URL_SHIPROCKET not configured");
+        throw new Error("UPDATE_STATUS_TASK_TARGET_URL not configured");
       }
 
       // Create initial tasks (chunk 0 for each account)
-      const taskPromises = Array.from(accountToUsers.entries()).map(([accountId, userIds], index) =>
+      const taskPromises = Array.from(allShopIds).map(({ accountId, businessId }, index) =>
         createTask(
           {
             accountId,
-            userIds,
+            businessId,
             batchId,
             jobId: accountId,
             chunkIndex: 0,
@@ -5239,9 +5575,9 @@ export const enqueueShiprocketStatusUpdateTasksScheduled = onSchedule(
 
       await Promise.all(taskPromises);
 
-      console.log(`Enqueued ${accountToUsers.size} initial tasks for batch ${batchId}`);
+      console.log(`Enqueued ${allShopIds.size} initial tasks for batch ${batchId}`);
     } catch (error) {
-      console.error("enqueueShiprocketStatusUpdateTasks failed:", error);
+      console.error("enqueueStatusUpdateTasks failed:", error);
       throw error;
     }
   },
@@ -5261,21 +5597,21 @@ export const updateShiprocketStatusesJob = onRequest(
 
       const {
         accountId,
-        userIds,
+        businessId,
         batchId,
         jobId,
         cursor = null,
         chunkIndex = 0,
       } = req.body as {
         accountId?: string;
-        userIds?: string[];
+        businessId?: string;
         batchId?: string;
         jobId?: string;
         cursor?: string | null;
         chunkIndex?: number;
       };
 
-      if (!accountId || !userIds?.length || !batchId || !jobId) {
+      if (!accountId || !businessId || !batchId || !jobId) {
         res.status(400).json({ error: "missing_required_params" });
         return;
       }
@@ -5292,11 +5628,6 @@ export const updateShiprocketStatusesJob = onRequest(
 
       // Initialize job on first chunk
       if (chunkIndex === 0) {
-        const validUserIds = await validateUsers(accountId, userIds);
-        if (validUserIds.length === 0) {
-          throw new Error("NO_VALID_USERS_FOR_ACCOUNT");
-        }
-
         await db.runTransaction(async (tx: Transaction) => {
           const snap = await tx.get(jobRef);
           const data = snap.data() || {};
@@ -5310,8 +5641,7 @@ export const updateShiprocketStatusesJob = onRequest(
               attempts: (prevAttempts || 0) + 1,
               lastAttemptAt: FieldValue.serverTimestamp(),
               accountId,
-              userIds: validUserIds,
-              userCount: validUserIds.length,
+              businessId,
               processedOrders: 0,
               updatedOrders: 0,
               totalChunks: 0,
@@ -5326,10 +5656,10 @@ export const updateShiprocketStatusesJob = onRequest(
       }
 
       // Verify account and get API key
-      const accountDoc = await db.collection("accounts").doc(accountId).get();
-      if (!accountDoc.exists) throw new Error("ACCOUNT_NOT_FOUND");
+      const businessDoc = await db.collection("users").doc(businessId).get();
+      if (!businessDoc.exists) throw new Error("ACCOUNT_NOT_FOUND");
 
-      const apiKey = accountDoc.data()?.integrations?.couriers?.shiprocket?.apiKey;
+      const apiKey = businessDoc.data()?.integrations?.couriers?.shiprocket?.apiKey;
       if (!apiKey) throw new Error("API_KEY_MISSING");
 
       // Process one chunk of orders
@@ -5351,11 +5681,11 @@ export const updateShiprocketStatusesJob = onRequest(
           process.env.UPDATE_STATUS_TASK_JOB_TARGET_URL_SHIPROCKET!,
           {
             accountId,
-            userIds,
+            businessId,
             batchId,
             jobId,
-            cursor: result.nextCursor,
             chunkIndex: chunkIndex + 1,
+            cursor: result.nextCursor,
           },
         );
 
@@ -5426,6 +5756,7 @@ async function processShiprocketOrderChunk(
     "DTO Delivered",
     "Cancellation Requested",
     "Pending Refunds",
+    "DTO Refunded",
   ]);
 
   const shopRef = db.collection("accounts").doc(accountId);
@@ -5677,52 +6008,40 @@ export const enqueueXpressbeesStatusUpdateTasksScheduled = onSchedule(
     secrets: [TASKS_SECRET],
   },
   async (event) => {
-    console.log(
-      `Starting scheduled Xpressbees status update batch processing...${event ? "" : ""}`,
-    );
+    console.log(`Starting scheduled status update batch processing...${event ? "" : ""}`);
 
     try {
-      const usersSnapshot = await db.collection("users").where("activeAccountId", "!=", null).get();
+      console.log("Looking for active businesses, so that redundant updates can be avoided...");
+      // Get all the Business (User) docs
+      const businessesSnapshot = await db.collection("users").get();
 
-      if (usersSnapshot.empty) {
-        console.log("No users with active accounts found");
+      if (businessesSnapshot.empty) {
+        console.log("No users with business found");
         return;
       }
 
-      // Group users by account and filter for Xpressbees integration
-      const accountToUsers = new Map<string, string[]>();
-      let totalUsersCount = 0;
-
-      for (const userDoc of usersSnapshot.docs) {
-        const userId = userDoc.id;
-        const activeAccountId = userDoc.get("activeAccountId");
-        if (!activeAccountId) continue;
-
-        try {
-          const accountDoc = await db.collection("accounts").doc(activeAccountId).get();
-          if (!accountDoc.exists) continue;
-
-          const apiKey = accountDoc.data()?.integrations?.couriers?.xpressbees?.apiKey;
-          if (apiKey) {
-            if (!accountToUsers.has(activeAccountId)) {
-              accountToUsers.set(activeAccountId, []);
-            }
-            accountToUsers.get(activeAccountId)!.push(userId);
-            totalUsersCount++;
-          }
-        } catch (error) {
-          console.error(`Error checking account ${activeAccountId}:`, error);
+      // Only process businesses that have orders in active shipping states
+      const activeBusinesses = [];
+      for (const doc of businessesSnapshot.docs) {
+        const data = doc.data() as BusinessData;
+        if (data.stores?.length && (await hasActiveShipments(data.stores))) {
+          activeBusinesses.push(doc);
         }
       }
 
-      if (accountToUsers.size === 0) {
-        console.log("No accounts with Xpressbees integration found");
-        return;
-      }
-
+      console.log(`Found ${activeBusinesses.length} businesses`);
       console.log(
-        `Found ${accountToUsers.size} accounts with Xpressbees (${totalUsersCount} users)`,
+        "Creating the individual batches of the shops, which are within these active businesses...",
       );
+
+      let allShopIds = new Set<{ accountId: string; businessId: string }>();
+      activeBusinesses.forEach((doc) => {
+        const data = doc.data() as BusinessData;
+        data.stores.forEach((acc) => allShopIds.add({ accountId: acc, businessId: doc.id }));
+      });
+
+      console.log(`Found ${allShopIds.size} shops to process.`);
+      console.log("Proceeding to create a batch and enqueueing all the shops as batch's jobs");
 
       // Create batch header
       const batchRef = db.collection("status_update_batches").doc();
@@ -5731,27 +6050,24 @@ export const enqueueXpressbeesStatusUpdateTasksScheduled = onSchedule(
       await batchRef.set({
         createdAt: FieldValue.serverTimestamp(),
         createdBy: "system-scheduled",
-        total: accountToUsers.size,
-        totalUsers: totalUsersCount,
-        queued: accountToUsers.size,
+        queued: allShopIds.size,
         status: "running",
         processing: 0,
         success: 0,
         failed: 0,
         type: "status_update",
         schedule: "6x_daily",
-        courier: "xpressbees",
+        courier: "Xpressbees",
       });
 
       // Create job documents (one per account)
       const writer = db.bulkWriter();
-      for (const [accountId, userIds] of accountToUsers) {
+      for (const { accountId, businessId } of allShopIds) {
         writer.set(
           batchRef.collection("jobs").doc(accountId),
           {
             accountId,
-            userIds,
-            userCount: userIds.length,
+            businessId,
             status: "queued",
             attempts: 0,
             createdAt: FieldValue.serverTimestamp(),
@@ -5766,15 +6082,15 @@ export const enqueueXpressbeesStatusUpdateTasksScheduled = onSchedule(
 
       const targetUrl = process.env.UPDATE_STATUS_TASK_JOB_TARGET_URL_XPRESSBEES;
       if (!targetUrl) {
-        throw new Error("UPDATE_STATUS_TASK_TARGET_URL_XPRESSBEES not configured");
+        throw new Error("UPDATE_STATUS_TASK_TARGET_URL not configured");
       }
 
       // Create initial tasks (chunk 0 for each account)
-      const taskPromises = Array.from(accountToUsers.entries()).map(([accountId, userIds], index) =>
+      const taskPromises = Array.from(allShopIds).map(({ accountId, businessId }, index) =>
         createTask(
           {
             accountId,
-            userIds,
+            businessId,
             batchId,
             jobId: accountId,
             chunkIndex: 0,
@@ -5791,9 +6107,9 @@ export const enqueueXpressbeesStatusUpdateTasksScheduled = onSchedule(
 
       await Promise.all(taskPromises);
 
-      console.log(`Enqueued ${accountToUsers.size} initial tasks for batch ${batchId}`);
+      console.log(`Enqueued ${allShopIds.size} initial tasks for batch ${batchId}`);
     } catch (error) {
-      console.error("enqueueXpressbeesStatusUpdateTasks failed:", error);
+      console.error("enqueueStatusUpdateTasks failed:", error);
       throw error;
     }
   },
@@ -5813,21 +6129,21 @@ export const updateXpressbeesStatusesJob = onRequest(
 
       const {
         accountId,
-        userIds,
+        businessId,
         batchId,
         jobId,
         cursor = null,
         chunkIndex = 0,
       } = req.body as {
         accountId?: string;
-        userIds?: string[];
+        businessId?: string;
         batchId?: string;
         jobId?: string;
         cursor?: string | null;
         chunkIndex?: number;
       };
 
-      if (!accountId || !userIds?.length || !batchId || !jobId) {
+      if (!accountId || !businessId || !batchId || !jobId) {
         res.status(400).json({ error: "missing_required_params" });
         return;
       }
@@ -5844,11 +6160,6 @@ export const updateXpressbeesStatusesJob = onRequest(
 
       // Initialize job on first chunk
       if (chunkIndex === 0) {
-        const validUserIds = await validateUsers(accountId, userIds);
-        if (validUserIds.length === 0) {
-          throw new Error("NO_VALID_USERS_FOR_ACCOUNT");
-        }
-
         await db.runTransaction(async (tx: Transaction) => {
           const snap = await tx.get(jobRef);
           const data = snap.data() || {};
@@ -5862,8 +6173,7 @@ export const updateXpressbeesStatusesJob = onRequest(
               attempts: (prevAttempts || 0) + 1,
               lastAttemptAt: FieldValue.serverTimestamp(),
               accountId,
-              userIds: validUserIds,
-              userCount: validUserIds.length,
+              businessId,
               processedOrders: 0,
               updatedOrders: 0,
               totalChunks: 0,
@@ -5878,11 +6188,11 @@ export const updateXpressbeesStatusesJob = onRequest(
       }
 
       // Verify account and get credentials
-      const accountDoc = await db.collection("accounts").doc(accountId).get();
-      if (!accountDoc.exists) throw new Error("ACCOUNT_NOT_FOUND");
+      const businessDoc = await db.collection("users").doc(businessId).get();
+      if (!businessDoc.exists) throw new Error("ACCOUNT_NOT_FOUND");
 
-      const email = accountDoc.data()?.integrations?.couriers?.xpressbees?.email;
-      const password = accountDoc.data()?.integrations?.couriers?.xpressbees?.password;
+      const email = businessDoc.data()?.integrations?.couriers?.xpressbees?.email;
+      const password = businessDoc.data()?.integrations?.couriers?.xpressbees?.password;
 
       if (!email || !password) throw new Error("CREDENTIALS_MISSING");
 
@@ -5909,11 +6219,11 @@ export const updateXpressbeesStatusesJob = onRequest(
           process.env.UPDATE_STATUS_TASK_JOB_TARGET_URL_XPRESSBEES!,
           {
             accountId,
-            userIds,
+            businessDoc,
             batchId,
             jobId,
-            cursor: result.nextCursor,
             chunkIndex: chunkIndex + 1,
+            cursor: result.nextCursor,
           },
         );
 
@@ -5974,6 +6284,7 @@ export const updateXpressbeesStatusesJob = onRequest(
 );
 
 // 4. CHUNK PROCESSOR
+
 async function processXpressbeesOrderChunk(
   accountId: string,
   token: string,
@@ -5990,6 +6301,7 @@ async function processXpressbeesOrderChunk(
     "DTO Delivered",
     "Cancellation Requested",
     "Pending Refunds",
+    "DTO Refunded",
   ]);
 
   const shopRef = db.collection("accounts").doc(accountId);
@@ -7368,6 +7680,7 @@ async function processOrderIdsChunk(
     "DTO Delivered",
     "Cancellation Requested",
     "Pending Refunds",
+    "DTO Refunded",
   ]);
 
   // Fetch orders in batches (Firestore getAll limit is 500)
@@ -7608,7 +7921,7 @@ async function queueManualUpdateChunk(
 }
 
 // ============================================================================
-// MIGRATION: ADD COURIER PROVIDER FIELDS
+// MIGRATIONS
 // ============================================================================
 
 // Extract provider name from courier string
@@ -7799,33 +8112,161 @@ export const migrateCourierProviders = onRequest(
   },
 );
 
+async function migrateCancelledOrders(accountId: string): Promise<{
+  scanned: number;
+  updated: number;
+  skipped: number;
+}> {
+  const BATCH_SIZE = 500; // Firestore batch write limit
+  let scanned = 0;
+  let updated = 0;
+  let skipped = 0;
+  let lastDoc: QueryDocumentSnapshot | null = null;
+
+  while (true) {
+    // Query orders in chunks
+    let query = db.collection("accounts").doc(accountId).collection("orders").limit(BATCH_SIZE);
+
+    if (lastDoc) {
+      query = query.startAfter(lastDoc);
+    }
+
+    const snapshot = await query.get();
+
+    if (snapshot.empty) {
+      break; // No more orders
+    }
+
+    // Process this batch
+    const batch = db.batch();
+    let batchCount = 0;
+
+    for (const doc of snapshot.docs) {
+      scanned++;
+      const data = doc.data();
+
+      // Check if order is cancelled on Shopify
+      const isCancelled = data.raw?.cancelled_at !== null && data.raw?.cancelled_at !== undefined;
+
+      // Skip if not cancelled or already has Cancelled status
+      if (!isCancelled || data.customStatus === "Cancelled") {
+        skipped++;
+        continue;
+      }
+
+      // Update to Cancelled status
+      batch.update(doc.ref, {
+        customStatus: "Cancelled",
+      });
+      batchCount++;
+      updated++;
+    }
+
+    // Commit batch if there are updates
+    if (batchCount > 0) {
+      await batch.commit();
+      console.log(`  💾 Committed batch: ${batchCount} orders updated to Cancelled`);
+    }
+
+    lastDoc = snapshot.docs[snapshot.docs.length - 1];
+
+    // Progress update
+    if (scanned % 1000 === 0) {
+      console.log(`  📈 Progress: ${scanned} scanned, ${updated} updated`);
+    }
+  }
+
+  return { scanned, updated, skipped };
+}
+
+export const migrateCancelledOrdersStatus = onRequest(
+  {
+    cors: true,
+    timeoutSeconds: 540,
+    memory: "1GiB",
+    region: process.env.LOCATION || "asia-south1",
+    secrets: [ENQUEUE_FUNCTION_SECRET],
+  },
+  async (req: Request, res: Response): Promise<void> => {
+    try {
+      // Add secret protection
+      requireHeaderSecret(req, "x-api-key", ENQUEUE_FUNCTION_SECRET.value() || "");
+
+      console.log("🚀 Starting Cancelled Orders Status Migration...\n");
+
+      const stats: MigrationStats = {
+        accountsProcessed: 0,
+        ordersScanned: 0,
+        ordersUpdated: 0,
+        ordersSkipped: 0,
+        errors: 0,
+      };
+
+      try {
+        // Get all accounts
+        const accountsSnapshot = await db.collection("accounts").get();
+        console.log(`Found ${accountsSnapshot.size} accounts to process\n`);
+
+        // Process each account
+        for (const accountDoc of accountsSnapshot.docs) {
+          const accountId = accountDoc.id;
+          console.log(`\n📦 Processing account: ${accountId}`);
+
+          try {
+            const accountStats = await migrateCancelledOrders(accountId);
+            stats.accountsProcessed++;
+            stats.ordersScanned += accountStats.scanned;
+            stats.ordersUpdated += accountStats.updated;
+            stats.ordersSkipped += accountStats.skipped;
+
+            console.log(
+              `  ✅ Account completed: ${accountStats.updated} updated, ${accountStats.skipped} skipped`,
+            );
+          } catch (error) {
+            stats.errors++;
+            console.error(`  ❌ Error processing account ${accountId}:`, error);
+          }
+
+          // Small delay between accounts to avoid rate limits
+          await sleep(100);
+        }
+
+        // Print final summary
+        console.log("\n" + "=".repeat(60));
+        console.log("📊 MIGRATION SUMMARY");
+        console.log("=".repeat(60));
+        console.log(`Accounts processed: ${stats.accountsProcessed}`);
+        console.log(`Orders scanned:     ${stats.ordersScanned}`);
+        console.log(`Orders updated:     ${stats.ordersUpdated}`);
+        console.log(`Orders skipped:     ${stats.ordersSkipped}`);
+        console.log(`Errors:             ${stats.errors}`);
+        console.log("=".repeat(60));
+        console.log("✨ Migration completed!\n");
+
+        res.json({
+          success: true,
+          summary: stats,
+          message: "Cancelled orders migration completed successfully",
+        });
+      } catch (error) {
+        console.error("\n❌ Migration failed:", error);
+        res.status(500).json({
+          success: false,
+          error: error instanceof Error ? error.message : String(error),
+          stats,
+        });
+      }
+    } catch (authError) {
+      res.status(401).json({ error: `Unauthorized ${authError}` });
+    }
+  },
+);
+
 // functions/src/index.ts
 
 // ============================================================================
 // MIGRATION: ADD VENDORS ARRAY FIELD
 // ============================================================================
-
-/**
- * Extracts unique vendor names from line items
- */
-function extractVendors(lineItems: any[]): string[] {
-  if (!Array.isArray(lineItems) || lineItems.length === 0) {
-    return [];
-  }
-
-  const vendorSet = new Set<string>();
-
-  for (const item of lineItems) {
-    if (item.vendor && typeof item.vendor === "string") {
-      const trimmedVendor = item.vendor.trim();
-      if (trimmedVendor.length > 0) {
-        vendorSet.add(trimmedVendor);
-      }
-    }
-  }
-
-  return Array.from(vendorSet).sort(); // Sort for consistency
-}
 
 interface VendorsMigrationStats {
   accountsProcessed: number;
@@ -7864,25 +8305,7 @@ async function migrateAccountVendors(accountId: string): Promise<{
 
     for (const doc of snapshot.docs) {
       scanned++;
-      const data = doc.data();
-
-      // Skip if already has vendors field
-      if (data.vendors && Array.isArray(data.vendors)) {
-        skipped++;
-        continue;
-      }
-
-      // Extract vendors from line items
-      const lineItems = data.raw?.line_items;
-      if (!lineItems || !Array.isArray(lineItems)) {
-        skipped++;
-        continue;
-      }
-
-      const vendors = extractVendors(lineItems);
-
-      // Add to batch
-      batch.update(doc.ref, { vendors });
+      batch.update(doc.ref, { storeId: accountId });
       batchCount++;
       updated++;
     }
@@ -8033,12 +8456,12 @@ async function initializeAccountMetadata(accountId: string): Promise<{
 
   ordersSnapshot.docs.forEach((doc) => {
     const order = doc.data();
-    const isShopifyCancelled = !!order.raw?.cancelled_at;
+    const isShopifyCancelled = !!order.raw?.cancelled_at && order?.customStatus === "Cancelled";
 
+    allOrdersCount++;
     if (isShopifyCancelled) {
       counts["Cancelled"]++;
     } else {
-      allOrdersCount++;
       const status = order.customStatus || "New";
       if (counts[status] !== undefined) {
         counts[status]++;
@@ -8175,12 +8598,12 @@ export const updateOrderCounts = onDocumentWritten(
         const oldOrder = change.before.data();
         if (!oldOrder) return;
 
-        const oldStatus = oldOrder.raw?.cancelled_at ? "Cancelled" : oldOrder.customStatus || "New";
+        const oldStatus = oldOrder.customStatus || "New";
 
         await metadataRef.set(
           {
             counts: {
-              "All Orders": FieldValue.increment(oldOrder.raw?.cancelled_at ? 0 : -1),
+              "All Orders": FieldValue.increment(-1),
               [oldStatus]: FieldValue.increment(-1),
             },
             lastUpdated: FieldValue.serverTimestamp(),
@@ -8199,12 +8622,12 @@ export const updateOrderCounts = onDocumentWritten(
         const newOrder = change.after.data();
         if (!newOrder) return;
 
-        const newStatus = newOrder.raw?.cancelled_at ? "Cancelled" : newOrder.customStatus || "New";
+        const newStatus = newOrder.customStatus || "New";
 
         await metadataRef.set(
           {
             counts: {
-              "All Orders": FieldValue.increment(newOrder.raw?.cancelled_at ? 0 : 1),
+              "All Orders": FieldValue.increment(1),
               [newStatus]: FieldValue.increment(1),
             },
             lastUpdated: FieldValue.serverTimestamp(),
@@ -8224,8 +8647,8 @@ export const updateOrderCounts = onDocumentWritten(
 
       if (!oldOrder || !newOrder) return;
 
-      const oldStatus = oldOrder.raw?.cancelled_at ? "Cancelled" : oldOrder.customStatus || "New";
-      const newStatus = newOrder.raw?.cancelled_at ? "Cancelled" : newOrder.customStatus || "New";
+      const oldStatus = oldOrder.customStatus || "New";
+      const newStatus = newOrder.customStatus || "New";
 
       // If status hasn't changed, do nothing
       if (oldStatus === newStatus) {
@@ -8233,32 +8656,12 @@ export const updateOrderCounts = onDocumentWritten(
         return;
       }
 
-      // Calculate "All Orders" change
-      const oldWasCancelled = !!oldOrder.raw?.cancelled_at;
-      const newIsCancelled = !!newOrder.raw?.cancelled_at;
-      let allOrdersDelta = 0;
-
-      if (!oldWasCancelled && newIsCancelled) {
-        allOrdersDelta = -1; // Moved to cancelled
-      } else if (oldWasCancelled && !newIsCancelled) {
-        allOrdersDelta = 1; // Moved from cancelled
-      }
-
       // Update counts atomically
       const updates: any = {
         lastUpdated: FieldValue.serverTimestamp(),
+        [`counts.${oldStatus}`]: FieldValue.increment(-1),
+        [`counts.${newStatus}`]: FieldValue.increment(1),
       };
-
-      // Decrement old status
-      updates[`counts.${oldStatus}`] = FieldValue.increment(-1);
-
-      // Increment new status
-      updates[`counts.${newStatus}`] = FieldValue.increment(1);
-
-      // Update "All Orders" if needed
-      if (allOrdersDelta !== 0) {
-        updates["counts.All Orders"] = FieldValue.increment(allOrdersDelta);
-      }
 
       await metadataRef.update(updates);
 
@@ -8275,614 +8678,3 @@ export const updateOrderCounts = onDocumentWritten(
     }
   },
 );
-
-// // ============================================================================
-// // AI CONFIGURATION - Using Vertex AI
-// // ============================================================================
-// const ai = genkit({
-//   plugins: [
-//     vertexAI({
-//       projectId: process.env.GOOGLE_CLOUD_PROJECT ||
-//                  process.env.GCLOUD_PROJECT ||
-//                  process.env.GCP_PROJECT ||
-//                  'orderflow-jnig7', // Fallback
-//       location: 'asia-southeast1', // Singapore - closest to asia-south1
-//     })
-//   ],
-//   model: 'vertexai/gemini-2.0-flash-exp',
-// });
-
-// // Cache for AI results to reduce API calls
-// const addressCache = new Map<string, boolean>();
-
-// // ============================================================================
-// // CONFIGURATION
-// // ============================================================================
-// const GOOD_ADDRESS_KEYWORDS = [
-//   'apartment', 'apt', 'suite', 'unit', 'floor', 'building', 'tower',
-//   'block', 'flat', 'room', '#', 'house', 'street', 'road', 'avenue', 'nagar', 'chowk', 'shop'
-// ];
-
-// // ============================================================================
-// // TYPES
-// // ============================================================================
-// interface OrderData {
-//   customStatus: string;
-//   tags_new?: string[];
-//   raw: {
-//     id: string | number;
-//     total_price: string | number;
-//     total_outstanding: string | number;
-//     customer?: {
-//       id?: string | number;
-//       email?: string;
-//       phone?: string;
-//     };
-//     shipping_address?: {
-//       address1?: string;
-//       address2?: string;
-//     };
-//     line_items?: Array<{
-//       variant_id?: string | number;
-//     }>;
-//   };
-// }
-
-// interface GroupedOrders {
-//   goodAddress: QueryDocumentSnapshot[];
-//   badAddress: QueryDocumentSnapshot[];
-// }
-
-// // ============================================================================
-// // MAIN SCHEDULED FUNCTION
-// // ============================================================================
-// export const processNewOrdersScheduled = onSchedule(
-//   {
-//     schedule: "0 0 * * *", // Daily at 12 AM IST
-//     timeZone: "Asia/Kolkata",
-//     region: process.env.LOCATION || "asia-south1",
-//     memory: "1GiB",
-//     timeoutSeconds: 540,
-//     // No secrets needed - Vertex AI uses Application Default Credentials
-//   },
-//   async () => {
-//     console.log("Starting processNewOrders job");
-
-//     try {
-//       // Process orders for each account
-//       const accountsSnapshot = await db.collection("accounts").get();
-
-//       for (const accountDoc of accountsSnapshot.docs) {
-//         const accountId = accountDoc.id;
-//         console.log(`Processing account: ${accountId}`);
-
-//         try {
-//           await processAccountOrders(accountId);
-//         } catch (error) {
-//           console.error(`Error processing account ${accountId}:`, error);
-//           // Continue with other accounts
-//         }
-//       }
-
-//       console.log("Job completed successfully");
-//     } catch (error) {
-//       console.error("processNewOrders job failed:", error);
-//       throw error;
-//     }
-//   }
-// );
-
-// // ============================================================================
-// // PROCESS ORDERS FOR A SINGLE ACCOUNT
-// // ============================================================================
-// async function processAccountOrders(accountId: string): Promise<void> {
-//   // 1. Fetch eligible orders for this account
-//   const eligibleOrders = await fetchEligibleOrders(accountId);
-
-//   if (eligibleOrders.length === 0) {
-//     console.log(`No eligible orders found for account ${accountId}`);
-//     return;
-//   }
-
-//   console.log(`Found ${eligibleOrders.length} eligible orders for account ${accountId}`);
-
-//   // 2. Split by address quality
-//   const { goodAddress, badAddress } = await splitByAddressQuality(eligibleOrders);
-//   console.log(`Account ${accountId} - Good addresses: ${goodAddress.length}, Bad addresses: ${badAddress.length}`);
-
-//   // 3. Process good address orders
-//   await processGoodAddressOrders(goodAddress, accountId);
-
-//   // 4. Process bad address orders
-//   await processBadAddressOrders(badAddress, accountId);
-// }
-
-// // ============================================================================
-// // STEP 1: FETCH ELIGIBLE ORDERS
-// // ============================================================================
-// async function fetchEligibleOrders(accountId: string): Promise<QueryDocumentSnapshot[]> {
-//   try {
-//     const snapshot = await db
-//       .collection("accounts")
-//       .doc(accountId)
-//       .collection("orders")
-//       .where("customStatus", "==", "New")
-//       .get();
-
-//     // Filter for total_price == total_outstanding
-//     const eligible = snapshot.docs.filter((doc: QueryDocumentSnapshot) => {
-//       try {
-//         const data = doc.data() as OrderData;
-//         const totalPrice = parseFloat(String(data.raw?.total_price || 0));
-//         const totalOutstanding = parseFloat(String(data.raw?.total_outstanding || 0));
-//         return totalPrice === totalOutstanding && totalPrice > 0;
-//       } catch (error) {
-//         console.error(`Error parsing prices for order ${doc.id}:`, error);
-//         return false;
-//       }
-//     });
-
-//     return eligible;
-//   } catch (error) {
-//     console.error(`Error fetching orders for account ${accountId}:`, error);
-//     throw new Error(`Failed to fetch orders: ${error}`);
-//   }
-// }
-
-// // ============================================================================
-// // STEP 2: SPLIT BY ADDRESS QUALITY (AI-POWERED)
-// // ============================================================================
-// async function splitByAddressQuality(orders: QueryDocumentSnapshot[]): Promise<GroupedOrders> {
-//   const goodAddress: QueryDocumentSnapshot[] = [];
-//   const badAddress: QueryDocumentSnapshot[] = [];
-
-//   // Process addresses with some concurrency control
-//   const BATCH_SIZE = 10; // Process 10 addresses at a time to avoid rate limits
-
-//   for (let i = 0; i < orders.length; i += BATCH_SIZE) {
-//     const batch = orders.slice(i, i + BATCH_SIZE);
-
-//     await Promise.all(
-//       batch.map(async (doc: QueryDocumentSnapshot) => {
-//         try {
-//           const data = doc.data() as OrderData;
-//           const address1 = data.raw?.shipping_address?.address1?.toLowerCase() || "";
-//           const address2 = data.raw?.shipping_address?.address2?.toLowerCase() || "";
-//           const fullAddress = `${address1} ${address2}`.trim();
-
-//           const isGood = await isGoodAddress(fullAddress);
-
-//           if (isGood) {
-//             goodAddress.push(doc);
-//           } else {
-//             badAddress.push(doc);
-//           }
-//         } catch (error) {
-//           console.error(`Error evaluating address for order ${doc.id}:`, error);
-//           badAddress.push(doc); // Default to bad address on error
-//         }
-//       })
-//     );
-//   }
-
-//   return { goodAddress, badAddress };
-// }
-
-// // Helper function to get customer identifier
-// function getCustomerIdentifier(data: OrderData): string {
-//   // Try customer ID first (most reliable)
-//   if (data.raw?.customer?.id) {
-//     return `customer_${data.raw.customer.id}`;
-//   }
-
-//   // Fallback to email
-//   if (data.raw?.customer?.email) {
-//     return `email_${data.raw.customer.email.toLowerCase()}`;
-//   }
-
-//   // Fallback to phone (normalize it)
-//   if (data.raw?.customer?.phone) {
-//     const phone = data.raw.customer.phone.replace(/\D/g, ''); // Remove non-digits
-//     return `phone_${phone}`;
-//   }
-
-//   // No customer info - treat each order as unique customer
-//   return `unknown_${data.raw.id}`;
-// }
-
-// async function isGoodAddress(address: string): Promise<boolean> {
-//   if (!address || address.length < 10) return false;
-
-//   // Check cache first
-//   if (addressCache.has(address)) {
-//     return addressCache.get(address)!;
-//   }
-
-//   try {
-//     // Use Vertex AI to evaluate address quality
-//     const { text } = await ai.generate({
-//       model: 'vertexai/gemini-2.0-flash-exp',
-//       prompt: `You are an address quality evaluator for an e-commerce fulfillment system.
-
-// Analyze this shipping address and determine if it's sufficiently detailed for delivery:
-
-// Address: "${address}"
-
-// A GOOD address should have:
-// - Specific building/house number
-// - Clear location identifiers (apartment, suite, floor, etc.)
-// - Street/road name
-// - Enough detail for a delivery person to find the location
-
-// A BAD address is:
-// - Vague or incomplete
-// - Missing building/house numbers
-// - Only has area/locality without specific location
-// - Too short or generic
-
-// Respond with ONLY one word: "GOOD" or "BAD"`,
-//     });
-
-//     const result = text.trim().toUpperCase();
-//     const isGood = result === "GOOD";
-
-//     // Cache the result
-//     addressCache.set(address, isGood);
-
-//     return isGood;
-//   } catch (error) {
-//     console.error(`AI address evaluation failed for "${address}":`, error);
-
-//     // Fallback to keyword-based logic if AI fails
-//     return fallbackAddressCheck(address);
-//   }
-// }
-
-// // Fallback function if AI fails
-// function fallbackAddressCheck(address: string): boolean {
-//   if (!address || address.length < 10) return false;
-
-//   // Check for good address indicators
-//   const hasGoodKeyword = GOOD_ADDRESS_KEYWORDS.some((keyword) =>
-//     address.includes(keyword.toLowerCase())
-//   );
-
-//   // Check for numbers (house/building numbers)
-//   const hasNumbers = /\d/.test(address);
-
-//   // Check minimum length and structure
-//   const hasMinimumWords = address.split(/\s+/).length >= 3;
-
-//   return hasGoodKeyword && hasNumbers && hasMinimumWords;
-// }
-
-// // ============================================================================
-// // STEP 3: PROCESS GOOD ADDRESS ORDERS
-// // ============================================================================
-// async function processGoodAddressOrders(
-//   orders: QueryDocumentSnapshot[],
-//   accountId: string
-// ): Promise<void> {
-//   if (orders.length === 0) return;
-
-//   console.log(`Processing ${orders.length} good address orders for account ${accountId}`);
-
-//   try {
-//     const groups = groupOrdersByVariantId(orders);
-//     console.log(`Good address: Created ${groups.length} groups`);
-
-//     for (const group of groups) {
-//       try {
-//         if (group.length === 1) {
-//           // Single order: Confirm it
-//           await updateOrderStatus(group[0], "Confirmed");
-//           console.log(`Confirmed single order: ${group[0].id}`);
-//         } else {
-//           // Multiple orders: Keep latest, cancel rest
-//           const sorted = sortByOrderId(group);
-//           const latest = sorted[0];
-//           const toCancel = sorted.slice(1);
-
-//           await updateOrderStatus(latest, "Confirmed");
-//           console.log(`Confirmed latest order: ${latest.id}`);
-
-//           await cancelOrdersOnShopify(toCancel, accountId);
-//         }
-//       } catch (error) {
-//         console.error(`Error processing good address group:`, error);
-//       }
-//     }
-//   } catch (error) {
-//     console.error("Error in processGoodAddressOrders:", error);
-//     throw error;
-//   }
-// }
-
-// // ============================================================================
-// // STEP 4: PROCESS BAD ADDRESS ORDERS
-// // ============================================================================
-// async function processBadAddressOrders(
-//   orders: QueryDocumentSnapshot[],
-//   accountId: string
-// ): Promise<void> {
-//   if (orders.length === 0) return;
-
-//   console.log(`Processing ${orders.length} bad address orders for account ${accountId}`);
-
-//   try {
-//     const groups = groupOrdersByVariantId(orders);
-//     console.log(`Bad address: Created ${groups.length} groups`);
-
-//     for (const group of groups) {
-//       try {
-//         if (group.length === 1) {
-//           // Single order: Add L3 tag
-//           await addTagToOrder(group[0], "L3");
-//           console.log(`Added L3 tag to order: ${group[0].id}`);
-//         } else {
-//           // Multiple orders: Add L1 to latest, cancel rest
-//           const sorted = sortByOrderId(group);
-//           const latest = sorted[0];
-//           const toCancel = sorted.slice(1);
-
-//           await addTagToOrder(latest, "L1");
-//           console.log(`Added L1 tag to order: ${latest.id}`);
-
-//           await cancelOrdersOnShopify(toCancel, accountId);
-//         }
-//       } catch (error) {
-//         console.error(`Error processing bad address group:`, error);
-//       }
-//     }
-//   } catch (error) {
-//     console.error("Error in processBadAddressOrders:", error);
-//     throw error;
-//   }
-// }
-
-// // ============================================================================
-// // UTILITY: GROUP BY CUSTOMER, THEN BY VARIANT_ID (UNION-FIND)
-// // ============================================================================
-// function groupOrdersByVariantId(orders: QueryDocumentSnapshot[]): QueryDocumentSnapshot[][] {
-//   if (orders.length === 0) return [];
-
-//   // STEP 1: Group orders by customer first
-//   const ordersByCustomer = new Map<string, QueryDocumentSnapshot[]>();
-
-//   orders.forEach((doc: QueryDocumentSnapshot) => {
-//     const data = doc.data() as OrderData;
-//     const customerId = getCustomerIdentifier(data);
-
-//     if (!ordersByCustomer.has(customerId)) {
-//       ordersByCustomer.set(customerId, []);
-//     }
-//     ordersByCustomer.get(customerId)!.push(doc);
-//   });
-
-//   console.log(`Found ${ordersByCustomer.size} unique customers in ${orders.length} orders`);
-
-//   // STEP 2: For each customer, group their orders by shared variants
-//   const allGroups: QueryDocumentSnapshot[][] = [];
-
-//   ordersByCustomer.forEach((customerOrders: QueryDocumentSnapshot[], customerId: string) => {
-//     if (customerOrders.length === 1) {
-//       // Single order for this customer - no grouping needed
-//       allGroups.push(customerOrders);
-//       return;
-//     }
-
-//     console.log(`Customer ${customerId} has ${customerOrders.length} orders - checking for duplicates`);
-
-//     // Group this customer's orders by variant_id
-//     const customerGroups = groupCustomerOrdersByVariants(customerOrders);
-//     allGroups.push(...customerGroups);
-//   });
-
-//   return allGroups;
-// }
-
-// // Helper function to group a single customer's orders by shared variants
-// function groupCustomerOrdersByVariants(orders: QueryDocumentSnapshot[]): QueryDocumentSnapshot[][] {
-//   if (orders.length === 0) return [];
-//   if (orders.length === 1) return [orders];
-
-//   const variantToIndices = new Map<string, number[]>();
-
-//   orders.forEach((doc: QueryDocumentSnapshot, idx: number) => {
-//     try {
-//       const data = doc.data() as OrderData;
-//       const lineItems = data.raw?.line_items || [];
-
-//       lineItems.forEach((item) => {
-//         const variantId = item.variant_id;
-//         if (variantId) {
-//           const key = String(variantId);
-//           if (!variantToIndices.has(key)) {
-//             variantToIndices.set(key, []);
-//           }
-//           variantToIndices.get(key)!.push(idx);
-//         }
-//       });
-//     } catch (error) {
-//       console.error(`Error processing line items for order ${doc.id}:`, error);
-//     }
-//   });
-
-//   // Union-Find to group orders with shared variants
-//   const parent = Array.from({ length: orders.length }, (_: any, i: number) => i);
-
-//   function find(x: number): number {
-//     if (parent[x] !== x) {
-//       parent[x] = find(parent[x]);
-//     }
-//     return parent[x];
-//   }
-
-//   function union(x: number, y: number): void {
-//     const rootX = find(x);
-//     const rootY = find(y);
-//     if (rootX !== rootY) {
-//       parent[rootY] = rootX;
-//     }
-//   }
-
-//   variantToIndices.forEach((indices: number[]) => {
-//     for (let i = 1; i < indices.length; i++) {
-//       union(indices[0], indices[i]);
-//     }
-//   });
-
-//   // Group by root
-//   const groups = new Map<number, QueryDocumentSnapshot[]>();
-//   orders.forEach((doc: QueryDocumentSnapshot, idx: number) => {
-//     const root = find(idx);
-//     if (!groups.has(root)) {
-//       groups.set(root, []);
-//     }
-//     groups.get(root)!.push(doc);
-//   });
-
-//   return Array.from(groups.values());
-// }
-
-// // ============================================================================
-// // UTILITY: SORT BY ORDER ID (LATEST FIRST)
-// // ============================================================================
-// function sortByOrderId(orders: QueryDocumentSnapshot[]): QueryDocumentSnapshot[] {
-//   return [...orders].sort((a: QueryDocumentSnapshot, b: QueryDocumentSnapshot) => {
-//     try {
-//       const aId = (a.data() as OrderData).raw.id;
-//       const bId = (b.data() as OrderData).raw.id;
-//       return Number(bId) - Number(aId); // Descending (latest first)
-//     } catch (error) {
-//       console.error("Error sorting orders:", error);
-//       return 0;
-//     }
-//   });
-// }
-
-// // ============================================================================
-// // UTILITY: UPDATE ORDER STATUS
-// // ============================================================================
-// async function updateOrderStatus(
-//   doc: QueryDocumentSnapshot,
-//   newStatus: string
-// ): Promise<void> {
-//   try {
-//     await doc.ref.update({
-//       customStatus: newStatus,
-//       lastStatusUpdate: FieldValue.serverTimestamp(),
-//       customStatusesLogs: FieldValue.arrayUnion({
-//         status: newStatus,
-//         createdAt: Timestamp.now(),
-//         remarks: `Status changed to ${newStatus} by automated grouping`,
-//       }),
-//     });
-//   } catch (error) {
-//     console.error(`Failed to update status for order ${doc.id}:`, error);
-//     throw error;
-//   }
-// }
-
-// // ============================================================================
-// // UTILITY: ADD TAG TO ORDER
-// // ============================================================================
-// async function addTagToOrder(
-//   doc: QueryDocumentSnapshot,
-//   tag: string
-// ): Promise<void> {
-//   try {
-//     const data = doc.data() as OrderData;
-//     const existingTags = data.tags_new || [];
-
-//     if (!existingTags.includes(tag)) {
-//       await doc.ref.update({
-//         tags_new: FieldValue.arrayUnion(tag),
-//         lastTagUpdate: FieldValue.serverTimestamp(),
-//       });
-//     }
-//   } catch (error) {
-//     console.error(`Failed to add tag to order ${doc.id}:`, error);
-//     throw error;
-//   }
-// }
-
-// // ============================================================================
-// // UTILITY: CANCEL ORDERS ON SHOPIFY
-// // ============================================================================
-// async function cancelOrdersOnShopify(
-//   orders: QueryDocumentSnapshot[],
-//   accountId: string
-// ): Promise<void> {
-//   if (orders.length === 0) return;
-
-//   console.log(`Cancelling ${orders.length} orders on Shopify`);
-
-//   try {
-//     // Get account credentials once for all orders
-//     const accountDoc = await db.collection("accounts").doc(accountId).get();
-
-//     if (!accountDoc.exists) {
-//       throw new Error(`Account ${accountId} not found`);
-//     }
-
-//     const accountData = accountDoc.data();
-//     const accessToken = accountData?.accessToken;
-//     const shop = accountId; // The accountId is typically the shop domain
-
-//     if (!accessToken || !shop) {
-//       throw new Error(`Shopify not configured for account ${accountId}`);
-//     }
-
-//     // Cancel each order
-//     for (const doc of orders) {
-//       try {
-//         const data = doc.data() as OrderData;
-//         const shopifyOrderId = data.raw.id;
-
-//         // Cancel order via Shopify API using fetch
-//         const response = await fetch(
-//           `https://${shop}/admin/api/2024-10/orders/${shopifyOrderId}/cancel.json`,
-//           {
-//             method: 'POST',
-//             headers: {
-//               'X-Shopify-Access-Token': accessToken,
-//               'Content-Type': 'application/json',
-//             },
-//             body: JSON.stringify({
-//               reason: 'fraud',
-//               email: false,
-//               refund: false,
-//             }),
-//           }
-//         );
-
-//         if (!response.ok) {
-//           const errorText = await response.text();
-//           throw new Error(`Shopify API error ${response.status}: ${errorText}`);
-//         }
-
-//         // Update Firestore
-//         await doc.ref.update({
-//           customStatus: "Cancelled",
-//           cancelledAt: FieldValue.serverTimestamp(),
-//           cancelReason: "Duplicate order - automated cancellation",
-//           lastStatusUpdate: FieldValue.serverTimestamp(),
-//           customStatusesLogs: FieldValue.arrayUnion({
-//             status: "Cancelled",
-//             createdAt: Timestamp.now(),
-//             remarks: "Duplicate order - automated cancellation",
-//           }),
-//         });
-
-//         console.log(`Cancelled order ${doc.id} (Shopify ID: ${shopifyOrderId})`);
-//       } catch (error) {
-//         console.error(`Failed to cancel order ${doc.id}:`, error);
-//         // Continue with other orders even if one fails
-//       }
-//     }
-//   } catch (error) {
-//     console.error(`Error getting account credentials for ${accountId}:`, error);
-//     throw error;
-//   }
-// }
