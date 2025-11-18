@@ -3397,7 +3397,7 @@ export const processOrderSplitJob = onRequest(
             quantity: jobData.product_quantity,
           };
         });
-        sendSplitOrdersWhatsAppMessage(shopDoc, oldOrder, newOrders);
+        await sendSplitOrdersWhatsAppMessage(shopDoc, oldOrder, newOrders);
 
         console.log(`✓ Original order updated with split results`);
       }
@@ -4126,7 +4126,7 @@ export const processReturnShipmentTask = onRequest(
       });
 
       await maybeCompleteBatch(batchRef);
-      sendDTOBookedOrderWhatsAppMessage(shopData, orderData);
+      await sendDTOBookedOrderWhatsAppMessage(shopData, orderData);
 
       res.json({ ok: true, awb, carrierShipmentId: verdict.carrierShipmentId ?? null });
       return;
@@ -4667,7 +4667,7 @@ export const processFulfillmentTask = onRequest(
           ]);
 
           await maybeCompleteSummary(summaryRef);
-          sendDispatchedOrderWhatsAppMessage(shopData, orderData);
+          await sendDispatchedOrderWhatsAppMessage(shopData, orderData);
 
           res.json({ ok: true });
           return;
@@ -4902,7 +4902,7 @@ async function sendStatusChangeMessages(updates: OrderUpdate[], shop: any): Prom
       const order = orderDoc.data() as any;
 
       // Send the message
-      messageFn(shop, order);
+      await messageFn(shop, order);
 
       console.log(`Sent ${newStatus} message for order ${orderDoc.id}`);
     } catch (error) {
