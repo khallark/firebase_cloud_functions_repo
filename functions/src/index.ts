@@ -2809,10 +2809,33 @@ export const enqueueOrderSplitBatch = onRequest(
       const jobPromises = vendorGroups.map(async (group, index) => {
         const jobRef = batchRef.collection("jobs").doc();
 
-        // Calculate proportional discount for this vendor group
-        const proportionalDiscount = hasDiscount
-          ? calculateProportionalDiscount(originalSubtotal, originalTotalDiscount, group.subtotal)
-          : 0;
+        let proportionalDiscount = 0;
+
+        if (hasDiscount) {
+          if (index === vendorGroups.length - 1) {
+            // LAST SPLIT: Gets remainder to ensure exact sum
+            const sumOfPreviousDiscounts = vendorGroups.slice(0, index).reduce((sum, g) => {
+              const d = calculateProportionalDiscount(
+                originalSubtotal,
+                originalTotalDiscount,
+                g.subtotal,
+              );
+              return sum + d;
+            }, 0);
+
+            proportionalDiscount = originalTotalDiscount - sumOfPreviousDiscounts;
+            console.log(
+              `  💰 Last split gets remainder discount: ₹${proportionalDiscount.toFixed(2)}`,
+            );
+          } else {
+            // FIRST/MIDDLE SPLITS: Calculate and round normally
+            proportionalDiscount = calculateProportionalDiscount(
+              originalSubtotal,
+              originalTotalDiscount,
+              group.subtotal,
+            );
+          }
+        }
 
         const jobData = {
           vendorName: group.vendor,
@@ -2824,13 +2847,13 @@ export const enqueueOrderSplitBatch = onRequest(
           tax: group.tax,
           total: group.total,
           totalWeight: group.totalWeight,
-          proportionalDiscount,
+          proportionalDiscount, // ← Now guaranteed to sum exactly
           attempts: 0,
           createdAt: FieldValue.serverTimestamp(),
         };
         await jobRef.set(jobData);
         console.log(
-          `  ✓ Job ${index + 1}/${vendorGroups.length}: ${group.vendor} (₹${group.total.toFixed(2)})`,
+          `  ✓ Job ${index + 1}/${vendorGroups.length}: ${group.vendor} (₹${group.total.toFixed(2)}, discount: ₹${proportionalDiscount.toFixed(2)})`,
         );
         return jobRef.id;
       });
@@ -4984,8 +5007,26 @@ export const enqueueDelhiveryStatusUpdateTasksScheduled = onSchedule(
 
       let allShopIds = new Set<{ accountId: string; businessId: string }>();
       activeBusinesses.forEach((doc) => {
+        if (!doc.id) {
+          console.error("⚠️ Found document without ID in activeBusinesses:", doc.ref.path);
+          return; // Skip this document
+        }
+
         const data = doc.data() as BusinessData;
-        data.stores.forEach((acc) => allShopIds.add({ accountId: acc, businessId: doc.id }));
+        data.stores.forEach((acc) => {
+          if (!acc) {
+            console.error(`⚠️ Found undefined store in business ${doc.id}`);
+            return;
+          }
+
+          if (acc === SHARED_STORE_ID) {
+            if (doc.id === SUPER_ADMIN_ID) {
+              allShopIds.add({ accountId: acc, businessId: doc.id });
+            }
+          } else {
+            allShopIds.add({ accountId: acc, businessId: doc.id });
+          }
+        });
       });
 
       console.log(`Found ${allShopIds.size} shops to process.`);
@@ -5504,8 +5545,26 @@ export const enqueueShiprocketStatusUpdateTasksScheduled = onSchedule(
 
       let allShopIds = new Set<{ accountId: string; businessId: string }>();
       activeBusinesses.forEach((doc) => {
+        if (!doc.id) {
+          console.error("⚠️ Found document without ID in activeBusinesses:", doc.ref.path);
+          return; // Skip this document
+        }
+
         const data = doc.data() as BusinessData;
-        data.stores.forEach((acc) => allShopIds.add({ accountId: acc, businessId: doc.id }));
+        data.stores.forEach((acc) => {
+          if (!acc) {
+            console.error(`⚠️ Found undefined store in business ${doc.id}`);
+            return;
+          }
+
+          if (acc === SHARED_STORE_ID) {
+            if (doc.id === SUPER_ADMIN_ID) {
+              allShopIds.add({ accountId: acc, businessId: doc.id });
+            }
+          } else {
+            allShopIds.add({ accountId: acc, businessId: doc.id });
+          }
+        });
       });
 
       console.log(`Found ${allShopIds.size} shops to process.`);
@@ -6036,9 +6095,30 @@ export const enqueueXpressbeesStatusUpdateTasksScheduled = onSchedule(
 
       let allShopIds = new Set<{ accountId: string; businessId: string }>();
       activeBusinesses.forEach((doc) => {
+        if (!doc.id) {
+          console.error("⚠️ Found document without ID in activeBusinesses:", doc.ref.path);
+          return; // Skip this document
+        }
+
         const data = doc.data() as BusinessData;
-        data.stores.forEach((acc) => allShopIds.add({ accountId: acc, businessId: doc.id }));
+        data.stores.forEach((acc) => {
+          if (!acc) {
+            console.error(`⚠️ Found undefined store in business ${doc.id}`);
+            return;
+          }
+
+          if (acc === SHARED_STORE_ID) {
+            if (doc.id === SUPER_ADMIN_ID) {
+              allShopIds.add({ accountId: acc, businessId: doc.id });
+            }
+          } else {
+            allShopIds.add({ accountId: acc, businessId: doc.id });
+          }
+        });
       });
+
+      // Option 1: Convert to array and log (most readable)
+      console.log("All shop IDs:", JSON.stringify(Array.from(allShopIds.values()), null, 2));
 
       console.log(`Found ${allShopIds.size} shops to process.`);
       console.log("Proceeding to create a batch and enqueueing all the shops as batch's jobs");
@@ -6143,6 +6223,7 @@ export const updateXpressbeesStatusesJob = onRequest(
         chunkIndex?: number;
       };
 
+      console.error(accountId, businessId, batchId, jobId);
       if (!accountId || !businessId || !batchId || !jobId) {
         res.status(400).json({ error: "missing_required_params" });
         return;
@@ -6219,7 +6300,7 @@ export const updateXpressbeesStatusesJob = onRequest(
           process.env.UPDATE_STATUS_TASK_JOB_TARGET_URL_XPRESSBEES!,
           {
             accountId,
-            businessDoc,
+            businessId,
             batchId,
             jobId,
             chunkIndex: chunkIndex + 1,
