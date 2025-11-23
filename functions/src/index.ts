@@ -4601,6 +4601,18 @@ export const processFulfillmentTask = onRequest(
             summaryRef.update({
               success: FieldValue.increment(1),
             }),
+            orderRef.set(
+              {
+                customStatus: "Dispatched",
+                lastStatusUpdate: FieldValue.serverTimestamp(),
+                customStatusesLogs: FieldValue.arrayUnion({
+                  status: "Dispatched",
+                  createdAt: Timestamp.now(),
+                  remarks: `The order's shipment was dispatched from the warehouse.`,
+                }),
+              },
+              { merge: true },
+            ),
           ]);
 
           await maybeCompleteSummary(summaryRef);
