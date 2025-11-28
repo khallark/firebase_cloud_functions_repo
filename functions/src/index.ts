@@ -2631,11 +2631,13 @@ export const enqueueOrderSplitBatch = onRequest(
       };
 
       if (!shop || !orderId || !requestedBy) {
+        console.error("missing_shop_or_orderId");
         res.status(400).json({ error: "missing_shop_or_orderId" });
         return;
       }
 
       if (shop !== SHARED_STORE_ID) {
+        console.error("invalid_shop_order_for_splitting");
         res.status(403).json({ error: "invalid_shop_order_for_splitting" });
         return;
       }
@@ -2657,6 +2659,7 @@ export const enqueueOrderSplitBatch = onRequest(
       const originalOrder = orderData.raw;
 
       if (orderData.customStatus !== "New") {
+        console.log("cannot_perform_splitting_on_any_status_but_new");
         res.status(403).json({ error: "cannot_perform_splitting_on_any_status_but_new" });
         return;
       }
@@ -2932,6 +2935,7 @@ export const processOrderSplitJob = onRequest(
       };
 
       if (!shop || !batchId || !jobId) {
+        console.log("missing_params");
         res.status(400).json({ error: "missing_params" });
         return;
       }
