@@ -1657,3 +1657,57 @@ export async function sendConfirmedDelayedOrdersPDFWhatsAppMessage(
     return null;
   }
 }
+
+/**
+ * Send WhatsApp message with Excel download link
+ */
+export async function sendSharedStoreOrdersExcelWhatsAppMessage(
+  shop: any,
+  downloadUrl: string,
+  phone: string,
+): Promise<void> {
+  try {
+    const message =
+      `📊 *Shared Store Orders Report*\n\n` +
+      `Your Excel file containing all orders from the shared store is ready!\n\n` +
+      `📥 Download: ${downloadUrl}\n\n` +
+      `Generated on: ${new Date().toLocaleDateString("en-GB")}\n\n` +
+      `Thank you for using Majime! 🎉`;
+
+    const accessToken = shop?.whatsappAccessToken;
+    const phoneNumberId = shop?.whatsappPhoneNumberId;
+
+    if (!accessToken || !phoneNumberId) {
+      console.warn("WhatsApp credentials not configured, skipping message");
+      return;
+    }
+
+    const response = await fetch(`https://graph.facebook.com/v24.0/${phoneNumberId}/messages`, {
+      method: "POST",
+      headers: {
+        Authorization: `Bearer ${accessToken}`,
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({
+        messaging_product: "whatsapp",
+        to: phone,
+        type: "text",
+        text: {
+          preview_url: true,
+          body: message,
+        },
+      }),
+    });
+
+    if (!response.ok) {
+      const errorText = await response.text();
+      console.error(
+        `Failed to send WhatsApp message to ${phone}: ${response.status} - ${errorText}`,
+      );
+    } else {
+      console.log(`✅ WhatsApp message sent successfully to ${phone}`);
+    }
+  } catch (error) {
+    console.error(`Error sending WhatsApp message to ${phone}:`, error);
+  }
+}

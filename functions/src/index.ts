@@ -39,9 +39,11 @@ import {
   sendOutForDeliveryOrderWhatsAppMessage,
   sendRTODeliveredOrderWhatsAppMessage,
   sendRTOInTransitOrderWhatsAppMessage,
+  sendSharedStoreOrdersExcelWhatsAppMessage,
   sendSplitOrdersWhatsAppMessage,
 } from "./whatsappMessagesSendingFuncs";
 import PDFDocument from "pdfkit";
+import * as XLSX from "xlsx";
 
 setGlobalOptions({ region: process.env.LOCATION || "asia-south1" });
 
@@ -477,21 +479,22 @@ export const enqueueShipmentTasks = onRequest(
         return;
       }
 
-      const { businessId, shop, orders, courier, shippingMode, requestedBy } = (req.body || {}) as {
-        businessId?: string;
-        shop?: string;
-        orders?: string;
-        courier?: string;
-        // pickupName?: string;
-        shippingMode?: string;
-        requestedBy?: string;
-      };
+      const { businessId, shop, orders, courier, pickupName, shippingMode, requestedBy } =
+        (req.body || {}) as {
+          businessId?: string;
+          shop?: string;
+          orders?: string;
+          courier?: string;
+          pickupName?: string;
+          shippingMode?: string;
+          requestedBy?: string;
+        };
 
       if (
         !businessId ||
         !shop ||
         !courier ||
-        // !pickupName ||
+        !pickupName ||
         !shippingMode ||
         !Array.isArray(orders) ||
         orders.length === 0
@@ -535,8 +538,6 @@ export const enqueueShipmentTasks = onRequest(
 
       // 1) Create batch header
       const batchRef = businessRef.ref.collection("shipment_batches").doc();
-
-      const pickupName = businessDoc?.pickupName;
 
       await batchRef.set({
         shop,
@@ -7451,6 +7452,214 @@ function drawOrderDetailsTable(
 
   doc.y = currentY;
 }
+
+interface GenerateExcelPayload {
+  phoneNumbers?: string[];
+}
+
+/**
+ * Generates Excel file of all orders from shared store and sends download link
+ */
+export const generateSharedStoreOrdersExcel = onRequest(
+  {
+    cors: true,
+    timeoutSeconds: 540,
+    memory: "2GiB",
+    secrets: [ENQUEUE_FUNCTION_SECRET],
+  },
+  async (req: Request, res: Response): Promise<void> => {
+    try {
+      // Validate secret
+      requireHeaderSecret(req, "x-api-key", ENQUEUE_FUNCTION_SECRET.value() || "");
+
+      if (req.method !== "POST") {
+        res.status(405).json({ error: "method_not_allowed" });
+        return;
+      }
+
+      const { phoneNumbers = ["8950188819", "9132326000"] } = (req.body ||
+        {}) as GenerateExcelPayload;
+
+      console.log("🚀 Starting Excel generation for shared store...");
+      console.log(`📱 Will send to: ${phoneNumbers.join(", ")}`);
+
+      // Get shared store data
+      const shopDoc = await db.collection("accounts").doc(SHARED_STORE_ID).get();
+      if (!shopDoc.exists) {
+        res.status(404).json({ error: "shared_store_not_found" });
+        return;
+      }
+
+      const shopData = shopDoc.data() as any;
+
+      // Fetch all orders from shared store
+      console.log("📦 Fetching orders from shared store...");
+      const ordersSnapshot = await db
+        .collection("accounts")
+        .doc(SHARED_STORE_ID)
+        .collection("orders")
+        .get();
+
+      if (ordersSnapshot.empty) {
+        res.status(400).json({ error: "no_orders_found" });
+        return;
+      }
+
+      console.log(`Found ${ordersSnapshot.size} orders`);
+
+      // Process orders into Excel rows
+      const excelData: any[] = [];
+
+      ordersSnapshot.docs.forEach((doc) => {
+        const order = doc.data();
+        const items = order.raw?.line_items || [];
+
+        // Helper functions
+        const formatDate = (timestamp: any) => {
+          if (!timestamp) return "N/A";
+          const date = timestamp.toDate ? timestamp.toDate() : new Date(timestamp);
+          return date.toLocaleDateString("en-GB");
+        };
+
+        const formatAddress = (address: any) => {
+          if (!address) return "N/A";
+          const parts = [
+            address.address1,
+            address.address2,
+            address.city,
+            address.province,
+            address.zip,
+            address.country,
+          ].filter(Boolean);
+          return parts.join(", ") || "N/A";
+        };
+
+        const customerName =
+          order.raw.customer?.first_name && order.raw.customer?.last_name
+            ? `${order.raw.customer.first_name} ${order.raw.customer.last_name}`
+            : order.raw.billing_address?.name || order.raw.shipping_address?.name || "N/A";
+
+        const paymentStatus = order.raw.financial_status;
+
+        // Create a row for each line item
+        items.forEach((item: any) => {
+          excelData.push({
+            "Order name": order.name,
+            AWB: order.awb ?? "N/A",
+            "Return AWB": order.awb_reverse ?? "N/A",
+            Courier: order.courier ?? "N/A",
+            "Order date": formatDate(order.createdAt),
+            Customer: customerName,
+            Email: order.raw.customer?.email || order.raw?.contact_email || "N/A",
+            Phone:
+              order.raw.customer?.phone ||
+              order.raw.billing_address?.phone ||
+              order.raw.shipping_address?.phone ||
+              "N/A",
+            "Item title": item.title,
+            "Item SKU": item.sku || "N/A",
+            "Item Quantity": item.quantity,
+            "Item Price": item.price,
+            "Total Order Price": order.totalPrice,
+            Discount: order.raw.total_discounts || 0,
+            Vendor: item.vendor || "N/A",
+            Currency: order.currency,
+            "Payment Status": paymentStatus,
+            Status: order.customStatus,
+            "Billing Address": formatAddress(order.raw.billing_address),
+            "Billing City": order.raw.billing_address?.city || "N/A",
+            "Billing State": order.raw.billing_address?.province || "N/A",
+            "Billing Pincode": order.raw.billing_address?.zip || "N/A",
+            "Billing Country": order.raw.billing_address?.country || "N/A",
+            "Shipping Address": formatAddress(order.raw.shipping_address),
+            "Shipping City": order.raw.shipping_address?.city || "N/A",
+            "Shipping State": order.raw.shipping_address?.province || "N/A",
+            "Shipping Pincode": order.raw.shipping_address?.zip || "N/A",
+            "Shipping Country": order.raw.shipping_address?.country || "N/A",
+          });
+        });
+      });
+
+      console.log(`📊 Generated ${excelData.length} rows (including line items)`);
+
+      // Generate Excel file
+      const worksheet = XLSX.utils.json_to_sheet(excelData);
+      const workbook = XLSX.utils.book_new();
+      XLSX.utils.book_append_sheet(workbook, worksheet, "Orders");
+
+      // Auto-size columns
+      const maxWidth = 50;
+      const wscols = Object.keys(excelData[0] || {}).map((key) => {
+        const maxLen = Math.max(
+          key.length,
+          ...excelData.map((row) => String(row[key] || "").length),
+        );
+        return { wch: Math.min(maxLen + 2, maxWidth) };
+      });
+      worksheet["!cols"] = wscols;
+
+      // Convert to buffer
+      const excelBuffer = XLSX.write(workbook, {
+        type: "buffer",
+        bookType: "xlsx",
+      });
+
+      // Upload to Firebase Storage
+      const date = new Date().toLocaleDateString("en-GB").replace(/\//g, "-");
+      const fileName = `Shared_Store_Orders_${date}.xlsx`;
+      const filePath = `shared_store_orders/${fileName}`;
+
+      const bucket = storage.bucket();
+      const file = bucket.file(filePath);
+
+      await file.save(excelBuffer, {
+        contentType: "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        metadata: {
+          metadata: {
+            generatedAt: new Date().toISOString(),
+            shop: SHARED_STORE_ID,
+            totalOrders: ordersSnapshot.size,
+            totalRows: excelData.length,
+          },
+        },
+      });
+
+      // Make the file publicly accessible and get download URL
+      await file.makePublic();
+      const downloadUrl = `https://storage.googleapis.com/${bucket.name}/${filePath}`;
+
+      console.log(`✅ Excel file generated successfully`);
+      console.log(`📊 Total Orders: ${ordersSnapshot.size}, Total Rows: ${excelData.length}`);
+      console.log(`📄 Download URL: ${downloadUrl}`);
+
+      // Send WhatsApp messages to all phone numbers
+      const messagePromises = phoneNumbers.map((phone) =>
+        sendSharedStoreOrdersExcelWhatsAppMessage(shopData, downloadUrl, phone),
+      );
+
+      await Promise.allSettled(messagePromises);
+
+      console.log(`📱 WhatsApp messages sent to ${phoneNumbers.length} numbers`);
+
+      res.json({
+        success: true,
+        message: "Excel generated and sent successfully",
+        downloadUrl,
+        stats: {
+          totalOrders: ordersSnapshot.size,
+          totalRows: excelData.length,
+          sentTo: phoneNumbers,
+        },
+      });
+    } catch (error) {
+      console.error("❌ Error generating Excel:", error);
+      res.status(500).json({
+        error: "excel_generation_failed",
+        details: error instanceof Error ? error.message : String(error),
+      });
+    }
+  },
+);
 
 // ============================================================================
 // MANUAL STATUS UPDATES

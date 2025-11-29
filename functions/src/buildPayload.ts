@@ -108,9 +108,6 @@ export function buildDelhiveryPayload(params: {
   return {
     shipments: [shipment],
     pickup_location: {
-      // name: pickupName ? "Majime Productions 2" : "Majime Productions 2",
-      // name: pickupName ? "Endora" : "Endora",
-      // name: pickupName ? "Sai arpan apartment" : "Sai arpan apartment",
       name: pickupName,
     },
   };
@@ -162,7 +159,15 @@ export function buildShiprocketPayload(opts: {
           },
         ];
 
-  let sub_total = Number(order?.raw?.total_outstanding);
+  // Calculate sub_total as sum of (price * quantity) for all line items
+  let sub_total =
+    itemsSrc.length > 0
+      ? itemsSrc.reduce((sum, li) => {
+          const price = Number(li?.price ?? li?.selling_price ?? 0);
+          const quantity = Number(li?.quantity ?? 1);
+          return sum + price * quantity;
+        }, 0)
+      : Number(order?.total_price ?? order?.amount ?? 0);
 
   const payment_method = !Number(order.raw.total_outstanding) ? "Prepaid" : "COD";
 
@@ -186,9 +191,6 @@ export function buildShiprocketPayload(opts: {
   return {
     order_id: String(order?.name || orderId), // make order_id == jobId for idempotency
     order_date: new Date().toISOString().slice(0, 16).replace("T", " "), // "YYYY-MM-DD HH:mm"
-    // pickup_location: pickupName ? "Majime Productions 2" : "Majime Productions 2",
-    // pickup_location: pickupName ? "ENDORA" : "ENDORA",
-    // pickup_location: pickupName ? "Sai arpan apartment" : "Sai arpan apartment",
     pickup_location: pickupName,
     comment: order?.note || "",
     billing_customer_name: name,
@@ -359,7 +361,7 @@ export function buildDelhiveryReturnPayload(params: {
 
   return {
     shipments: [shipment],
-    pickup_location: { name: pickupName ? "Majime Productions 2" : "Majime Productions 2" },
+    pickup_location: { name: pickupName },
   };
 }
 
