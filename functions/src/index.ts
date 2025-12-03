@@ -7477,7 +7477,7 @@ export const generateSharedStoreOrdersExcel = onRequest(
         return;
       }
 
-      const { phoneNumbers = ["8950188819", "9132326000"] } = (req.body ||
+      const { phoneNumbers = ["8950188819", "9132326000", "9779752241"] } = (req.body ||
         {}) as GenerateExcelPayload;
 
       console.log("🚀 Starting Excel generation for shared store...");
@@ -7541,14 +7541,41 @@ export const generateSharedStoreOrdersExcel = onRequest(
 
         const paymentStatus = order.raw.financial_status;
 
+        const payment_gateway_names: string[] = order.raw.payment_gateway_names;
+
+        // Calculate total order value for proportional distribution
+        const orderTotal =
+          Number(order.raw.current_subtotal_price || order.raw.subtotal_price) ||
+          items.reduce((sum: number, item: any) => {
+            return sum + Number(item.price) * Number(item.quantity);
+          }, 0);
+
         // Create a row for each line item
         items.forEach((item: any) => {
+          // Calculate proportional share for this item
+          const itemTotal = Number(item.price) * Number(item.quantity);
+          const proportion = orderTotal > 0 ? itemTotal / orderTotal : 0;
+
+          // Calculate proportional refunded amount
+          const refundedAmount = order?.refundedAmount;
+          let itemRefundedAmount: string | number = "Not refunded";
+
+          if (refundedAmount !== undefined && refundedAmount !== null && refundedAmount !== "") {
+            const refundedAmountNum = Number(refundedAmount);
+            if (!isNaN(refundedAmountNum) && refundedAmountNum > 0) {
+              itemRefundedAmount = Number(refundedAmountNum * proportion).toFixed(2);
+            }
+          }
+
           excelData.push({
             "Order name": order.name,
-            AWB: order.awb ?? "N/A",
-            "Return AWB": order.awb_reverse ?? "N/A",
-            Courier: order.courier ?? "N/A",
             "Order date": formatDate(order.createdAt),
+            Status: String(order.customStatus).toUpperCase(),
+            "Financial Status": paymentStatus,
+            AWB: order.awb ?? "N/A",
+            Courier: order.courier ?? "N/A",
+            "Return AWB": order.awb_reverse ?? "N/A",
+            "Return Courier": order.courier_reverse,
             Customer: customerName,
             Email: order.raw.customer?.email || order.raw?.contact_email || "N/A",
             Phone:
@@ -7559,13 +7586,17 @@ export const generateSharedStoreOrdersExcel = onRequest(
             "Item title": item.title,
             "Item SKU": item.sku || "N/A",
             "Item Quantity": item.quantity,
-            "Item Price": item.price,
-            "Total Order Price": order.totalPrice,
-            Discount: order.raw.total_discounts || 0,
-            Vendor: item.vendor || "N/A",
-            Currency: order.currency,
-            "Payment Status": paymentStatus,
-            Status: order.customStatus,
+            "Item Price": Number(item.price).toFixed(),
+            "Total Order Price": Number(order.raw.total_price).toFixed(2),
+            "Total Discount": Number(order.raw.total_discounts || 0).toFixed(2),
+            "Proportionate Discount": Number(item.discount_allocations?.[0]?.amount || 0).toFixed(
+              2,
+            ),
+            "Credits Used": payment_gateway_names.includes("shopify_store_credit")
+              ? (Number(order.raw.total_price) - Number(order.raw.total_outstanding)).toFixed(2)
+              : 0,
+            "DTO Refunded Amount": itemRefundedAmount,
+            "DTO Refund Method": order?.refundMethod || "Not Refunded",
             "Billing Address": formatAddress(order.raw.billing_address),
             "Billing City": order.raw.billing_address?.city || "N/A",
             "Billing State": order.raw.billing_address?.province || "N/A",
@@ -7587,6 +7618,19 @@ export const generateSharedStoreOrdersExcel = onRequest(
       const workbook = XLSX.utils.book_new();
       XLSX.utils.book_append_sheet(workbook, worksheet, "Orders");
 
+      // Make headers bold
+      const range = XLSX.utils.decode_range(worksheet["!ref"] || "A1");
+      for (let col = range.s.c; col <= range.e.c; col++) {
+        const cellAddress = XLSX.utils.encode_cell({ r: 0, c: col });
+        if (!worksheet[cellAddress]) continue;
+
+        worksheet[cellAddress].s = {
+          font: {
+            bold: true,
+          },
+        };
+      }
+
       // Auto-size columns
       const maxWidth = 50;
       const wscols = Object.keys(excelData[0] || {}).map((key) => {
@@ -7602,6 +7646,7 @@ export const generateSharedStoreOrdersExcel = onRequest(
       const excelBuffer = XLSX.write(workbook, {
         type: "buffer",
         bookType: "xlsx",
+        cellStyles: true,
       });
 
       // Upload to Firebase Storage
