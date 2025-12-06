@@ -21,8 +21,6 @@ import {
   Timestamp,
   Transaction,
 } from "firebase-admin/firestore";
-// import { genkit } from 'genkit';
-// import vertexAI from "@genkit-ai/vertexai";
 import { onDocumentWritten, QueryDocumentSnapshot } from "firebase-functions/firestore";
 import {
   sendConfirmedDelayedLvl1WhatsAppMessage,
@@ -43,7 +41,8 @@ import {
   sendSplitOrdersWhatsAppMessage,
 } from "./whatsappMessagesSendingFuncs";
 import PDFDocument from "pdfkit";
-import * as XLSX from "xlsx";
+import ExcelJS from "exceljs";
+export { generateDailyTaxReport } from "./dailyTaxReport";
 
 setGlobalOptions({ region: process.env.LOCATION || "asia-south1" });
 
@@ -7009,6 +7008,262 @@ function chunkArray<T>(array: T[], size: number): T[][] {
 }
 
 /**
+ * Fetches all products with basic info and metafields only
+ */
+export const syncSharedStoreProductsBasic = onRequest(
+  {
+    cors: true,
+    timeoutSeconds: 540,
+    memory: "1GiB",
+    secrets: [ENQUEUE_FUNCTION_SECRET],
+  },
+  async (req: Request, res: Response): Promise<void> => {
+    try {
+      requireHeaderSecret(req, "x-api-key", ENQUEUE_FUNCTION_SECRET.value() || "");
+
+      if (req.method !== "POST") {
+        res.status(405).json({ error: "method_not_allowed" });
+        return;
+      }
+
+      console.log("🚀 Starting basic product sync for shared store...");
+
+      const shopDoc = await db.collection("accounts").doc(SHARED_STORE_ID).get();
+      if (!shopDoc.exists) {
+        res.status(404).json({ error: "shared_store_not_found" });
+        return;
+      }
+
+      const accessToken = shopDoc.data()?.accessToken;
+      if (!accessToken) {
+        res.status(500).json({ error: "access_token_missing" });
+        return;
+      }
+
+      const products = await fetchBasicProducts(SHARED_STORE_ID, accessToken);
+
+      console.log(`📦 Fetched ${products.length} products from Shopify`);
+
+      // Store in Firestore
+      const productsCollection = db
+        .collection("accounts")
+        .doc(SHARED_STORE_ID)
+        .collection("products");
+
+      // Clear existing products
+      console.log("🗑️ Clearing existing products...");
+      const existingProducts = await productsCollection.listDocuments();
+      const deleteChunks = chunkArray(existingProducts, 500);
+
+      for (const chunk of deleteChunks) {
+        const batch = db.batch();
+        chunk.forEach((doc) => batch.delete(doc));
+        await batch.commit();
+      }
+
+      // Store new products
+      console.log("💾 Storing products in Firestore...");
+      const productChunks = chunkArray(products, 500);
+
+      for (const chunk of productChunks) {
+        const batch = db.batch();
+
+        chunk.forEach((product) => {
+          const productRef = productsCollection.doc(String(product.id));
+          batch.set(productRef, {
+            ...product,
+            syncedAt: FieldValue.serverTimestamp(),
+          });
+        });
+
+        await batch.commit();
+        console.log(`  ✓ Stored batch of ${chunk.length} products`);
+      }
+
+      console.log("✅ Product sync completed successfully");
+
+      res.json({
+        success: true,
+        message: "Products synced successfully",
+        stats: {
+          totalProducts: products.length,
+          storeId: SHARED_STORE_ID,
+        },
+      });
+    } catch (error) {
+      console.error("❌ Error syncing products:", error);
+      res.status(500).json({
+        error: "product_sync_failed",
+        details: error instanceof Error ? error.message : String(error),
+      });
+    }
+  },
+);
+
+/**
+ * Extract numeric ID from Shopify GID format
+ * @param gid - Shopify GID (e.g., "gid://shopify/Product/123456789")
+ * @returns Numeric ID as string (e.g., "123456789")
+ */
+function extractNumericId(gid: string): string {
+  if (!gid) return "";
+
+  // If it's already numeric, return as-is
+  if (/^\d+$/.test(gid)) {
+    return gid;
+  }
+
+  // Extract from GID format: gid://shopify/Product/123456789
+  const parts = gid.split("/");
+  return parts[parts.length - 1];
+}
+
+/**
+ * Fetches basic product info with metafields using minimal GraphQL query
+ */
+async function fetchBasicProducts(shop: string, accessToken: string): Promise<any[]> {
+  const allProducts: any[] = [];
+  let hasNextPage = true;
+  let cursor: string | null = null;
+  let pageCount = 0;
+
+  const PRODUCTS_PER_PAGE = 250;
+
+  while (hasNextPage) {
+    pageCount++;
+    console.log(`📄 Fetching page ${pageCount}...`);
+
+    // MINIMAL QUERY - Basic info + Metafields only
+    const query = `
+      query GetProducts($cursor: String, $first: Int!) {
+        products(first: $first, after: $cursor) {
+          edges {
+            cursor
+            node {
+              # Basic Product Info
+              id
+              legacyResourceId
+              title
+              handle
+              description(truncateAt: 500)
+              descriptionHtml
+              vendor
+              productType
+              tags
+              status
+              
+              # Dates
+              createdAt
+              updatedAt
+              publishedAt
+              
+              # Simple flags
+              totalInventory
+              tracksInventory
+              
+              # Metafields - THIS IS WHAT YOU WANT
+              metafields(first: 250) {
+                edges {
+                  node {
+                    id
+                    namespace
+                    key
+                    value
+                    type
+                    description
+                    createdAt
+                    updatedAt
+                  }
+                }
+              }
+            }
+          }
+          pageInfo {
+            hasNextPage
+            endCursor
+          }
+        }
+      }
+    `;
+
+    const variables = {
+      first: PRODUCTS_PER_PAGE,
+      cursor,
+    };
+
+    const response = await fetch(`https://${shop}/admin/api/2025-01/graphql.json`, {
+      method: "POST",
+      headers: {
+        "X-Shopify-Access-Token": accessToken,
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({ query, variables }),
+    });
+
+    if (!response.ok) {
+      throw new Error(`Shopify API error: ${response.status} ${response.statusText}`);
+    }
+
+    const result = (await response.json()) as any;
+
+    if (result.errors) {
+      throw new Error(`GraphQL errors: ${JSON.stringify(result.errors)}`);
+    }
+
+    const products = result.data?.products?.edges || [];
+    const pageInfo = result.data?.products?.pageInfo;
+
+    // Extract and clean product data
+    products.forEach((edge: any) => {
+      const product = edge.node;
+
+      allProducts.push({
+        id: extractNumericId(product.id),
+        shopifyId: product.id,
+        legacyResourceId: product.legacyResourceId,
+        title: product.title,
+        handle: product.handle,
+        description: product.description,
+        descriptionHtml: product.descriptionHtml,
+        vendor: product.vendor,
+        productType: product.productType,
+        tags: product.tags,
+        status: product.status,
+        createdAt: product.createdAt,
+        updatedAt: product.updatedAt,
+        publishedAt: product.publishedAt,
+        totalInventory: product.totalInventory,
+        tracksInventory: product.tracksInventory,
+
+        // Clean metafields
+        metafields: product.metafields.edges.map((edge: any) => ({
+          id: extractNumericId(edge.node.id),
+          shopifyId: edge.node.id,
+          namespace: edge.node.namespace,
+          key: edge.node.key,
+          value: edge.node.value,
+          type: edge.node.type,
+          description: edge.node.description,
+          createdAt: edge.node.createdAt,
+          updatedAt: edge.node.updatedAt,
+        })),
+      });
+    });
+
+    console.log(`  ✓ Fetched ${products.length} products (Total: ${allProducts.length})`);
+
+    hasNextPage = pageInfo?.hasNextPage || false;
+    cursor = pageInfo?.endCursor || null;
+
+    if (hasNextPage) {
+      await sleep(500);
+    }
+  }
+
+  return allProducts;
+}
+
+/**
  * Generates a PDF report of unavailable stock items from confirmed orders
  * Runs daily at 9 AM IST
  */
@@ -7613,53 +7868,64 @@ export const generateSharedStoreOrdersExcel = onRequest(
 
       console.log(`📊 Generated ${excelData.length} rows (including line items)`);
 
-      // Generate Excel file
-      const worksheet = XLSX.utils.json_to_sheet(excelData);
-      const workbook = XLSX.utils.book_new();
-      XLSX.utils.book_append_sheet(workbook, worksheet, "Orders");
+      // Generate Excel file using ExcelJS
+      const workbook = new ExcelJS.Workbook();
+      const worksheet = workbook.addWorksheet("Orders");
 
-      // Make headers bold
-      const range = XLSX.utils.decode_range(worksheet["!ref"] || "A1");
-      for (let col = range.s.c; col <= range.e.c; col++) {
-        const cellAddress = XLSX.utils.encode_cell({ r: 0, c: col });
-        if (!worksheet[cellAddress]) continue;
+      // Define columns from the first data row
+      if (excelData.length > 0) {
+        const headers = Object.keys(excelData[0]);
 
-        worksheet[cellAddress].s = {
-          font: {
-            bold: true,
-          },
-        };
+        // Set up columns with headers
+        worksheet.columns = headers.map((header) => ({
+          header: header,
+          key: header,
+          width: Math.min(
+            Math.max(
+              header.length + 2,
+              ...excelData.map((row) => String(row[header] || "").length),
+            ),
+            50,
+          ),
+        }));
+
+        // Make header row bold
+        worksheet.getRow(1).font = { bold: true };
+
+        // Add all data rows
+        excelData.forEach((row) => {
+          worksheet.addRow(row);
+        });
+
+        // Apply borders to all cells
+        worksheet.eachRow((row) => {
+          row.eachCell((cell) => {
+            cell.border = {
+              top: { style: "thin" },
+              left: { style: "thin" },
+              bottom: { style: "thin" },
+              right: { style: "thin" },
+            };
+          });
+        });
+
+        // Freeze the header row
+        worksheet.views = [{ state: "frozen", ySplit: 1 }];
       }
-
-      // Auto-size columns
-      const maxWidth = 50;
-      const wscols = Object.keys(excelData[0] || {}).map((key) => {
-        const maxLen = Math.max(
-          key.length,
-          ...excelData.map((row) => String(row[key] || "").length),
-        );
-        return { wch: Math.min(maxLen + 2, maxWidth) };
-      });
-      worksheet["!cols"] = wscols;
-
-      // Convert to buffer
-      const excelBuffer = XLSX.write(workbook, {
-        type: "buffer",
-        bookType: "xlsx",
-        cellStyles: true,
-      });
 
       // Upload to Firebase Storage
       const date = new Date().toLocaleDateString("en-GB").replace(/\//g, "-");
-      const fileName = `Shared_Store_Orders_${date}.xlsx`;
+      const uniqueId = Date.now(); // Timestamp-based unique ID
+      const fileName = `Shared_Store_Orders_${date}_${uniqueId}.xlsx`;
       const filePath = `shared_store_orders/${fileName}`;
 
       const bucket = storage.bucket();
       const file = bucket.file(filePath);
 
-      await file.save(excelBuffer, {
-        contentType: "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+      // Create write stream
+      const writeStream = file.createWriteStream({
         metadata: {
+          contentType: "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
           metadata: {
             generatedAt: new Date().toISOString(),
             shop: SHARED_STORE_ID,
@@ -7667,6 +7933,15 @@ export const generateSharedStoreOrdersExcel = onRequest(
             totalRows: excelData.length,
           },
         },
+      });
+
+      // Write Excel directly to stream
+      await workbook.xlsx.write(writeStream);
+
+      // Wait for stream to finish
+      await new Promise((resolve, reject) => {
+        writeStream.on("finish", resolve);
+        writeStream.on("error", reject);
       });
 
       // Make the file publicly accessible and get download URL
