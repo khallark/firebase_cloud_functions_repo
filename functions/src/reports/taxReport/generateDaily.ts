@@ -841,7 +841,6 @@ export const generateDailyTaxReport = onSchedule(
   {
     schedule: "0 0 * * *", // 12:00 AM daily
     timeZone: "Asia/Kolkata",
-    region: process.env.LOCATION || "asia-south1",
     memory: "2GiB",
     timeoutSeconds: 540,
   },

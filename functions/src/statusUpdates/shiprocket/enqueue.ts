@@ -9,7 +9,6 @@ export const enqueueShiprocketStatusUpdateTasksScheduled = onSchedule(
   {
     schedule: "0 0,4,8,12,16,20 * * *", // 6 times daily
     timeZone: "Asia/Kolkata",
-    region: process.env.LOCATION || "asia-south1",
     memory: "512MiB",
     timeoutSeconds: 540,
     secrets: [TASKS_SECRET],

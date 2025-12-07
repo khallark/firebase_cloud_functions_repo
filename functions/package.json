@@ -9,6 +9,7 @@
     "shell": "npm run build && firebase functions:shell",
     "start": "npm run shell",
     "deploy": "firebase deploy --only functions",
+    "predeploy": "npm run build",
     "logs": "firebase functions:log",
     "format": "prettier --write \"src/**/*.{ts,js}\""
   },

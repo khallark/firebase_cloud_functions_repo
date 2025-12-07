@@ -9,7 +9,6 @@ import { db } from "../../firebaseAdmin";
 export const updateOrderCounts = onDocumentWritten(
   {
     document: "accounts/{storeId}/orders/{orderId}",
-    region: process.env.LOCATION || "asia-south1",
     memory: "256MiB",
   },
   async (event) => {

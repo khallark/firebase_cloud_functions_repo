@@ -2,6 +2,10 @@
 // CLOUD FUNCTIONS - Direct Exports Only
 // ============================================================================
 
+import { setGlobalOptions } from "firebase-functions/v2";
+
+setGlobalOptions({ region: process.env.LOCATION || "asia-south1" });
+
 // Shipments - Forward
 export { enqueueShipmentTasks } from "./shipments/forward/enqueueShipmentTasks";
 export { processShipmentTask } from "./shipments/forward/processShipmentTask";

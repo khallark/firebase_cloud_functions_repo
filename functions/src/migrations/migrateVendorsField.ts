@@ -65,7 +65,6 @@ export const migrateVendorsField = onRequest(
     cors: true,
     timeoutSeconds: 540,
     memory: "1GiB",
-    region: process.env.LOCATION || "asia-south1",
     secrets: [ENQUEUE_FUNCTION_SECRET],
   },
   async (req, res) => {
