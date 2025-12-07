@@ -2,7 +2,6 @@
 import { onSchedule } from "firebase-functions/v2/scheduler";
 import { db, storage } from "../../firebaseAdmin";
 import ExcelJS from "exceljs";
-import { Timestamp } from "firebase-admin/firestore";
 import { formatDate } from "../../helpers";
 import { REPORT_PHONE_NUMBER, RETURN_STATUSES, SHARED_STORE_ID } from "../../config";
 import { sendTaxReportWhatsAppMessage } from "../../services";
@@ -185,9 +184,11 @@ function calculateProportionalRefund(order: any, item: any): number {
 
   // Calculate item's proportion of total order
   const items = order.raw?.line_items || [];
-  const orderTotal = items.reduce((sum: number, lineItem: any) => {
-    return sum + Number(lineItem.price) * Number(lineItem.quantity);
-  }, 0);
+  const orderTotal =
+    Number(order.raw.current_subtotal_price || order.raw.subtotal_price) ||
+    items.reduce((sum: number, item: any) => {
+      return sum + Number(item.price) * Number(item.quantity);
+    }, 0);
 
   if (orderTotal === 0) return 0;
 
@@ -215,8 +216,8 @@ async function processSalesOrders(targetDate: Date): Promise<SalesRow[]> {
     .collection("accounts")
     .doc(SHARED_STORE_ID)
     .collection("orders")
-    .where("createdAt", ">=", Timestamp.fromDate(startOfDay))
-    .where("createdAt", "<=", Timestamp.fromDate(endOfDay))
+    .where("createdAt", ">=", startOfDay.toISOString())
+    .where("createdAt", "<=", endOfDay.toISOString())
     .get();
 
   console.log(`Found ${ordersSnapshot.size} sales orders`);
@@ -476,7 +477,7 @@ function generateStatePivot(salesRows: SalesRow[], returnRows: SalesReturnRow[])
   // Calculate net sales
   const pivotArray = Array.from(stateMap.values());
   pivotArray.forEach((pivot) => {
-    pivot.netQty = Number((pivot.grossQty - pivot.returnQty).toFixed(2));
+    pivot.netQty = Number((pivot.grossQty + pivot.returnQty).toFixed(2));
     pivot.netTaxable = Number((pivot.grossTaxable - pivot.returnTaxable).toFixed(2));
     pivot.netIGST = Number((pivot.grossIGST - pivot.returnIGST).toFixed(2));
     pivot.netSGST = Number((pivot.grossSGST - pivot.returnSGST).toFixed(2));
@@ -621,14 +622,35 @@ async function createExcelWorkbook(
 
   salesRows.forEach((row) => salesSheet.addRow(row));
 
-  // Style header
-  salesSheet.getRow(1).font = { bold: true, color: { argb: "FFFFFFFF" } };
-  salesSheet.getRow(1).fill = {
-    type: "pattern",
-    pattern: "solid",
-    fgColor: { argb: "FF4472C4" },
-  };
-  salesSheet.getRow(1).alignment = { vertical: "middle", horizontal: "center" };
+  // Style header with all borders
+  const salesHeaderRow = salesSheet.getRow(1);
+  for (let col = 1; col <= 18; col++) {
+    const cell = salesHeaderRow.getCell(col);
+    cell.font = { bold: true, color: { argb: "FFFFFFFF" } };
+    cell.fill = {
+      type: "pattern",
+      pattern: "solid",
+      fgColor: { argb: "FF4472C4" },
+    };
+    cell.alignment = { vertical: "middle", horizontal: "center" };
+    cell.border = {
+      top: { style: "thin" },
+      left: { style: "thin" },
+      bottom: { style: "thin" },
+      right: { style: "thin" },
+    };
+  }
+
+  // Add side borders to all data rows
+  for (let row = 2; row <= salesRows.length + 1; row++) {
+    for (let col = 1; col <= 18; col++) {
+      const cell = salesSheet.getCell(row, col);
+      cell.border = {
+        left: { style: "thin" },
+        right: { style: "thin" },
+      };
+    }
+  }
 
   // Sheet 2: Sales Return Report
   const returnSheet = workbook.addWorksheet("Sales Return Report");
@@ -658,14 +680,35 @@ async function createExcelWorkbook(
 
   returnRows.forEach((row) => returnSheet.addRow(row));
 
-  // Style header
-  returnSheet.getRow(1).font = { bold: true, color: { argb: "FFFFFFFF" } };
-  returnSheet.getRow(1).fill = {
-    type: "pattern",
-    pattern: "solid",
-    fgColor: { argb: "FF4472C4" },
-  };
-  returnSheet.getRow(1).alignment = { vertical: "middle", horizontal: "center" };
+  // Style header with all borders
+  const returnHeaderRow = returnSheet.getRow(1);
+  for (let col = 1; col <= 21; col++) {
+    const cell = returnHeaderRow.getCell(col);
+    cell.font = { bold: true, color: { argb: "FFFFFFFF" } };
+    cell.fill = {
+      type: "pattern",
+      pattern: "solid",
+      fgColor: { argb: "FF4472C4" },
+    };
+    cell.alignment = { vertical: "middle", horizontal: "center" };
+    cell.border = {
+      top: { style: "thin" },
+      left: { style: "thin" },
+      bottom: { style: "thin" },
+      right: { style: "thin" },
+    };
+  }
+
+  // Add side borders to all data rows
+  for (let row = 2; row <= returnRows.length + 1; row++) {
+    for (let col = 1; col <= 21; col++) {
+      const cell = returnSheet.getCell(row, col);
+      cell.border = {
+        left: { style: "thin" },
+        right: { style: "thin" },
+      };
+    }
+  }
 
   // Sheet 3: State Wise Tax Report
   const stateSheet = workbook.addWorksheet("State Wise Tax Report");
@@ -699,16 +742,25 @@ async function createExcelWorkbook(
     stateSheet.getCell(2, col++).value = header;
   });
 
-  // Style headers
+  // Style headers with all borders (rows 1 & 2, columns 1-19)
   [1, 2].forEach((rowNum) => {
     const row = stateSheet.getRow(rowNum);
-    row.font = { bold: true, color: { argb: "FFFFFFFF" } };
-    row.fill = {
-      type: "pattern",
-      pattern: "solid",
-      fgColor: { argb: "FF4472C4" },
-    };
-    row.alignment = { vertical: "middle", horizontal: "center" };
+    for (let col = 1; col <= 19; col++) {
+      const cell = row.getCell(col);
+      cell.font = { bold: true, color: { argb: "FFFFFFFF" } };
+      cell.fill = {
+        type: "pattern",
+        pattern: "solid",
+        fgColor: { argb: "FF4472C4" },
+      };
+      cell.alignment = { vertical: "middle", horizontal: "center" };
+      cell.border = {
+        top: { style: "thin" },
+        left: { style: "thin" },
+        bottom: { style: "thin" },
+        right: { style: "thin" },
+      };
+    }
   });
 
   // Add data rows
@@ -736,6 +788,17 @@ async function createExcelWorkbook(
     currentRow++;
   });
 
+  // Add side borders to data rows
+  for (let row = 3; row < currentRow; row++) {
+    for (let col = 1; col <= 19; col++) {
+      const cell = stateSheet.getCell(row, col);
+      cell.border = {
+        left: { style: "thin" },
+        right: { style: "thin" },
+      };
+    }
+  }
+
   // Add grand total row
   const totalRow = currentRow;
   stateSheet.getCell(totalRow, 1).value = "Grand Total";
@@ -748,6 +811,17 @@ async function createExcelWorkbook(
     }
     stateSheet.getCell(totalRow, col).value = Number(sum.toFixed(2));
     stateSheet.getCell(totalRow, col).font = { bold: true };
+  }
+
+  // Add all borders to grand total row
+  for (let col = 1; col <= 19; col++) {
+    const cell = stateSheet.getCell(totalRow, col);
+    cell.border = {
+      top: { style: "thin" },
+      left: { style: "thin" },
+      bottom: { style: "thin" },
+      right: { style: "thin" },
+    };
   }
 
   // Sheet 4: HSN Wise Tax Report
@@ -780,16 +854,25 @@ async function createExcelWorkbook(
     hsnSheet.getCell(2, col++).value = header;
   });
 
-  // Style headers
+  // Style headers with all borders (rows 1 & 2, columns 1-19)
   [1, 2].forEach((rowNum) => {
     const row = hsnSheet.getRow(rowNum);
-    row.font = { bold: true, color: { argb: "FFFFFFFF" } };
-    row.fill = {
-      type: "pattern",
-      pattern: "solid",
-      fgColor: { argb: "FF4472C4" },
-    };
-    row.alignment = { vertical: "middle", horizontal: "center" };
+    for (let col = 1; col <= 19; col++) {
+      const cell = row.getCell(col);
+      cell.font = { bold: true, color: { argb: "FFFFFFFF" } };
+      cell.fill = {
+        type: "pattern",
+        pattern: "solid",
+        fgColor: { argb: "FF4472C4" },
+      };
+      cell.alignment = { vertical: "middle", horizontal: "center" };
+      cell.border = {
+        top: { style: "thin" },
+        left: { style: "thin" },
+        bottom: { style: "thin" },
+        right: { style: "thin" },
+      };
+    }
   });
 
   // Add data rows
@@ -817,6 +900,17 @@ async function createExcelWorkbook(
     currentRow++;
   });
 
+  // Add side borders to data rows
+  for (let row = 3; row < currentRow; row++) {
+    for (let col = 1; col <= 19; col++) {
+      const cell = hsnSheet.getCell(row, col);
+      cell.border = {
+        left: { style: "thin" },
+        right: { style: "thin" },
+      };
+    }
+  }
+
   // Add grand total row
   const hsnTotalRow = currentRow;
   hsnSheet.getCell(hsnTotalRow, 1).value = "Grand Total";
@@ -829,6 +923,17 @@ async function createExcelWorkbook(
     }
     hsnSheet.getCell(hsnTotalRow, col).value = Number(sum.toFixed(2));
     hsnSheet.getCell(hsnTotalRow, col).font = { bold: true };
+  }
+
+  // Add all borders to grand total row
+  for (let col = 1; col <= 19; col++) {
+    const cell = hsnSheet.getCell(hsnTotalRow, col);
+    cell.border = {
+      top: { style: "thin" },
+      left: { style: "thin" },
+      bottom: { style: "thin" },
+      right: { style: "thin" },
+    };
   }
 
   return workbook;
