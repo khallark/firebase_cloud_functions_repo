@@ -1,21 +1,11 @@
 // Daily Tax Report Generation Function
 import { onSchedule } from "firebase-functions/v2/scheduler";
-import { db, storage } from "./firebaseAdmin";
+import { db, storage } from "../../firebaseAdmin";
 import ExcelJS from "exceljs";
-import { FieldValue, Timestamp } from "firebase-admin/firestore";
-import { sendSharedStoreOrdersExcelWhatsAppMessage } from "./whatsappMessagesSendingFuncs";
-
-const SHARED_STORE_ID = "nfkjgp-sv.myshopify.com";
-const REPORT_PHONE_NUMBER = "9779752241";
-
-// Status list for Sales Return Report
-const RETURN_STATUSES = new Set([
-  "RTO Closed",
-  "DTO Refunded", 
-  "Lost",
-  "Cancellation Requested",
-  "Cancelled"
-]);
+import { Timestamp } from "firebase-admin/firestore";
+import { formatDate } from "../../helpers";
+import { REPORT_PHONE_NUMBER, RETURN_STATUSES, SHARED_STORE_ID } from "../../config";
+import { sendTaxReportWhatsAppMessage } from "../../services";
 
 interface ProductInfo {
   hsn: string;
@@ -100,18 +90,6 @@ interface HSNPivot {
 }
 
 /**
- * Formats a timestamp to DD-MM-YYYY
- */
-function formatDate(timestamp: any): string {
-  if (!timestamp) return "N/A";
-  const date = timestamp.toDate ? timestamp.toDate() : new Date(timestamp);
-  const day = String(date.getDate()).padStart(2, '0');
-  const month = String(date.getMonth() + 1).padStart(2, '0');
-  const year = date.getFullYear();
-  return `${day}-${month}-${year}`;
-}
-
-/**
  * Gets product HSN and Tax Rate from products collection
  */
 async function getProductInfo(productTitle: string): Promise<ProductInfo> {
@@ -158,30 +136,34 @@ async function getProductInfo(productTitle: string): Promise<ProductInfo> {
  * Calculates taxable amount from sale price (inclusive tax)
  */
 function calculateTaxable(salePrice: number, taxRate: number): number {
-  return Number((salePrice * 100 / (100 + taxRate)).toFixed(2));
+  return Number(((salePrice * 100) / (100 + taxRate)).toFixed(2));
 }
 
 /**
  * Calculates tax amounts based on state
  */
-function calculateTaxes(taxable: number, taxRate: number, state: string): {
+function calculateTaxes(
+  taxable: number,
+  taxRate: number,
+  state: string,
+): {
   igst: number;
   sgst: number;
   cgst: number;
 } {
-  const totalTax = Number((taxable * taxRate / 100).toFixed(2));
-  
+  const totalTax = Number(((taxable * taxRate) / 100).toFixed(2));
+
   if (state === "Punjab") {
     return {
       igst: 0,
       sgst: Number((totalTax / 2).toFixed(2)),
-      cgst: Number((totalTax / 2).toFixed(2))
+      cgst: Number((totalTax / 2).toFixed(2)),
     };
   } else {
     return {
       igst: totalTax,
       sgst: 0,
-      cgst: 0
+      cgst: 0,
     };
   }
 }
@@ -189,12 +171,9 @@ function calculateTaxes(taxable: number, taxRate: number, state: string): {
 /**
  * Calculates proportional refund amount for an item
  */
-function calculateProportionalRefund(
-  order: any,
-  item: any
-): number {
+function calculateProportionalRefund(order: any, item: any): number {
   const refundedAmount = order?.refundedAmount;
-  
+
   if (refundedAmount === undefined || refundedAmount === null || refundedAmount === "") {
     return 0;
   }
@@ -207,7 +186,7 @@ function calculateProportionalRefund(
   // Calculate item's proportion of total order
   const items = order.raw?.line_items || [];
   const orderTotal = items.reduce((sum: number, lineItem: any) => {
-    return sum + (Number(lineItem.price) * Number(lineItem.quantity));
+    return sum + Number(lineItem.price) * Number(lineItem.quantity);
   }, 0);
 
   if (orderTotal === 0) return 0;
@@ -224,11 +203,13 @@ function calculateProportionalRefund(
 async function processSalesOrders(targetDate: Date): Promise<SalesRow[]> {
   const startOfDay = new Date(targetDate);
   startOfDay.setHours(0, 0, 0, 0);
-  
+
   const endOfDay = new Date(targetDate);
   endOfDay.setHours(23, 59, 59, 999);
 
-  console.log(`📊 Fetching sales orders from ${startOfDay.toISOString()} to ${endOfDay.toISOString()}`);
+  console.log(
+    `📊 Fetching sales orders from ${startOfDay.toISOString()} to ${endOfDay.toISOString()}`,
+  );
 
   const ordersSnapshot = await db
     .collection("accounts")
@@ -249,14 +230,13 @@ async function processSalesOrders(targetDate: Date): Promise<SalesRow[]> {
 
     for (const item of items) {
       try {
-        const customerName = order.raw.customer?.first_name && order.raw.customer?.last_name
-          ? `${order.raw.customer.first_name} ${order.raw.customer.last_name}`
-          : order.raw.billing_address?.name || order.raw.shipping_address?.name || "N/A";
+        const customerName =
+          order.raw.customer?.first_name && order.raw.customer?.last_name
+            ? `${order.raw.customer.first_name} ${order.raw.customer.last_name}`
+            : order.raw.billing_address?.name || order.raw.shipping_address?.name || "N/A";
 
         const state = String(
-          order.raw.shipping_address?.province || 
-          order.raw.billing_address?.province || 
-          ""
+          order.raw.shipping_address?.province || order.raw.billing_address?.province || "",
         );
 
         const itemQty = Number(item.quantity || 0);
@@ -288,7 +268,7 @@ async function processSalesOrders(targetDate: Date): Promise<SalesRow[]> {
           igst: taxes.igst,
           sgst: taxes.sgst,
           cgst: taxes.cgst,
-          vendor: String(item.vendor || "")
+          vendor: String(item.vendor || ""),
         });
       } catch (error) {
         console.error(`Error processing item in order ${order.name}:`, error);
@@ -305,11 +285,13 @@ async function processSalesOrders(targetDate: Date): Promise<SalesRow[]> {
 async function processSalesReturnOrders(targetDate: Date): Promise<SalesReturnRow[]> {
   const startOfDay = new Date(targetDate);
   startOfDay.setHours(0, 0, 0, 0);
-  
+
   const endOfDay = new Date(targetDate);
   endOfDay.setHours(23, 59, 59, 999);
 
-  console.log(`📊 Fetching sales return orders with status changes on ${targetDate.toDateString()}`);
+  console.log(
+    `📊 Fetching sales return orders with status changes on ${targetDate.toDateString()}`,
+  );
 
   // Fetch all orders (we need to filter by customStatusesLogs)
   const ordersSnapshot = await db
@@ -331,16 +313,15 @@ async function processSalesReturnOrders(targetDate: Date): Promise<SalesReturnRo
     // Find logs from target date with return statuses
     const returnLogs = statusLogs.filter((log: any) => {
       if (!log.createdAt || !log.status) return false;
-      
+
       const logDate = log.createdAt.toDate ? log.createdAt.toDate() : new Date(log.createdAt);
       const logDateOnly = new Date(logDate);
       logDateOnly.setHours(0, 0, 0, 0);
-      
+
       const targetDateOnly = new Date(targetDate);
       targetDateOnly.setHours(0, 0, 0, 0);
-      
-      return logDateOnly.getTime() === targetDateOnly.getTime() && 
-             RETURN_STATUSES.has(log.status);
+
+      return logDateOnly.getTime() === targetDateOnly.getTime() && RETURN_STATUSES.has(log.status);
     });
 
     if (returnLogs.length === 0) continue;
@@ -353,14 +334,13 @@ async function processSalesReturnOrders(targetDate: Date): Promise<SalesReturnRo
 
     for (const item of items) {
       try {
-        const customerName = order.raw.customer?.first_name && order.raw.customer?.last_name
-          ? `${order.raw.customer.first_name} ${order.raw.customer.last_name}`
-          : order.raw.billing_address?.name || order.raw.shipping_address?.name || "N/A";
+        const customerName =
+          order.raw.customer?.first_name && order.raw.customer?.last_name
+            ? `${order.raw.customer.first_name} ${order.raw.customer.last_name}`
+            : order.raw.billing_address?.name || order.raw.shipping_address?.name || "N/A";
 
         const state = String(
-          order.raw.shipping_address?.province || 
-          order.raw.billing_address?.province || 
-          ""
+          order.raw.shipping_address?.province || order.raw.billing_address?.province || "",
         );
 
         const itemQty = Number(item.quantity || 0);
@@ -374,7 +354,7 @@ async function processSalesReturnOrders(targetDate: Date): Promise<SalesReturnRo
 
         // Get HSN and Tax Rate
         const productInfo = await getProductInfo(item.title);
-        
+
         // Calculate taxable on refund amount instead of sale price
         const taxable = calculateTaxable(refundAmount, productInfo.taxRate);
         const taxes = calculateTaxes(taxable, productInfo.taxRate, state);
@@ -400,7 +380,7 @@ async function processSalesReturnOrders(targetDate: Date): Promise<SalesReturnRo
           igst: taxes.igst,
           sgst: taxes.sgst,
           cgst: taxes.cgst,
-          vendor: String(item.vendor || "")
+          vendor: String(item.vendor || ""),
         });
       } catch (error) {
         console.error(`Error processing return item in order ${order.name}:`, error);
@@ -416,22 +396,34 @@ async function processSalesReturnOrders(targetDate: Date): Promise<SalesReturnRo
 /**
  * Generates state-wise pivot data
  */
-function generateStatePivot(
-  salesRows: SalesRow[],
-  returnRows: SalesReturnRow[]
-): StatePivot[] {
+function generateStatePivot(salesRows: SalesRow[], returnRows: SalesReturnRow[]): StatePivot[] {
   const stateMap = new Map<string, StatePivot>();
 
   // Process sales data
-  salesRows.forEach(row => {
+  salesRows.forEach((row) => {
     const state = row.state || "Unknown";
-    
+
     if (!stateMap.has(state)) {
       stateMap.set(state, {
         state,
-        grossQty: 0, grossTaxable: 0, grossIGST: 0, grossSGST: 0, grossCGST: 0, grossInvoiceAmount: 0,
-        returnQty: 0, returnTaxable: 0, returnIGST: 0, returnSGST: 0, returnCGST: 0, returnInvoiceAmount: 0,
-        netQty: 0, netTaxable: 0, netIGST: 0, netSGST: 0, netCGST: 0, netInvoiceAmount: 0
+        grossQty: 0,
+        grossTaxable: 0,
+        grossIGST: 0,
+        grossSGST: 0,
+        grossCGST: 0,
+        grossInvoiceAmount: 0,
+        returnQty: 0,
+        returnTaxable: 0,
+        returnIGST: 0,
+        returnSGST: 0,
+        returnCGST: 0,
+        returnInvoiceAmount: 0,
+        netQty: 0,
+        netTaxable: 0,
+        netIGST: 0,
+        netSGST: 0,
+        netCGST: 0,
+        netInvoiceAmount: 0,
       });
     }
 
@@ -445,15 +437,30 @@ function generateStatePivot(
   });
 
   // Process return data
-  returnRows.forEach(row => {
+  returnRows.forEach((row) => {
     const state = row.state || "Unknown";
-    
+
     if (!stateMap.has(state)) {
       stateMap.set(state, {
         state,
-        grossQty: 0, grossTaxable: 0, grossIGST: 0, grossSGST: 0, grossCGST: 0, grossInvoiceAmount: 0,
-        returnQty: 0, returnTaxable: 0, returnIGST: 0, returnSGST: 0, returnCGST: 0, returnInvoiceAmount: 0,
-        netQty: 0, netTaxable: 0, netIGST: 0, netSGST: 0, netCGST: 0, netInvoiceAmount: 0
+        grossQty: 0,
+        grossTaxable: 0,
+        grossIGST: 0,
+        grossSGST: 0,
+        grossCGST: 0,
+        grossInvoiceAmount: 0,
+        returnQty: 0,
+        returnTaxable: 0,
+        returnIGST: 0,
+        returnSGST: 0,
+        returnCGST: 0,
+        returnInvoiceAmount: 0,
+        netQty: 0,
+        netTaxable: 0,
+        netIGST: 0,
+        netSGST: 0,
+        netCGST: 0,
+        netInvoiceAmount: 0,
       });
     }
 
@@ -468,13 +475,15 @@ function generateStatePivot(
 
   // Calculate net sales
   const pivotArray = Array.from(stateMap.values());
-  pivotArray.forEach(pivot => {
+  pivotArray.forEach((pivot) => {
     pivot.netQty = Number((pivot.grossQty - pivot.returnQty).toFixed(2));
     pivot.netTaxable = Number((pivot.grossTaxable - pivot.returnTaxable).toFixed(2));
     pivot.netIGST = Number((pivot.grossIGST - pivot.returnIGST).toFixed(2));
     pivot.netSGST = Number((pivot.grossSGST - pivot.returnSGST).toFixed(2));
     pivot.netCGST = Number((pivot.grossCGST - pivot.returnCGST).toFixed(2));
-    pivot.netInvoiceAmount = Number((pivot.grossInvoiceAmount - pivot.returnInvoiceAmount).toFixed(2));
+    pivot.netInvoiceAmount = Number(
+      (pivot.grossInvoiceAmount - pivot.returnInvoiceAmount).toFixed(2),
+    );
   });
 
   return pivotArray.sort((a, b) => a.state.localeCompare(b.state));
@@ -483,22 +492,34 @@ function generateStatePivot(
 /**
  * Generates HSN-wise pivot data
  */
-function generateHSNPivot(
-  salesRows: SalesRow[],
-  returnRows: SalesReturnRow[]
-): HSNPivot[] {
+function generateHSNPivot(salesRows: SalesRow[], returnRows: SalesReturnRow[]): HSNPivot[] {
   const hsnMap = new Map<string, HSNPivot>();
 
   // Process sales data
-  salesRows.forEach(row => {
+  salesRows.forEach((row) => {
     const hsn = row.hsn || "Unknown";
-    
+
     if (!hsnMap.has(hsn)) {
       hsnMap.set(hsn, {
         hsn,
-        grossQty: 0, grossTaxable: 0, grossIGST: 0, grossSGST: 0, grossCGST: 0, grossInvoiceAmount: 0,
-        returnQty: 0, returnTaxable: 0, returnIGST: 0, returnSGST: 0, returnCGST: 0, returnInvoiceAmount: 0,
-        netQty: 0, netTaxable: 0, netIGST: 0, netSGST: 0, netCGST: 0, netInvoiceAmount: 0
+        grossQty: 0,
+        grossTaxable: 0,
+        grossIGST: 0,
+        grossSGST: 0,
+        grossCGST: 0,
+        grossInvoiceAmount: 0,
+        returnQty: 0,
+        returnTaxable: 0,
+        returnIGST: 0,
+        returnSGST: 0,
+        returnCGST: 0,
+        returnInvoiceAmount: 0,
+        netQty: 0,
+        netTaxable: 0,
+        netIGST: 0,
+        netSGST: 0,
+        netCGST: 0,
+        netInvoiceAmount: 0,
       });
     }
 
@@ -512,15 +533,30 @@ function generateHSNPivot(
   });
 
   // Process return data
-  returnRows.forEach(row => {
+  returnRows.forEach((row) => {
     const hsn = row.hsn || "Unknown";
-    
+
     if (!hsnMap.has(hsn)) {
       hsnMap.set(hsn, {
         hsn,
-        grossQty: 0, grossTaxable: 0, grossIGST: 0, grossSGST: 0, grossCGST: 0, grossInvoiceAmount: 0,
-        returnQty: 0, returnTaxable: 0, returnIGST: 0, returnSGST: 0, returnCGST: 0, returnInvoiceAmount: 0,
-        netQty: 0, netTaxable: 0, netIGST: 0, netSGST: 0, netCGST: 0, netInvoiceAmount: 0
+        grossQty: 0,
+        grossTaxable: 0,
+        grossIGST: 0,
+        grossSGST: 0,
+        grossCGST: 0,
+        grossInvoiceAmount: 0,
+        returnQty: 0,
+        returnTaxable: 0,
+        returnIGST: 0,
+        returnSGST: 0,
+        returnCGST: 0,
+        returnInvoiceAmount: 0,
+        netQty: 0,
+        netTaxable: 0,
+        netIGST: 0,
+        netSGST: 0,
+        netCGST: 0,
+        netInvoiceAmount: 0,
       });
     }
 
@@ -535,13 +571,15 @@ function generateHSNPivot(
 
   // Calculate net sales
   const pivotArray = Array.from(hsnMap.values());
-  pivotArray.forEach(pivot => {
+  pivotArray.forEach((pivot) => {
     pivot.netQty = Number((pivot.grossQty - pivot.returnQty).toFixed(2));
     pivot.netTaxable = Number((pivot.grossTaxable - pivot.returnTaxable).toFixed(2));
     pivot.netIGST = Number((pivot.grossIGST - pivot.returnIGST).toFixed(2));
     pivot.netSGST = Number((pivot.grossSGST - pivot.returnSGST).toFixed(2));
     pivot.netCGST = Number((pivot.grossCGST - pivot.returnCGST).toFixed(2));
-    pivot.netInvoiceAmount = Number((pivot.grossInvoiceAmount - pivot.returnInvoiceAmount).toFixed(2));
+    pivot.netInvoiceAmount = Number(
+      (pivot.grossInvoiceAmount - pivot.returnInvoiceAmount).toFixed(2),
+    );
   });
 
   return pivotArray.sort((a, b) => a.hsn.localeCompare(b.hsn));
@@ -554,7 +592,7 @@ async function createExcelWorkbook(
   salesRows: SalesRow[],
   returnRows: SalesReturnRow[],
   statePivot: StatePivot[],
-  hsnPivot: HSNPivot[]
+  hsnPivot: HSNPivot[],
 ): Promise<ExcelJS.Workbook> {
   const workbook = new ExcelJS.Workbook();
 
@@ -578,17 +616,17 @@ async function createExcelWorkbook(
     { header: "IGST", key: "igst", width: 12 },
     { header: "SGST", key: "sgst", width: 12 },
     { header: "CGST", key: "cgst", width: 12 },
-    { header: "Vendor", key: "vendor", width: 20 }
+    { header: "Vendor", key: "vendor", width: 20 },
   ];
 
-  salesRows.forEach(row => salesSheet.addRow(row));
+  salesRows.forEach((row) => salesSheet.addRow(row));
 
   // Style header
   salesSheet.getRow(1).font = { bold: true, color: { argb: "FFFFFFFF" } };
   salesSheet.getRow(1).fill = {
     type: "pattern",
     pattern: "solid",
-    fgColor: { argb: "FF4472C4" }
+    fgColor: { argb: "FF4472C4" },
   };
   salesSheet.getRow(1).alignment = { vertical: "middle", horizontal: "center" };
 
@@ -615,67 +653,67 @@ async function createExcelWorkbook(
     { header: "IGST", key: "igst", width: 12 },
     { header: "SGST", key: "sgst", width: 12 },
     { header: "CGST", key: "cgst", width: 12 },
-    { header: "Vendor", key: "vendor", width: 20 }
+    { header: "Vendor", key: "vendor", width: 20 },
   ];
 
-  returnRows.forEach(row => returnSheet.addRow(row));
+  returnRows.forEach((row) => returnSheet.addRow(row));
 
   // Style header
   returnSheet.getRow(1).font = { bold: true, color: { argb: "FFFFFFFF" } };
   returnSheet.getRow(1).fill = {
     type: "pattern",
     pattern: "solid",
-    fgColor: { argb: "FF4472C4" }
+    fgColor: { argb: "FF4472C4" },
   };
   returnSheet.getRow(1).alignment = { vertical: "middle", horizontal: "center" };
 
   // Sheet 3: State Wise Tax Report
   const stateSheet = workbook.addWorksheet("State Wise Tax Report");
-  
+
   // Create multi-level headers
   stateSheet.mergeCells("A1:A2");
   stateSheet.getCell("A1").value = "State";
-  
+
   stateSheet.mergeCells("B1:G1");
   stateSheet.getCell("B1").value = "Gross Sales";
-  
+
   stateSheet.mergeCells("H1:M1");
   stateSheet.getCell("H1").value = "Refund/Sale Return Amount";
-  
+
   stateSheet.mergeCells("N1:S1");
   stateSheet.getCell("N1").value = "Net Sales";
-  
+
   // Sub-headers row 2
   const subHeaders = ["Qty", "Taxable Sales", "IGST", "SGST", "CGST", "Invoice Amount"];
-  
+
   let col = 2; // Column B
-  subHeaders.forEach(header => {
+  subHeaders.forEach((header) => {
     stateSheet.getCell(2, col++).value = header;
   });
-  
-  subHeaders.forEach(header => {
+
+  subHeaders.forEach((header) => {
     stateSheet.getCell(2, col++).value = header;
   });
-  
-  subHeaders.forEach(header => {
+
+  subHeaders.forEach((header) => {
     stateSheet.getCell(2, col++).value = header;
   });
 
   // Style headers
-  [1, 2].forEach(rowNum => {
+  [1, 2].forEach((rowNum) => {
     const row = stateSheet.getRow(rowNum);
     row.font = { bold: true, color: { argb: "FFFFFFFF" } };
     row.fill = {
       type: "pattern",
       pattern: "solid",
-      fgColor: { argb: "FF4472C4" }
+      fgColor: { argb: "FF4472C4" },
     };
     row.alignment = { vertical: "middle", horizontal: "center" };
   });
 
   // Add data rows
   let currentRow = 3;
-  statePivot.forEach(pivot => {
+  statePivot.forEach((pivot) => {
     stateSheet.getCell(currentRow, 1).value = pivot.state;
     stateSheet.getCell(currentRow, 2).value = pivot.grossQty;
     stateSheet.getCell(currentRow, 3).value = pivot.grossTaxable;
@@ -702,7 +740,7 @@ async function createExcelWorkbook(
   const totalRow = currentRow;
   stateSheet.getCell(totalRow, 1).value = "Grand Total";
   stateSheet.getCell(totalRow, 1).font = { bold: true };
-  
+
   for (let col = 2; col <= 19; col++) {
     let sum = 0;
     for (let row = 3; row < totalRow; row++) {
@@ -714,49 +752,49 @@ async function createExcelWorkbook(
 
   // Sheet 4: HSN Wise Tax Report
   const hsnSheet = workbook.addWorksheet("HSN Wise Tax Report");
-  
+
   // Create multi-level headers (same structure as state sheet)
   hsnSheet.mergeCells("A1:A2");
   hsnSheet.getCell("A1").value = "HSN";
-  
+
   hsnSheet.mergeCells("B1:G1");
   hsnSheet.getCell("B1").value = "Gross Sales";
-  
+
   hsnSheet.mergeCells("H1:M1");
   hsnSheet.getCell("H1").value = "Refund/Sale Return Amount";
-  
+
   hsnSheet.mergeCells("N1:S1");
   hsnSheet.getCell("N1").value = "Net Sales";
-  
+
   // Sub-headers row 2
   col = 2;
-  subHeaders.forEach(header => {
+  subHeaders.forEach((header) => {
     hsnSheet.getCell(2, col++).value = header;
   });
-  
-  subHeaders.forEach(header => {
+
+  subHeaders.forEach((header) => {
     hsnSheet.getCell(2, col++).value = header;
   });
-  
-  subHeaders.forEach(header => {
+
+  subHeaders.forEach((header) => {
     hsnSheet.getCell(2, col++).value = header;
   });
 
   // Style headers
-  [1, 2].forEach(rowNum => {
+  [1, 2].forEach((rowNum) => {
     const row = hsnSheet.getRow(rowNum);
     row.font = { bold: true, color: { argb: "FFFFFFFF" } };
     row.fill = {
       type: "pattern",
       pattern: "solid",
-      fgColor: { argb: "FF4472C4" }
+      fgColor: { argb: "FF4472C4" },
     };
     row.alignment = { vertical: "middle", horizontal: "center" };
   });
 
   // Add data rows
   currentRow = 3;
-  hsnPivot.forEach(pivot => {
+  hsnPivot.forEach((pivot) => {
     hsnSheet.getCell(currentRow, 1).value = pivot.hsn;
     hsnSheet.getCell(currentRow, 2).value = pivot.grossQty;
     hsnSheet.getCell(currentRow, 3).value = pivot.grossTaxable;
@@ -783,7 +821,7 @@ async function createExcelWorkbook(
   const hsnTotalRow = currentRow;
   hsnSheet.getCell(hsnTotalRow, 1).value = "Grand Total";
   hsnSheet.getCell(hsnTotalRow, 1).font = { bold: true };
-  
+
   for (let col = 2; col <= 19; col++) {
     let sum = 0;
     for (let row = 3; row < hsnTotalRow; row++) {
@@ -815,7 +853,7 @@ export const generateDailyTaxReport = onSchedule(
       const today = new Date();
       const yesterday = new Date(today);
       yesterday.setDate(yesterday.getDate() - 1);
-      
+
       console.log(`📅 Generating report for: ${yesterday.toDateString()}`);
 
       // Step 1: Process Sales Orders
@@ -874,7 +912,7 @@ export const generateDailyTaxReport = onSchedule(
 
       await file.makePublic();
       const downloadUrl = `https://storage.googleapis.com/${bucket.name}/${filePath}`;
-      
+
       console.log(`✅ File uploaded: ${downloadUrl}`);
 
       // Step 7: Send WhatsApp Message
@@ -883,11 +921,7 @@ export const generateDailyTaxReport = onSchedule(
       const shopData = shopDoc.data();
 
       if (shopData) {
-        await sendSharedStoreOrdersExcelWhatsAppMessage(
-          shopData,
-          downloadUrl,
-          REPORT_PHONE_NUMBER
-        );
+        await sendTaxReportWhatsAppMessage(shopData, downloadUrl, REPORT_PHONE_NUMBER);
         console.log(`✅ WhatsApp message sent to ${REPORT_PHONE_NUMBER}`);
       }
 
@@ -898,10 +932,9 @@ export const generateDailyTaxReport = onSchedule(
       console.log(`   - States covered: ${statePivot.length}`);
       console.log(`   - HSN codes: ${hsnPivot.length}`);
       console.log(`   - Download URL: ${downloadUrl}`);
-
     } catch (error) {
       console.error("❌ Error generating daily tax report:", error);
       throw error;
     }
-  }
+  },
 );
