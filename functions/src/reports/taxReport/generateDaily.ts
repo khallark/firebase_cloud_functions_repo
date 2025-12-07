@@ -573,7 +573,7 @@ function generateHSNPivot(salesRows: SalesRow[], returnRows: SalesReturnRow[]): 
   // Calculate net sales
   const pivotArray = Array.from(hsnMap.values());
   pivotArray.forEach((pivot) => {
-    pivot.netQty = Number((pivot.grossQty - pivot.returnQty).toFixed(2));
+    pivot.netQty = Number((pivot.grossQty + pivot.returnQty).toFixed(2));
     pivot.netTaxable = Number((pivot.grossTaxable - pivot.returnTaxable).toFixed(2));
     pivot.netIGST = Number((pivot.grossIGST - pivot.returnIGST).toFixed(2));
     pivot.netSGST = Number((pivot.grossSGST - pivot.returnSGST).toFixed(2));
@@ -649,6 +649,9 @@ async function createExcelWorkbook(
         left: { style: "thin" },
         right: { style: "thin" },
       };
+      if (row == salesRows.length + 1) {
+        cell.border.bottom = { style: "thin" };
+      }
     }
   }
 
@@ -707,6 +710,9 @@ async function createExcelWorkbook(
         left: { style: "thin" },
         right: { style: "thin" },
       };
+      if (row == returnRows.length + 1) {
+        cell.border.bottom = { style: "thin" };
+      }
     }
   }
 

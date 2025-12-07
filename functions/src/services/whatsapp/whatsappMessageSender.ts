@@ -169,7 +169,9 @@ export async function sendWhatsAppTextMessage(
     }
 
     const result = (await response.json()) as any;
-    console.log(`✅ WhatsApp message sent successfully to ${phone}`);
+    console.log(
+      `✅ WhatsApp message sent successfully to ${result.contacts?.[0]?.input}, messageId: ${result.messages?.[0]?.id}`,
+    );
 
     return {
       success: true,
