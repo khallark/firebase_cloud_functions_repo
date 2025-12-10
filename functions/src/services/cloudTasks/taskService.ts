@@ -34,7 +34,7 @@ export async function createTask(payload: any, config: CloudTaskConfig): Promise
       url: config.url,
       headers: {
         "Content-Type": "application/json",
-        "x-tasks-secret": config.tasksSecret,
+        "X-Tasks-Secret": config.tasksSecret,
       },
       body: Buffer.from(JSON.stringify(payload)).toString("base64"),
     },

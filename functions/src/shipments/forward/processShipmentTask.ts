@@ -18,6 +18,11 @@ import {
 } from "../../helpers";
 import { db } from "../../firebaseAdmin";
 
+// Helper function - add this somewhere
+function sanitizeForFirestore(obj: any): any {
+  return JSON.parse(JSON.stringify(obj));
+}
+
 /**
  * Processes a single shipment task for Delhivery
  */
@@ -332,7 +337,7 @@ export const processShipmentTask = onRequest(
           carrierShipmentId: verdict.carrierShipmentId ?? null,
           errorCode: FieldValue.delete(),
           errorMessage: FieldValue.delete(),
-          apiResp: carrier,
+          apiResp: sanitizeForFirestore(carrier),
           completedAt: FieldValue.serverTimestamp(),
         });
 

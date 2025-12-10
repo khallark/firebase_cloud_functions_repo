@@ -1,6 +1,6 @@
 import ExcelJS from "exceljs";
 import { formatDate } from "../../helpers";
-import { RETURN_STATUSES, SHARED_STORE_ID } from "../../config";
+import { RETURN_STATUSES } from "../../config";
 import { db } from "../../firebaseAdmin";
 
 interface ProductInfo {
@@ -88,11 +88,11 @@ interface HSNPivot {
 /**
  * Gets product HSN and Tax Rate from products collection
  */
-async function getProductInfo(productTitle: string): Promise<ProductInfo> {
+async function getProductInfo(storeId: string, productTitle: string): Promise<ProductInfo> {
   try {
     const productsSnapshot = await db
       .collection("accounts")
-      .doc(SHARED_STORE_ID)
+      .doc(storeId)
       .collection("products")
       .where("title", "==", productTitle)
       .limit(1)
@@ -198,7 +198,11 @@ function calculateProportionalRefund(order: any, item: any): number {
 /**
  * Processes sales orders (created within the date range)
  */
-async function processSalesOrders(startDate: Date, endDate: Date): Promise<SalesRow[]> {
+async function processSalesOrders(
+  storeId: string,
+  startDate: Date,
+  endDate: Date,
+): Promise<SalesRow[]> {
   const startOfRange = new Date(startDate);
   startOfRange.setHours(0, 0, 0, 0);
 
@@ -211,7 +215,7 @@ async function processSalesOrders(startDate: Date, endDate: Date): Promise<Sales
 
   const ordersSnapshot = await db
     .collection("accounts")
-    .doc(SHARED_STORE_ID)
+    .doc(storeId)
     .collection("orders")
     .where("createdAt", ">=", startOfRange.toISOString())
     .where("createdAt", "<=", endOfRange.toISOString())
@@ -244,7 +248,7 @@ async function processSalesOrders(startDate: Date, endDate: Date): Promise<Sales
         const salePrice = Number((mrp - discountLinewise).toFixed(2));
 
         // Get HSN and Tax Rate
-        const productInfo = await getProductInfo(item.title);
+        const productInfo = await getProductInfo(storeId, item.title);
         const taxable = calculateTaxable(salePrice, productInfo.taxRate);
         const taxes = calculateTaxes(taxable, productInfo.taxRate, state);
 
@@ -280,7 +284,11 @@ async function processSalesOrders(startDate: Date, endDate: Date): Promise<Sales
 /**
  * Processes sales return orders (status changed to return statuses within date range)
  */
-async function processSalesReturnOrders(startDate: Date, endDate: Date): Promise<SalesReturnRow[]> {
+async function processSalesReturnOrders(
+  storeId: string,
+  startDate: Date,
+  endDate: Date,
+): Promise<SalesReturnRow[]> {
   const startOfRange = new Date(startDate);
   startOfRange.setHours(0, 0, 0, 0);
 
@@ -292,11 +300,7 @@ async function processSalesReturnOrders(startDate: Date, endDate: Date): Promise
   );
 
   // Fetch all orders (we need to filter by customStatusesLogs)
-  const ordersSnapshot = await db
-    .collection("accounts")
-    .doc(SHARED_STORE_ID)
-    .collection("orders")
-    .get();
+  const ordersSnapshot = await db.collection("accounts").doc(storeId).collection("orders").get();
 
   console.log(`Scanning ${ordersSnapshot.size} total orders for returns`);
 
@@ -358,7 +362,7 @@ async function processSalesReturnOrders(startDate: Date, endDate: Date): Promise
         const refundAmount = calculateProportionalRefund(order, item);
 
         // Get HSN and Tax Rate
-        const productInfo = await getProductInfo(item.title);
+        const productInfo = await getProductInfo(storeId, item.title);
 
         // Calculate taxable on refund amount instead of sale price
         const taxable = calculateTaxable(refundAmount, productInfo.taxRate);
@@ -481,7 +485,7 @@ function generateStatePivot(salesRows: SalesRow[], returnRows: SalesReturnRow[])
   // Calculate net sales
   const pivotArray = Array.from(stateMap.values());
   pivotArray.forEach((pivot) => {
-    pivot.netQty = Number((pivot.grossQty + pivot.returnQty).toFixed(2));
+    pivot.netQty = Number((pivot.grossQty - pivot.returnQty).toFixed(2));
     pivot.netTaxable = Number((pivot.grossTaxable - pivot.returnTaxable).toFixed(2));
     pivot.netIGST = Number((pivot.grossIGST - pivot.returnIGST).toFixed(2));
     pivot.netSGST = Number((pivot.grossSGST - pivot.returnSGST).toFixed(2));
@@ -577,7 +581,7 @@ function generateHSNPivot(salesRows: SalesRow[], returnRows: SalesReturnRow[]): 
   // Calculate net sales
   const pivotArray = Array.from(hsnMap.values());
   pivotArray.forEach((pivot) => {
-    pivot.netQty = Number((pivot.grossQty + pivot.returnQty).toFixed(2));
+    pivot.netQty = Number((pivot.grossQty - pivot.returnQty).toFixed(2));
     pivot.netTaxable = Number((pivot.grossTaxable - pivot.returnTaxable).toFixed(2));
     pivot.netIGST = Number((pivot.grossIGST - pivot.returnIGST).toFixed(2));
     pivot.netSGST = Number((pivot.grossSGST - pivot.returnSGST).toFixed(2));
@@ -953,6 +957,7 @@ async function createExcelWorkbook(
  * Core function to generate tax report for a date range
  */
 export async function generateTaxReport(
+  storeId: string,
   startDate: Date,
   endDate: Date,
 ): Promise<{
@@ -966,12 +971,12 @@ export async function generateTaxReport(
 
   // Step 1: Process Sales Orders
   console.log("\n📊 Step 1: Processing Sales Orders...");
-  const salesRows = await processSalesOrders(startDate, endDate);
+  const salesRows = await processSalesOrders(storeId, startDate, endDate);
   console.log(`✅ Processed ${salesRows.length} sales line items`);
 
   // Step 2: Process Sales Return Orders
   console.log("\n📊 Step 2: Processing Sales Return Orders...");
-  const returnRows = await processSalesReturnOrders(startDate, endDate);
+  const returnRows = await processSalesReturnOrders(storeId, startDate, endDate);
   console.log(`✅ Processed ${returnRows.length} return line items`);
 
   // Step 3: Generate State Pivot

@@ -231,7 +231,7 @@ export async function sendSplitOrdersWhatsAppMessage(
         { type: "text", text: newOrderList },
       ],
     },
-    "Damaged",
+    "Order Splitted",
   );
 }
 
@@ -261,7 +261,7 @@ export async function sendDTOBookedOrderWhatsAppMessage(
       ],
       buttonParameters: [{ type: "text", text: queryString }],
     },
-    "Cancelled",
+    "DTO Booked",
   );
 }
 
@@ -291,7 +291,7 @@ export async function sendDTOInTransitOrderWhatsAppMessage(
       ],
       buttonParameters: [{ type: "text", text: queryString }],
     },
-    "Cancelled",
+    "DTO In Transit",
   );
 }
 
@@ -319,6 +319,6 @@ export async function sendDTODeliveredOrderWhatsAppMessage(
         { type: "text", text: deliveredDate },
       ],
     },
-    "Cancelled",
+    "DTO Delivered",
   );
 }
