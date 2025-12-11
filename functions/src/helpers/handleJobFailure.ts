@@ -4,6 +4,15 @@ import { TASKS_SECRET } from "../config";
 import { maybeCompleteBatch } from "./maybeCompleteBatch";
 import { db } from "../firebaseAdmin";
 
+function safeStringify(obj: any): string | null {
+  if (!obj) return null;
+  try {
+    return JSON.stringify(obj);
+  } catch {
+    return String(obj);
+  }
+}
+
 /**
  * Handles job failure with retry logic and priority fallback
  */
@@ -64,7 +73,7 @@ export async function handleJobFailure(params: {
         lastErrorCode: errorCode,
         lastErrorMessage: errorMessage.slice(0, 400),
         lastFailedAt: FieldValue.serverTimestamp(),
-        ...(apiResp && { lastApiResp: apiResp }),
+        ...(apiResp && { lastApiResp: safeStringify(apiResp) }),
       });
       tx.update(batchRef, {
         processing: FieldValue.increment(-1),
@@ -78,7 +87,7 @@ export async function handleJobFailure(params: {
       errorCode: isRetryable ? "EXCEPTION" : errorCode,
       errorMessage: errorMessage.slice(0, 400),
     };
-    if (apiResp) updateData.apiResp = apiResp;
+    if (apiResp) updateData.apiResp = safeStringify(apiResp);
 
     tx.set(jobRef, updateData, { merge: true });
 

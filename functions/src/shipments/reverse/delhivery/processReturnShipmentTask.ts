@@ -1,28 +1,104 @@
-// functions/src/functions/shipments/forward/processShipmentTask3.ts
-
 import { onRequest } from "firebase-functions/v2/https";
-import type { Request, Response } from "express";
-import fetch from "node-fetch";
-import { FieldValue, Transaction, Timestamp } from "firebase-admin/firestore";
-import { buildXpressbeesPayload, evaluateXpressbeesResponse, selectCourier } from "../../couriers";
-import { NON_RETRYABLE } from "./shipmentHelpers";
-import { SHARED_STORE_ID, TASKS_SECRET } from "../../config";
+import { NON_RETRYABLE_ERROR_CODES, SHARED_STORE_ID, TASKS_SECRET } from "../../../config";
 import {
   BusinessIsAuthorisedToProcessThisOrder,
-  handleJobFailure,
-  httpRetryable,
   maybeCompleteBatch,
-  parseJson,
   requireHeaderSecret,
-} from "../../helpers";
-import { db } from "../../firebaseAdmin";
+} from "../../../helpers";
+import { allocateAwb, releaseAwb, sendDTOBookedOrderWhatsAppMessage } from "../../../services";
+import { FieldValue, Timestamp, Transaction } from "firebase-admin/firestore";
+import { handleReturnJobFailure } from "../helpers";
+import { buildDelhiveryReturnPayload } from "../../../couriers";
+import { db } from "../../../firebaseAdmin";
 
-/**
- * Processes a single shipment task for Xpressbees
- */
-export const processShipmentTask3 = onRequest(
+const RETURN_NON_RETRYABLE = NON_RETRYABLE_ERROR_CODES;
+
+export const processReturnShipmentTask = onRequest(
   { cors: true, timeoutSeconds: 60, secrets: [TASKS_SECRET] },
-  async (req: Request, res: Response): Promise<void> => {
+  async (req, res) => {
+    let awb: string | undefined;
+    let awbReleased = false;
+
+    // --- helpers -------------------------------------------------------------
+    const parseJson = (t: string) => {
+      try {
+        return JSON.parse(t);
+      } catch {
+        return { raw: t };
+      }
+    };
+
+    /** Classify Delhivery return response */
+    function evalDelhiveryReturnResp(carrier: any): {
+      ok: boolean;
+      retryable: boolean;
+      code: string;
+      message: string;
+      carrierShipmentId?: string | null;
+    } {
+      const remarksArr = carrier.packages?.[0]?.remarks;
+      let remarks = "";
+      if (Array.isArray(remarksArr)) remarks = remarksArr.join("\n ");
+
+      const okFlag = carrier?.success === true && carrier?.error !== true;
+
+      if (okFlag) {
+        return {
+          ok: true,
+          retryable: false,
+          code: "OK",
+          message: "return created",
+          carrierShipmentId: null,
+        };
+      }
+
+      // Check for insufficient balance error
+      const lowerRemarks = remarks.toLowerCase();
+      const lowerError = String(carrier?.error || carrier?.message || "").toLowerCase();
+      const combinedText = `${lowerRemarks} ${lowerError}`;
+
+      const balanceKeywords = [
+        "insufficient",
+        "wallet",
+        "balance",
+        "insufficient balance",
+        "low balance",
+        "wallet balance",
+        "insufficient wallet",
+        "insufficient fund",
+        "recharge",
+        "add balance",
+        "balance low",
+        "no balance",
+      ];
+
+      const isBalanceError = balanceKeywords.some((keyword) => combinedText.includes(keyword));
+
+      if (isBalanceError) {
+        return {
+          ok: false,
+          retryable: false,
+          code: "INSUFFICIENT_BALANCE",
+          message: remarks || "Insufficient balance in carrier account",
+        };
+      }
+
+      // Known permanent validation/business errors (non-retryable)
+      return {
+        ok: false,
+        retryable: false,
+        code: "CARRIER_AMBIGUOUS",
+        message: remarks || "Unknown carrier error",
+      };
+    }
+
+    /** Decide if an HTTP failure status is retryable */
+    function httpRetryable(status: number) {
+      if (status === 429 || status === 408 || status === 409 || status === 425) return true;
+      if (status >= 500) return true;
+      return false;
+    }
+
     // -------------------------------------------------------------------------
 
     try {
@@ -41,7 +117,7 @@ export const processShipmentTask3 = onRequest(
         shippingMode?: string;
       };
 
-      if (!businessId || !shop || !batchId || !jobId || !pickupName || !shippingMode) {
+      if (!businessId || !shop || !batchId || !jobId || !pickupName) {
         res.status(400).json({ error: "bad_payload" });
         return;
       }
@@ -49,17 +125,21 @@ export const processShipmentTask3 = onRequest(
       const batchRef = db
         .collection("users")
         .doc(businessId)
-        .collection("shipment_batches")
+        .collection("book_return_batches")
         .doc(batchId);
       const jobRef = batchRef.collection("jobs").doc(String(jobId));
       const orderRef = db.collection("accounts").doc(shop).collection("orders").doc(String(jobId));
+      const orderData = (await orderRef.get()).data() as any;
       const businessRef = db.collection("users").doc(businessId);
+      const businessData = (await businessRef.get()).data() as any;
+      const shopData = (await db.collection("accounts").doc(shop).get()).data() as any;
 
-      // FIX: Atomic idempotency check inside transaction
+      // FIX: Atomic idempotency check and status update
       const shouldProceed = await db.runTransaction(async (tx: Transaction) => {
         const job = await tx.get(jobRef);
         const jobData = job.data();
 
+        // Check terminal states atomically
         if (jobData?.status === "success") {
           const batch = await tx.get(batchRef);
           const batchData = batch.data() || {};
@@ -72,16 +152,13 @@ export const processShipmentTask3 = onRequest(
         }
 
         if (jobData?.status === "failed") {
-          return false;
+          return false; // Already failed, don't reprocess
         }
 
+        // Proceed with processing
         const prevAttempts = Number(jobData?.attempts || 0);
         const jobStatus = jobData?.status;
-
-        const isFallbackAttempt =
-          jobStatus === "fallback_queued" || jobStatus === "attempting_fallback";
-        const firstAttempt =
-          (prevAttempts === 0 || jobStatus === "queued" || !jobStatus) && !isFallbackAttempt;
+        const firstAttempt = prevAttempts === 0 || jobStatus === "queued" || !jobStatus;
 
         tx.set(
           jobRef,
@@ -106,22 +183,18 @@ export const processShipmentTask3 = onRequest(
         return;
       }
 
-      // Load order to check status
+      // Load order first to check status
       const ordSnap = await orderRef.get();
       if (!ordSnap.exists) throw new Error("ORDER_NOT_FOUND");
       const order = ordSnap.data();
 
-      const businessDoc = await businessRef.get();
-      const businessData = businessDoc.data();
-
-      // Check if the shop is exceptional one, if yes, then check if the given business is authorised to process this order or not
+      // Check if the shop is exceptional one, if yes, then chekc if the given business is authorised to process this order or not
       if (shop === SHARED_STORE_ID) {
         const vendorName = businessData?.vendorName;
         const vendors = order?.vendors;
         const canProcess = BusinessIsAuthorisedToProcessThisOrder(businessId, vendorName, vendors);
         if (!canProcess.authorised) {
-          const failure = await handleJobFailure({
-            businessId,
+          const failure = await handleReturnJobFailure({
             shop,
             batchRef,
             jobRef,
@@ -150,15 +223,16 @@ export const processShipmentTask3 = onRequest(
         }
       }
 
-      if (order?.customStatus !== "Confirmed") {
-        const failure = await handleJobFailure({
-          businessId,
+      // Check if order is in correct status for return shipment
+      const status = order?.customStatus;
+      if (status !== "Delivered" && status !== "DTO Requested") {
+        const failure = await handleReturnJobFailure({
           shop,
           batchRef,
           jobRef,
           jobId,
-          errorCode: "ORDER_ALREADY_SHIPPED",
-          errorMessage: `Order status is '${order?.customStatus}' - not 'Confirmed'. Order may already be shipped.`,
+          errorCode: "INVALID_ORDER_STATUS",
+          errorMessage: `Order status is '${status}' - not 'Delivered' or 'DTO Requested'. Cannot book return.`,
           isRetryable: false,
         });
 
@@ -166,7 +240,7 @@ export const processShipmentTask3 = onRequest(
           res.status(failure.statusCode).json({
             ok: false,
             reason: failure.reason,
-            code: "ORDER_ALREADY_SHIPPED",
+            code: "INVALID_ORDER_STATUS",
           });
         } else {
           res.status(failure.statusCode).json({
@@ -177,106 +251,56 @@ export const processShipmentTask3 = onRequest(
         return;
       }
 
-      // Get Xpressbees API key
-      const xpressbeesCfg = businessData?.integrations?.couriers?.xpressbees || {};
-      const apiKey = xpressbeesCfg?.apiKey || xpressbeesCfg?.token;
+      // Allocate AWB
+      awb = await allocateAwb(businessId);
 
-      if (!apiKey) throw new Error("CARRIER_KEY_MISSING");
-
-      // Select courier based on mode and weight
-      const items =
-        (Array.isArray(order?.raw?.line_items) && order.raw.line_items) || order?.lineItems || [];
-
-      // Calculate total quantity (consider item quantities)
-      const totalQuantity = items.reduce((sum: number, item: any) => {
-        return sum + Number(item?.quantity ?? 1);
-      }, 0);
-
-      // Get batch data
-      const batchData = (await batchRef.get()).data();
-
-      // Determine if this is a priority shipment
-      const isPriority = batchData?.courier === "Priority";
-
-      // Get shipping mode
-      const payloadShippingMode = (() => {
-        if (!isPriority) return shippingMode; // Use default shipping mode
-
-        const priorityCouriers = businessData?.integrations?.couriers?.priorityList;
-        const xpressbeesConfig = priorityCouriers?.find(
-          (courier: any) => courier.name === "xpressbees",
-        );
-
-        return xpressbeesConfig?.mode ?? "Surface"; // Default to Surface if not configured
-      })();
-
-      let courierId: string;
-      try {
-        courierId = await selectCourier(apiKey, payloadShippingMode, totalQuantity);
-      } catch (error) {
-        const msg = error instanceof Error ? error.message : String(error);
-        const failure = await handleJobFailure({
-          businessId,
-          shop,
-          batchRef,
-          jobRef,
-          jobId,
-          errorCode: "COURIER_SELECTION_FAILED",
-          errorMessage: msg,
-          isRetryable: false,
-        });
-
-        if (failure.shouldReturnFailure) {
-          res.status(failure.statusCode).json({
-            ok: false,
-            reason: failure.reason,
-            code: "COURIER_SELECTION_FAILED",
-          });
-        } else {
-          res.status(failure.statusCode).json({
-            ok: true,
-            action: failure.reason,
-          });
-        }
-        return;
-      }
-
-      // Build payload for Xpressbees
-      const payload = buildXpressbeesPayload({
+      // Build payload for Delhivery return
+      const payload = buildDelhiveryReturnPayload({
         orderId: String(jobId),
+        awb,
         order,
         pickupName,
-        courierId,
-        shippingMode: payloadShippingMode,
+        shippingMode,
       });
 
-      // Call Xpressbees API
-      const base = "https://shipment.xpressbees.com";
-      const path = "/api/shipments2";
+      // Carrier API key
+      const apiKey = businessData?.integrations?.couriers?.delhivery?.apiKey as string | undefined;
+      if (!apiKey) throw new Error("CARRIER_KEY_MISSING");
 
+      // Call Delhivery
+      const base = "https://track.delhivery.com";
+      const path = "/api/cmu/create.json";
+      const body = new URLSearchParams({ format: "json", data: JSON.stringify(payload) });
       const resp = await fetch(`${base}${path}`, {
         method: "POST",
         headers: {
-          Authorization: `Bearer ${apiKey}`,
-          "Content-Type": "application/json",
+          Authorization: `Token ${apiKey}`,
+          Accept: "application/json",
+          "Content-Type": "application/x-www-form-urlencoded",
         },
-        body: JSON.stringify(payload),
+        body,
       });
 
       const text = await resp.text();
-      const carrier = parseJson(text);
 
-      // Handle network/gateway errors (non-JSON responses with non-2xx status)
-      if (!resp.ok && !carrier?.status) {
-        // This is a network/gateway error (502, 503, etc.) - not a proper Xpressbees API response
-        const failure = await handleJobFailure({
-          businessId,
+      // Handle HTTP layer errors (non-2xx)
+      if (!resp.ok) {
+        if (awb && !awbReleased) {
+          try {
+            await releaseAwb(businessId, awb);
+            awbReleased = true;
+          } catch (e) {
+            console.error("Failed to release AWB:", e);
+          }
+        }
+
+        const failure = await handleReturnJobFailure({
           shop,
           batchRef,
           jobRef,
           jobId,
           errorCode: `HTTP_${resp.status}`,
-          errorMessage: text.slice(0, 400) || `HTTP ${resp.status} error`,
+          errorMessage: text,
           isRetryable: httpRetryable(resp.status),
         });
 
@@ -295,13 +319,21 @@ export const processShipmentTask3 = onRequest(
         return;
       }
 
-      // Evaluate response (works for both success and error responses)
-      const verdict = evaluateXpressbeesResponse(carrier);
+      // Parse and evaluate carrier JSON
+      const carrier = parseJson(text);
+      const verdict = evalDelhiveryReturnResp(carrier);
 
-      // Handle API errors (proper Xpressbees error responses)
       if (!verdict.ok) {
-        const failure = await handleJobFailure({
-          businessId,
+        if (awb && !awbReleased) {
+          try {
+            await releaseAwb(businessId, awb);
+            awbReleased = true;
+          } catch (e) {
+            console.error("Failed to release AWB:", e);
+          }
+        }
+
+        const failure = await handleReturnJobFailure({
           shop,
           batchRef,
           jobRef,
@@ -329,20 +361,22 @@ export const processShipmentTask3 = onRequest(
 
       // --- Success path ------------------------------------------------------
       // FIX: Atomic success update
+      awbReleased = true;
+
       await db.runTransaction(async (tx: Transaction) => {
         const job = await tx.get(jobRef);
         const jobData = job.data();
 
+        // Prevent double-counting
         if (jobData?.status === "success") {
           return; // Already processed
         }
 
+        // Update atomically
         tx.update(jobRef, {
           status: "success",
-          awb: verdict.awbNumber ?? null,
-          carrierShipmentId: verdict.shipmentId ?? null,
-          xpressbeesOrderId: verdict.orderId ?? null,
-          courierName: verdict.courierName ?? null,
+          awb,
+          carrierShipmentId: verdict.carrierShipmentId ?? null,
           errorCode: FieldValue.delete(),
           errorMessage: FieldValue.delete(),
           apiResp: carrier,
@@ -357,16 +391,15 @@ export const processShipmentTask3 = onRequest(
         tx.set(
           orderRef,
           {
-            awb: verdict.awbNumber ?? null,
-            courier: `Xpressbees: ${verdict.courierName ?? "Unknown"}`,
-            courierProvider: "Xpressbees",
-            customStatus: "Ready To Dispatch",
-            shippingMode,
+            awb_reverse: awb,
+            courier_reverse: "Delhivery",
+            courierReverseProvider: "Delhivery",
+            customStatus: "DTO Booked",
             lastStatusUpdate: FieldValue.serverTimestamp(),
             customStatusesLogs: FieldValue.arrayUnion({
-              status: "Ready To Dispatch",
+              status: "DTO Booked",
               createdAt: Timestamp.now(),
-              remarks: `The order's shipment was successfully made on Xpressbees (${shippingMode}) (AWB: ${verdict.awbNumber})`,
+              remarks: `Return shipment was successfully booked on Delhivery (AWB: ${awb})`,
             }),
           },
           { merge: true },
@@ -374,19 +407,15 @@ export const processShipmentTask3 = onRequest(
       });
 
       await maybeCompleteBatch(batchRef);
+      await sendDTOBookedOrderWhatsAppMessage(shopData, orderData);
 
-      res.json({
-        ok: true,
-        awb: verdict.awbNumber ?? null,
-        carrierShipmentId: verdict.shipmentId ?? null,
-        xpressbeesOrderId: verdict.orderId ?? null,
-      });
+      res.json({ ok: true, awb, carrierShipmentId: verdict.carrierShipmentId ?? null });
       return;
     } catch (e: any) {
       // Generic failure (network/bug/etc.)
       const msg = e instanceof Error ? e.message : String(e);
       const code = msg.split(/\s/)[0]; // first token
-      const isRetryable = !NON_RETRYABLE.has(code);
+      const isRetryable = !RETURN_NON_RETRYABLE.has(code);
 
       try {
         const { businessId, shop, batchId, jobId } = (req.body || {}) as {
@@ -397,15 +426,23 @@ export const processShipmentTask3 = onRequest(
         };
 
         if (businessId && shop && batchId && jobId) {
+          if (awb && !awbReleased) {
+            try {
+              await releaseAwb(businessId, awb);
+              awbReleased = true;
+            } catch (e) {
+              console.error("Failed to release AWB:", e);
+            }
+          }
+
           const batchRef = db
             .collection("users")
             .doc(businessId)
-            .collection("shipment_batches")
+            .collection("book_return_batches")
             .doc(batchId);
           const jobRef = batchRef.collection("jobs").doc(String(jobId));
 
-          const failure = await handleJobFailure({
-            businessId,
+          const failure = await handleReturnJobFailure({
             shop,
             batchRef,
             jobRef,

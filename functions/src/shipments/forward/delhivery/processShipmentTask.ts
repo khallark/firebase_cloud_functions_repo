@@ -1,105 +1,55 @@
+// functions/src/functions/shipments/forward/processShipmentTask.ts
+
 import { onRequest } from "firebase-functions/v2/https";
-import { NON_RETRYABLE_ERROR_CODES, SHARED_STORE_ID, TASKS_SECRET } from "../../config";
+import type { Request, Response } from "express";
+import fetch from "node-fetch";
+import { allocateAwb, releaseAwb } from "../../../services";
+import { FieldValue, Transaction, Timestamp } from "firebase-admin/firestore";
+import { buildDelhiveryPayload, evaluateDelhiveryResponse } from "../../../couriers";
+import { NON_RETRYABLE } from "../../helpers";
+import { TASKS_SECRET, SHARED_STORE_ID } from "../../../config";
 import {
   BusinessIsAuthorisedToProcessThisOrder,
+  handleJobFailure,
+  httpRetryable,
   maybeCompleteBatch,
+  parseJson,
   requireHeaderSecret,
-} from "../../helpers";
-import { allocateAwb, releaseAwb, sendDTOBookedOrderWhatsAppMessage } from "../../services";
-import { FieldValue, Timestamp, Transaction } from "firebase-admin/firestore";
-import { handleReturnJobFailure } from "./returnShipmentHelpers";
-import { buildDelhiveryReturnPayload } from "../../couriers";
-import { db } from "../../firebaseAdmin";
+} from "../../../helpers";
+import { db } from "../../../firebaseAdmin";
 
-const RETURN_NON_RETRYABLE = NON_RETRYABLE_ERROR_CODES;
+// Helper function - add this somewhere
+function sanitizeForFirestore(obj: any): any {
+  if (obj === null || obj === undefined) return null;
+  if (typeof obj !== "object") return obj;
+  if (Array.isArray(obj)) return obj.map(sanitizeForFirestore);
 
-export const processReturnShipmentTask = onRequest(
+  const result: Record<string, any> = {};
+  for (const [key, value] of Object.entries(obj)) {
+    // Skip undefined values
+    if (value === undefined) continue;
+
+    // Sanitize key: replace invalid characters
+    const safeKey = key
+      .replace(/\./g, "_")
+      .replace(/\[/g, "_")
+      .replace(/\]/g, "_")
+      .replace(/\*/g, "_")
+      .replace(/\//g, "_");
+
+    result[safeKey] = sanitizeForFirestore(value);
+  }
+  return result;
+}
+
+/**
+ * Processes a single shipment task for Delhivery
+ */
+export const processShipmentTask = onRequest(
   { cors: true, timeoutSeconds: 60, secrets: [TASKS_SECRET] },
-  async (req, res) => {
+  async (req: Request, res: Response): Promise<void> => {
     let awb: string | undefined;
     let awbReleased = false;
-
-    // --- helpers -------------------------------------------------------------
-    const parseJson = (t: string) => {
-      try {
-        return JSON.parse(t);
-      } catch {
-        return { raw: t };
-      }
-    };
-
-    /** Classify Delhivery return response */
-    function evalDelhiveryReturnResp(carrier: any): {
-      ok: boolean;
-      retryable: boolean;
-      code: string;
-      message: string;
-      carrierShipmentId?: string | null;
-    } {
-      const remarksArr = carrier.packages?.[0]?.remarks;
-      let remarks = "";
-      if (Array.isArray(remarksArr)) remarks = remarksArr.join("\n ");
-
-      const okFlag = carrier?.success === true && carrier?.error !== true;
-
-      if (okFlag) {
-        return {
-          ok: true,
-          retryable: false,
-          code: "OK",
-          message: "return created",
-          carrierShipmentId: null,
-        };
-      }
-
-      // Check for insufficient balance error
-      const lowerRemarks = remarks.toLowerCase();
-      const lowerError = String(carrier?.error || carrier?.message || "").toLowerCase();
-      const combinedText = `${lowerRemarks} ${lowerError}`;
-
-      const balanceKeywords = [
-        "insufficient",
-        "wallet",
-        "balance",
-        "insufficient balance",
-        "low balance",
-        "wallet balance",
-        "insufficient wallet",
-        "insufficient fund",
-        "recharge",
-        "add balance",
-        "balance low",
-        "no balance",
-      ];
-
-      const isBalanceError = balanceKeywords.some((keyword) => combinedText.includes(keyword));
-
-      if (isBalanceError) {
-        return {
-          ok: false,
-          retryable: false,
-          code: "INSUFFICIENT_BALANCE",
-          message: remarks || "Insufficient balance in carrier account",
-        };
-      }
-
-      // Known permanent validation/business errors (non-retryable)
-      return {
-        ok: false,
-        retryable: false,
-        code: "CARRIER_AMBIGUOUS",
-        message: remarks || "Unknown carrier error",
-      };
-    }
-
-    /** Decide if an HTTP failure status is retryable */
-    function httpRetryable(status: number) {
-      if (status === 429 || status === 408 || status === 409 || status === 425) return true;
-      if (status >= 500) return true;
-      return false;
-    }
-
-    // -------------------------------------------------------------------------
 
     try {
       requireHeaderSecret(req, "x-tasks-secret", TASKS_SECRET.value() || "");
@@ -116,8 +66,7 @@ export const processReturnShipmentTask = onRequest(
         pickupName?: string;
         shippingMode?: string;
       };
-
-      if (!businessId || !shop || !batchId || !jobId || !pickupName) {
+      if (!businessId || !shop || !batchId || !jobId || !pickupName || !shippingMode) {
         res.status(400).json({ error: "bad_payload" });
         return;
       }
@@ -125,14 +74,11 @@ export const processReturnShipmentTask = onRequest(
       const batchRef = db
         .collection("users")
         .doc(businessId)
-        .collection("book_return_batches")
+        .collection("shipment_batches")
         .doc(batchId);
       const jobRef = batchRef.collection("jobs").doc(String(jobId));
       const orderRef = db.collection("accounts").doc(shop).collection("orders").doc(String(jobId));
-      const orderData = (await orderRef.get()).data() as any;
       const businessRef = db.collection("users").doc(businessId);
-      const businessData = (await businessRef.get()).data() as any;
-      const shopData = (await db.collection("accounts").doc(shop).get()).data() as any;
 
       // FIX: Atomic idempotency check and status update
       const shouldProceed = await db.runTransaction(async (tx: Transaction) => {
@@ -158,7 +104,11 @@ export const processReturnShipmentTask = onRequest(
         // Proceed with processing
         const prevAttempts = Number(jobData?.attempts || 0);
         const jobStatus = jobData?.status;
-        const firstAttempt = prevAttempts === 0 || jobStatus === "queued" || !jobStatus;
+
+        const isFallbackAttempt =
+          jobStatus === "fallback_queued" || jobStatus === "attempting_fallback";
+        const firstAttempt =
+          (prevAttempts === 0 || jobStatus === "queued" || !jobStatus) && !isFallbackAttempt;
 
         tx.set(
           jobRef,
@@ -188,13 +138,22 @@ export const processReturnShipmentTask = onRequest(
       if (!ordSnap.exists) throw new Error("ORDER_NOT_FOUND");
       const order = ordSnap.data();
 
-      // Check if the shop is exceptional one, if yes, then chekc if the given business is authorised to process this order or not
+      // Carrier API key
+      const businessDoc = await businessRef.get();
+
+      // Cache data to avoid repeated lookups
+      const batchData = (await batchRef.get()).data();
+      const businessData = businessDoc.data();
+
+      // Check if the shop is exceptional one, if yes, then check if the given business is authorised to process this order or not
       if (shop === SHARED_STORE_ID) {
         const vendorName = businessData?.vendorName;
         const vendors = order?.vendors;
         const canProcess = BusinessIsAuthorisedToProcessThisOrder(businessId, vendorName, vendors);
+
         if (!canProcess.authorised) {
-          const failure = await handleReturnJobFailure({
+          const failure = await handleJobFailure({
+            businessId,
             shop,
             batchRef,
             jobRef,
@@ -223,16 +182,16 @@ export const processReturnShipmentTask = onRequest(
         }
       }
 
-      // Check if order is in correct status for return shipment
-      const status = order?.customStatus;
-      if (status !== "Delivered" && status !== "DTO Requested") {
-        const failure = await handleReturnJobFailure({
+      // Check if order is in correct status for shipping
+      if (order?.customStatus !== "Confirmed") {
+        const failure = await handleJobFailure({
+          businessId,
           shop,
           batchRef,
           jobRef,
           jobId,
-          errorCode: "INVALID_ORDER_STATUS",
-          errorMessage: `Order status is '${status}' - not 'Delivered' or 'DTO Requested'. Cannot book return.`,
+          errorCode: "ORDER_ALREADY_SHIPPED",
+          errorMessage: `Order status is '${order?.customStatus}' - not 'Confirmed'. Order may already be shipped.`,
           isRetryable: false,
         });
 
@@ -240,7 +199,7 @@ export const processReturnShipmentTask = onRequest(
           res.status(failure.statusCode).json({
             ok: false,
             reason: failure.reason,
-            code: "INVALID_ORDER_STATUS",
+            code: "ORDER_ALREADY_SHIPPED",
           });
         } else {
           res.status(failure.statusCode).json({
@@ -254,20 +213,36 @@ export const processReturnShipmentTask = onRequest(
       // Allocate AWB
       awb = await allocateAwb(businessId);
 
-      // Build payload for Delhivery return
-      const payload = buildDelhiveryReturnPayload({
+      // Determine if this is a priority shipment
+      const isPriority = batchData?.courier === "Priority";
+
+      // Get shipping mode
+      const payloadShippingMode = (() => {
+        if (!isPriority) return shippingMode; // Use default shipping mode
+
+        const priorityCouriers = businessData?.integrations?.couriers?.priorityList;
+        const delhiveryConfig = priorityCouriers?.find(
+          (courier: any) => courier.name === "delhivery",
+        );
+
+        return delhiveryConfig?.mode ?? "Surface"; // Default to Surface if not configured
+      })();
+
+      // Build payload for Delhivery
+      const payload = buildDelhiveryPayload({
         orderId: String(jobId),
         awb,
         order,
         pickupName,
-        shippingMode,
+        shippingMode: payloadShippingMode,
       });
 
-      // Carrier API key
-      const apiKey = businessData?.integrations?.couriers?.delhivery?.apiKey as string | undefined;
+      const apiKey = businessDoc.data()?.integrations?.couriers?.delhivery?.apiKey as
+        | string
+        | undefined;
       if (!apiKey) throw new Error("CARRIER_KEY_MISSING");
 
-      // Call Delhivery
+      // Call Delhivery (IMPORTANT: format=json&data=<json>)
       const base = "https://track.delhivery.com";
       const path = "/api/cmu/create.json";
       const body = new URLSearchParams({ format: "json", data: JSON.stringify(payload) });
@@ -294,7 +269,8 @@ export const processReturnShipmentTask = onRequest(
           }
         }
 
-        const failure = await handleReturnJobFailure({
+        const failure = await handleJobFailure({
+          businessId,
           shop,
           batchRef,
           jobRef,
@@ -321,7 +297,7 @@ export const processReturnShipmentTask = onRequest(
 
       // Parse and evaluate carrier JSON
       const carrier = parseJson(text);
-      const verdict = evalDelhiveryReturnResp(carrier);
+      const verdict = evaluateDelhiveryResponse(carrier);
 
       if (!verdict.ok) {
         if (awb && !awbReleased) {
@@ -333,7 +309,8 @@ export const processReturnShipmentTask = onRequest(
           }
         }
 
-        const failure = await handleReturnJobFailure({
+        const failure = await handleJobFailure({
+          businessId,
           shop,
           batchRef,
           jobRef,
@@ -341,7 +318,7 @@ export const processReturnShipmentTask = onRequest(
           errorCode: verdict.code,
           errorMessage: verdict.message,
           isRetryable: verdict.retryable,
-          apiResp: carrier,
+          apiResp: sanitizeForFirestore(carrier),
         });
 
         if (failure.shouldReturnFailure) {
@@ -379,7 +356,7 @@ export const processReturnShipmentTask = onRequest(
           carrierShipmentId: verdict.carrierShipmentId ?? null,
           errorCode: FieldValue.delete(),
           errorMessage: FieldValue.delete(),
-          apiResp: carrier,
+          apiResp: sanitizeForFirestore(carrier),
           completedAt: FieldValue.serverTimestamp(),
         });
 
@@ -391,15 +368,16 @@ export const processReturnShipmentTask = onRequest(
         tx.set(
           orderRef,
           {
-            awb_reverse: awb,
-            courier_reverse: "Delhivery",
-            courierReverseProvider: "Delhivery",
-            customStatus: "DTO Booked",
+            awb,
+            courier: "Delhivery", // Change to "Shiprocket" or "Xpressbees" as appropriate
+            courierProvider: "Delhivery",
+            customStatus: "Ready To Dispatch",
+            shippingMode,
             lastStatusUpdate: FieldValue.serverTimestamp(),
             customStatusesLogs: FieldValue.arrayUnion({
-              status: "DTO Booked",
+              status: "Ready To Dispatch",
               createdAt: Timestamp.now(),
-              remarks: `Return shipment was successfully booked on Delhivery (AWB: ${awb})`,
+              remarks: `The order's shipment was successfully made on Delhivery (${shippingMode}) (AWB: ${awb})`,
             }),
           },
           { merge: true },
@@ -407,7 +385,6 @@ export const processReturnShipmentTask = onRequest(
       });
 
       await maybeCompleteBatch(batchRef);
-      await sendDTOBookedOrderWhatsAppMessage(shopData, orderData);
 
       res.json({ ok: true, awb, carrierShipmentId: verdict.carrierShipmentId ?? null });
       return;
@@ -415,7 +392,7 @@ export const processReturnShipmentTask = onRequest(
       // Generic failure (network/bug/etc.)
       const msg = e instanceof Error ? e.message : String(e);
       const code = msg.split(/\s/)[0]; // first token
-      const isRetryable = !RETURN_NON_RETRYABLE.has(code);
+      const isRetryable = !NON_RETRYABLE.has(code);
 
       try {
         const { businessId, shop, batchId, jobId } = (req.body || {}) as {
@@ -438,11 +415,12 @@ export const processReturnShipmentTask = onRequest(
           const batchRef = db
             .collection("users")
             .doc(businessId)
-            .collection("book_return_batches")
+            .collection("shipment_batches")
             .doc(batchId);
           const jobRef = batchRef.collection("jobs").doc(String(jobId));
 
-          const failure = await handleReturnJobFailure({
+          const failure = await handleJobFailure({
+            businessId,
             shop,
             batchRef,
             jobRef,

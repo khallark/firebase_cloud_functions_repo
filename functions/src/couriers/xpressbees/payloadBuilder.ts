@@ -1,6 +1,6 @@
 // couriers/xpressbees/payloadBuilder.ts
 
-import { normalizePhoneNumber } from "../../helpers";
+import { normalizePhoneNumber, sanitizePin } from "../../helpers";
 
 interface XpressbeesShipmentParams {
   orderId: string;
@@ -11,7 +11,7 @@ interface XpressbeesShipmentParams {
 }
 
 /**
- * Builds Xpressbees shipment creation payload from order data
+ * Builds Xpressbees shipment creation payload from order dataw
  */
 export function buildXpressbeesPayload(params: XpressbeesShipmentParams) {
   const { orderId, order, courierId } = params;
@@ -63,7 +63,7 @@ export function buildXpressbeesPayload(params: XpressbeesShipmentParams) {
       address_2: ship?.address2 || "",
       city: ship?.city || "",
       state: ship?.province || "",
-      pincode: ship?.zip || "",
+      pincode: sanitizePin(ship?.zip) || "",
       phone: normalizePhoneNumber(
         ship?.phone ||
           order?.raw?.phone ||

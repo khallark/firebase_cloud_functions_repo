@@ -1,6 +1,6 @@
 // couriers/delhivery/payloadBuilder.ts
 
-import { normalizePhoneNumber } from "../../helpers";
+import { normalizePhoneNumber, sanitizePin } from "../../helpers";
 
 interface DelhiveryShipmentParams {
   orderId?: string;
@@ -53,7 +53,7 @@ export function buildDelhiveryPayload(params: DelhiveryShipmentParams) {
         "Customer",
     ),
     add: _([ship?.address1, ship?.address2].filter(Boolean).join(", ")),
-    pin: _(ship?.zip || order?.raw?.billing_address?.zip),
+    pin: _(sanitizePin(ship?.zip || order?.raw?.billing_address?.zip)),
     city: _(ship?.city),
     state: _(ship?.province),
     country: _(ship?.country || "India"),

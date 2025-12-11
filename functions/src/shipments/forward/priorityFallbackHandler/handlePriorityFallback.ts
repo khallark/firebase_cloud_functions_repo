@@ -3,10 +3,10 @@
 import { onRequest } from "firebase-functions/v2/https";
 import type { Request, Response } from "express";
 import { FieldValue, Transaction } from "firebase-admin/firestore";
-import { createTask } from "../../services";
-import { TASKS_SECRET } from "../../config";
-import { capitalizeWords, maybeCompleteBatch, requireHeaderSecret } from "../../helpers";
-import { db } from "../../firebaseAdmin";
+import { createTask } from "../../../services";
+import { TASKS_SECRET } from "../../../config";
+import { capitalizeWords, maybeCompleteBatch, requireHeaderSecret } from "../../../helpers";
+import { db } from "../../../firebaseAdmin";
 
 /**
  * Handles priority courier fallback logic

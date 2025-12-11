@@ -167,11 +167,11 @@ function calculateTaxes(
 /**
  * Calculates proportional refund amount for an item
  */
-function calculateProportionalRefund(order: any, item: any): number {
+function calculateProportionalRefund(order: any, item: any, salePrice: number): number {
   const refundedAmount = order?.refundedAmount;
 
   if (refundedAmount === undefined || refundedAmount === null || refundedAmount === "") {
-    return 0;
+    return salePrice;
   }
 
   const refundedAmountNum = Number(refundedAmount);
@@ -203,22 +203,34 @@ async function processSalesOrders(
   startDate: Date,
   endDate: Date,
 ): Promise<SalesRow[]> {
-  const startOfRange = new Date(startDate);
-  startOfRange.setHours(0, 0, 0, 0);
+  // IST is UTC+5:30
+  const IST_OFFSET = "+05:30";
 
-  const endOfRange = new Date(endDate);
-  endOfRange.setHours(23, 59, 59, 999);
+  // Get date parts from input
+  const startYear = startDate.getFullYear();
+  const startMonth = String(startDate.getMonth() + 1).padStart(2, "0");
+  const startDay = String(startDate.getDate()).padStart(2, "0");
 
-  console.log(
-    `📊 Fetching sales orders from ${startOfRange.toISOString()} to ${endOfRange.toISOString()}`,
-  );
+  const endYear = endDate.getFullYear();
+  const endMonth = String(endDate.getMonth() + 1).padStart(2, "0");
+  const endDay = String(endDate.getDate()).padStart(2, "0");
+
+  // Create IST midnight timestamps and convert to UTC ISO
+  const startISO = new Date(
+    `${startYear}-${startMonth}-${startDay}T00:00:00.000${IST_OFFSET}`,
+  ).toISOString();
+  const endISO = new Date(
+    `${endYear}-${endMonth}-${endDay}T23:59:59.999${IST_OFFSET}`,
+  ).toISOString();
+
+  console.log(`📊 Fetching sales orders from ${startISO} to ${endISO}`);
 
   const ordersSnapshot = await db
     .collection("accounts")
     .doc(storeId)
     .collection("orders")
-    .where("createdAt", ">=", startOfRange.toISOString())
-    .where("createdAt", "<=", endOfRange.toISOString())
+    .where("createdAt", ">=", startISO)
+    .where("createdAt", "<=", endISO)
     .get();
 
   console.log(`Found ${ordersSnapshot.size} sales orders`);
@@ -289,17 +301,27 @@ async function processSalesReturnOrders(
   startDate: Date,
   endDate: Date,
 ): Promise<SalesReturnRow[]> {
-  const startOfRange = new Date(startDate);
-  startOfRange.setHours(0, 0, 0, 0);
+  // IST is UTC+5:30
+  const IST_OFFSET = "+05:30";
 
-  const endOfRange = new Date(endDate);
-  endOfRange.setHours(23, 59, 59, 999);
+  // Helper to get IST day boundaries
+  const getISTDayBounds = (date: Date) => {
+    const year = date.getFullYear();
+    const month = String(date.getMonth() + 1).padStart(2, "0");
+    const day = String(date.getDate()).padStart(2, "0");
+    return {
+      start: new Date(`${year}-${month}-${day}T00:00:00.000${IST_OFFSET}`).getTime(),
+      end: new Date(`${year}-${month}-${day}T23:59:59.999${IST_OFFSET}`).getTime(),
+    };
+  };
+
+  const rangeStart = getISTDayBounds(startDate).start;
+  const rangeEnd = getISTDayBounds(endDate).end;
 
   console.log(
-    `📊 Fetching sales return orders with status changes from ${startOfRange.toDateString()} to ${endOfRange.toDateString()}`,
+    `📊 Fetching sales return orders with status changes from ${new Date(rangeStart).toISOString()} to ${new Date(rangeEnd).toISOString()}`,
   );
 
-  // Fetch all orders (we need to filter by customStatusesLogs)
   const ordersSnapshot = await db.collection("accounts").doc(storeId).collection("orders").get();
 
   console.log(`Scanning ${ordersSnapshot.size} total orders for returns`);
@@ -316,20 +338,13 @@ async function processSalesReturnOrders(
     const returnLogs = statusLogs.filter((log: any) => {
       if (!log.createdAt || !log.status) return false;
 
-      const logDate = log.createdAt.toDate ? log.createdAt.toDate() : new Date(log.createdAt);
-      const logDateOnly = new Date(logDate);
-      logDateOnly.setHours(0, 0, 0, 0);
-
-      const startDateOnly = new Date(startOfRange);
-      startDateOnly.setHours(0, 0, 0, 0);
-
-      const endDateOnly = new Date(endOfRange);
-      endDateOnly.setHours(0, 0, 0, 0);
+      // Convert to timestamp (milliseconds)
+      const logTimestamp = log.createdAt.toDate
+        ? log.createdAt.toDate().getTime()
+        : new Date(log.createdAt).getTime();
 
       return (
-        logDateOnly >= startDateOnly &&
-        logDateOnly <= endDateOnly &&
-        RETURN_STATUSES.has(log.status)
+        logTimestamp >= rangeStart && logTimestamp <= rangeEnd && RETURN_STATUSES.has(log.status)
       );
     });
 
@@ -359,7 +374,7 @@ async function processSalesReturnOrders(
         const salePrice = Number((mrp - discountLinewise).toFixed(2));
 
         // Calculate refund amount
-        const refundAmount = calculateProportionalRefund(order, item);
+        const refundAmount = calculateProportionalRefund(order, item, salePrice);
 
         // Get HSN and Tax Rate
         const productInfo = await getProductInfo(storeId, item.title);

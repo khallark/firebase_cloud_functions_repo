@@ -10,3 +10,4 @@ export * from "./maybeCompleteBatch";
 export * from "./handleJobFailure";
 export * from "./chunkArray";
 export * from "./maybeCompleteSummary";
+export * from "./sanitizePin";

@@ -1,13 +1,16 @@
-// functions/src/functions/shipments/forward/processShipmentTask.ts
+// functions/src/functions/shipments/forward/processShipmentTask3.ts
 
 import { onRequest } from "firebase-functions/v2/https";
 import type { Request, Response } from "express";
 import fetch from "node-fetch";
-import { allocateAwb, releaseAwb } from "../../services";
 import { FieldValue, Transaction, Timestamp } from "firebase-admin/firestore";
-import { buildDelhiveryPayload, evaluateDelhiveryResponse } from "../../couriers";
-import { NON_RETRYABLE } from "./shipmentHelpers";
-import { TASKS_SECRET, SHARED_STORE_ID } from "../../config";
+import {
+  buildXpressbeesPayload,
+  evaluateXpressbeesResponse,
+  selectCourier,
+} from "../../../couriers";
+import { NON_RETRYABLE } from "../../helpers";
+import { SHARED_STORE_ID, TASKS_SECRET } from "../../../config";
 import {
   BusinessIsAuthorisedToProcessThisOrder,
   handleJobFailure,
@@ -15,22 +18,16 @@ import {
   maybeCompleteBatch,
   parseJson,
   requireHeaderSecret,
-} from "../../helpers";
-import { db } from "../../firebaseAdmin";
-
-// Helper function - add this somewhere
-function sanitizeForFirestore(obj: any): any {
-  return JSON.parse(JSON.stringify(obj));
-}
+} from "../../../helpers";
+import { db } from "../../../firebaseAdmin";
 
 /**
- * Processes a single shipment task for Delhivery
+ * Processes a single shipment task for Xpressbees
  */
-export const processShipmentTask = onRequest(
+export const processShipmentTask3 = onRequest(
   { cors: true, timeoutSeconds: 60, secrets: [TASKS_SECRET] },
   async (req: Request, res: Response): Promise<void> => {
-    let awb: string | undefined;
-    let awbReleased = false;
+    // -------------------------------------------------------------------------
 
     try {
       requireHeaderSecret(req, "x-tasks-secret", TASKS_SECRET.value() || "");
@@ -47,6 +44,7 @@ export const processShipmentTask = onRequest(
         pickupName?: string;
         shippingMode?: string;
       };
+
       if (!businessId || !shop || !batchId || !jobId || !pickupName || !shippingMode) {
         res.status(400).json({ error: "bad_payload" });
         return;
@@ -61,12 +59,11 @@ export const processShipmentTask = onRequest(
       const orderRef = db.collection("accounts").doc(shop).collection("orders").doc(String(jobId));
       const businessRef = db.collection("users").doc(businessId);
 
-      // FIX: Atomic idempotency check and status update
+      // FIX: Atomic idempotency check inside transaction
       const shouldProceed = await db.runTransaction(async (tx: Transaction) => {
         const job = await tx.get(jobRef);
         const jobData = job.data();
 
-        // Check terminal states atomically
         if (jobData?.status === "success") {
           const batch = await tx.get(batchRef);
           const batchData = batch.data() || {};
@@ -79,10 +76,9 @@ export const processShipmentTask = onRequest(
         }
 
         if (jobData?.status === "failed") {
-          return false; // Already failed, don't reprocess
+          return false;
         }
 
-        // Proceed with processing
         const prevAttempts = Number(jobData?.attempts || 0);
         const jobStatus = jobData?.status;
 
@@ -114,16 +110,12 @@ export const processShipmentTask = onRequest(
         return;
       }
 
-      // Load order first to check status
+      // Load order to check status
       const ordSnap = await orderRef.get();
       if (!ordSnap.exists) throw new Error("ORDER_NOT_FOUND");
       const order = ordSnap.data();
 
-      // Carrier API key
       const businessDoc = await businessRef.get();
-
-      // Cache data to avoid repeated lookups
-      const batchData = (await batchRef.get()).data();
       const businessData = businessDoc.data();
 
       // Check if the shop is exceptional one, if yes, then check if the given business is authorised to process this order or not
@@ -131,7 +123,6 @@ export const processShipmentTask = onRequest(
         const vendorName = businessData?.vendorName;
         const vendors = order?.vendors;
         const canProcess = BusinessIsAuthorisedToProcessThisOrder(businessId, vendorName, vendors);
-
         if (!canProcess.authorised) {
           const failure = await handleJobFailure({
             businessId,
@@ -163,7 +154,6 @@ export const processShipmentTask = onRequest(
         }
       }
 
-      // Check if order is in correct status for shipping
       if (order?.customStatus !== "Confirmed") {
         const failure = await handleJobFailure({
           businessId,
@@ -191,8 +181,23 @@ export const processShipmentTask = onRequest(
         return;
       }
 
-      // Allocate AWB
-      awb = await allocateAwb(businessId);
+      // Get Xpressbees API key
+      const xpressbeesCfg = businessData?.integrations?.couriers?.xpressbees || {};
+      const apiKey = xpressbeesCfg?.apiKey || xpressbeesCfg?.token;
+
+      if (!apiKey) throw new Error("CARRIER_KEY_MISSING");
+
+      // Select courier based on mode and weight
+      const items =
+        (Array.isArray(order?.raw?.line_items) && order.raw.line_items) || order?.lineItems || [];
+
+      // Calculate total quantity (consider item quantities)
+      const totalQuantity = items.reduce((sum: number, item: any) => {
+        return sum + Number(item?.quantity ?? 1);
+      }, 0);
+
+      // Get batch data
+      const batchData = (await batchRef.get()).data();
 
       // Determine if this is a priority shipment
       const isPriority = batchData?.courier === "Priority";
@@ -202,54 +207,72 @@ export const processShipmentTask = onRequest(
         if (!isPriority) return shippingMode; // Use default shipping mode
 
         const priorityCouriers = businessData?.integrations?.couriers?.priorityList;
-        const delhiveryConfig = priorityCouriers?.find(
-          (courier: any) => courier.name === "delhivery",
+        const xpressbeesConfig = priorityCouriers?.find(
+          (courier: any) => courier.name === "xpressbees",
         );
 
-        return delhiveryConfig?.mode ?? "Surface"; // Default to Surface if not configured
+        return xpressbeesConfig?.mode ?? "Surface"; // Default to Surface if not configured
       })();
 
-      // Build payload for Delhivery
-      const payload = buildDelhiveryPayload({
+      let courierId: string;
+      try {
+        courierId = await selectCourier(apiKey, payloadShippingMode, totalQuantity);
+      } catch (error) {
+        const msg = error instanceof Error ? error.message : String(error);
+        const failure = await handleJobFailure({
+          businessId,
+          shop,
+          batchRef,
+          jobRef,
+          jobId,
+          errorCode: "COURIER_SELECTION_FAILED",
+          errorMessage: msg,
+          isRetryable: false,
+        });
+
+        if (failure.shouldReturnFailure) {
+          res.status(failure.statusCode).json({
+            ok: false,
+            reason: failure.reason,
+            code: "COURIER_SELECTION_FAILED",
+          });
+        } else {
+          res.status(failure.statusCode).json({
+            ok: true,
+            action: failure.reason,
+          });
+        }
+        return;
+      }
+
+      // Build payload for Xpressbees
+      const payload = buildXpressbeesPayload({
         orderId: String(jobId),
-        awb,
         order,
         pickupName,
+        courierId,
         shippingMode: payloadShippingMode,
       });
 
-      const apiKey = businessDoc.data()?.integrations?.couriers?.delhivery?.apiKey as
-        | string
-        | undefined;
-      if (!apiKey) throw new Error("CARRIER_KEY_MISSING");
+      // Call Xpressbees API
+      const base = "https://shipment.xpressbees.com";
+      const path = "/api/shipments2";
 
-      // Call Delhivery (IMPORTANT: format=json&data=<json>)
-      const base = "https://track.delhivery.com";
-      const path = "/api/cmu/create.json";
-      const body = new URLSearchParams({ format: "json", data: JSON.stringify(payload) });
       const resp = await fetch(`${base}${path}`, {
         method: "POST",
         headers: {
-          Authorization: `Token ${apiKey}`,
-          Accept: "application/json",
-          "Content-Type": "application/x-www-form-urlencoded",
+          Authorization: `Bearer ${apiKey}`,
+          "Content-Type": "application/json",
         },
-        body,
+        body: JSON.stringify(payload),
       });
 
       const text = await resp.text();
+      const carrier = parseJson(text);
 
-      // Handle HTTP layer errors (non-2xx)
-      if (!resp.ok) {
-        if (awb && !awbReleased) {
-          try {
-            await releaseAwb(businessId, awb);
-            awbReleased = true;
-          } catch (e) {
-            console.error("Failed to release AWB:", e);
-          }
-        }
-
+      // Handle network/gateway errors (non-JSON responses with non-2xx status)
+      if (!resp.ok && !carrier?.status) {
+        // This is a network/gateway error (502, 503, etc.) - not a proper Xpressbees API response
         const failure = await handleJobFailure({
           businessId,
           shop,
@@ -257,7 +280,7 @@ export const processShipmentTask = onRequest(
           jobRef,
           jobId,
           errorCode: `HTTP_${resp.status}`,
-          errorMessage: text,
+          errorMessage: text.slice(0, 400) || `HTTP ${resp.status} error`,
           isRetryable: httpRetryable(resp.status),
         });
 
@@ -276,20 +299,11 @@ export const processShipmentTask = onRequest(
         return;
       }
 
-      // Parse and evaluate carrier JSON
-      const carrier = parseJson(text);
-      const verdict = evaluateDelhiveryResponse(carrier);
+      // Evaluate response (works for both success and error responses)
+      const verdict = evaluateXpressbeesResponse(carrier);
 
+      // Handle API errors (proper Xpressbees error responses)
       if (!verdict.ok) {
-        if (awb && !awbReleased) {
-          try {
-            await releaseAwb(businessId, awb);
-            awbReleased = true;
-          } catch (e) {
-            console.error("Failed to release AWB:", e);
-          }
-        }
-
         const failure = await handleJobFailure({
           businessId,
           shop,
@@ -319,25 +333,23 @@ export const processShipmentTask = onRequest(
 
       // --- Success path ------------------------------------------------------
       // FIX: Atomic success update
-      awbReleased = true;
-
       await db.runTransaction(async (tx: Transaction) => {
         const job = await tx.get(jobRef);
         const jobData = job.data();
 
-        // Prevent double-counting
         if (jobData?.status === "success") {
           return; // Already processed
         }
 
-        // Update atomically
         tx.update(jobRef, {
           status: "success",
-          awb,
-          carrierShipmentId: verdict.carrierShipmentId ?? null,
+          awb: verdict.awbNumber ?? null,
+          carrierShipmentId: verdict.shipmentId ?? null,
+          xpressbeesOrderId: verdict.orderId ?? null,
+          courierName: verdict.courierName ?? null,
           errorCode: FieldValue.delete(),
           errorMessage: FieldValue.delete(),
-          apiResp: sanitizeForFirestore(carrier),
+          apiResp: carrier,
           completedAt: FieldValue.serverTimestamp(),
         });
 
@@ -349,16 +361,16 @@ export const processShipmentTask = onRequest(
         tx.set(
           orderRef,
           {
-            awb,
-            courier: "Delhivery", // Change to "Shiprocket" or "Xpressbees" as appropriate
-            courierProvider: "Delhivery",
+            awb: verdict.awbNumber ?? null,
+            courier: `Xpressbees: ${verdict.courierName ?? "Unknown"}`,
+            courierProvider: "Xpressbees",
             customStatus: "Ready To Dispatch",
             shippingMode,
             lastStatusUpdate: FieldValue.serverTimestamp(),
             customStatusesLogs: FieldValue.arrayUnion({
               status: "Ready To Dispatch",
               createdAt: Timestamp.now(),
-              remarks: `The order's shipment was successfully made on Delhivery (${shippingMode}) (AWB: ${awb})`,
+              remarks: `The order's shipment was successfully made on Xpressbees (${shippingMode}) (AWB: ${verdict.awbNumber})`,
             }),
           },
           { merge: true },
@@ -367,7 +379,12 @@ export const processShipmentTask = onRequest(
 
       await maybeCompleteBatch(batchRef);
 
-      res.json({ ok: true, awb, carrierShipmentId: verdict.carrierShipmentId ?? null });
+      res.json({
+        ok: true,
+        awb: verdict.awbNumber ?? null,
+        carrierShipmentId: verdict.shipmentId ?? null,
+        xpressbeesOrderId: verdict.orderId ?? null,
+      });
       return;
     } catch (e: any) {
       // Generic failure (network/bug/etc.)
@@ -384,15 +401,6 @@ export const processShipmentTask = onRequest(
         };
 
         if (businessId && shop && batchId && jobId) {
-          if (awb && !awbReleased) {
-            try {
-              await releaseAwb(businessId, awb);
-              awbReleased = true;
-            } catch (e) {
-              console.error("Failed to release AWB:", e);
-            }
-          }
-
           const batchRef = db
             .collection("users")
             .doc(businessId)

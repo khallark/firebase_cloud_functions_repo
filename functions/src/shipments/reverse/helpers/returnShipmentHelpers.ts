@@ -1,6 +1,6 @@
 import { DocumentReference, FieldValue, Transaction } from "firebase-admin/firestore";
-import { maybeCompleteBatch } from "../../helpers";
-import { db } from "../../firebaseAdmin";
+import { maybeCompleteBatch } from "../../../helpers";
+import { db } from "../../../firebaseAdmin";
 
 export async function handleReturnJobFailure(params: {
   shop: string;
