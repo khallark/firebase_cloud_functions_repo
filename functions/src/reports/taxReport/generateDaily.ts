@@ -27,9 +27,14 @@ export const generateDailyTaxReport = onSchedule(
     console.log("🚀 Starting Daily Tax Report Generation...");
 
     try {
-      // Calculate previous day's date
-      const today = new Date();
-      const yesterday = new Date(today);
+      // Get current date in IST
+      const istDateStr = new Date().toLocaleDateString("en-CA", {
+        timeZone: "Asia/Kolkata",
+      }); // Returns "2024-12-12" format
+
+      // Parse and subtract a day
+      const todayIST = new Date(istDateStr + "T00:00:00+05:30");
+      const yesterday = new Date(todayIST);
       yesterday.setDate(yesterday.getDate() - 1);
 
       // Generate report for single day (yesterday to yesterday)
@@ -303,8 +308,8 @@ export const generateCustomTaxReportPreliminary = onRequest(
 export const generateCustomTaxReport = onRequest(
   {
     cors: true,
-    memory: "2GiB",
-    timeoutSeconds: 540,
+    memory: "4GiB",
+    timeoutSeconds: 3600,
     secrets: [TASKS_SECRET],
   },
   async (req, res) => {
@@ -371,7 +376,7 @@ export const generateCustomTaxReport = onRequest(
         return;
       }
 
-      console.log(`🚀 Starting Custom Tax Report Generation...`);
+      // console.log(`🚀 Starting Custom Tax Report Generation...`);
       console.log(`📅 Date Range: ${startDate} to ${endDate} (${daysDiff + 1} days)`);
 
       // Generate report for custom date range

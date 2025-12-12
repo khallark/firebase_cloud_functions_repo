@@ -99,7 +99,7 @@ async function getProductInfo(storeId: string, productTitle: string): Promise<Pr
       .get();
 
     if (productsSnapshot.empty) {
-      return { hsn: "6109", taxRate: 12 };
+      return { hsn: "6109", taxRate: 5 };
     }
 
     const product = productsSnapshot.docs[0].data();
@@ -107,7 +107,7 @@ async function getProductInfo(storeId: string, productTitle: string): Promise<Pr
 
     // Find HSN and Tax Rate in metafields
     let hsn = "6109";
-    let taxRate = 12;
+    let taxRate = 5;
 
     metafields.forEach((metafield: any) => {
       if (metafield.key === "hsn" || metafield.key === "HSN") {
@@ -124,7 +124,7 @@ async function getProductInfo(storeId: string, productTitle: string): Promise<Pr
     return { hsn, taxRate };
   } catch (error) {
     console.error(`Error fetching product info for ${productTitle}:`, error);
-    return { hsn: "6109", taxRate: 12 };
+    return { hsn: "6109", taxRate: 5 };
   }
 }
 
@@ -203,34 +203,22 @@ async function processSalesOrders(
   startDate: Date,
   endDate: Date,
 ): Promise<SalesRow[]> {
-  // IST is UTC+5:30
-  const IST_OFFSET = "+05:30";
+  const startOfRange = new Date(startDate);
+  startOfRange.setHours(0, 0, 0, 0);
 
-  // Get date parts from input
-  const startYear = startDate.getFullYear();
-  const startMonth = String(startDate.getMonth() + 1).padStart(2, "0");
-  const startDay = String(startDate.getDate()).padStart(2, "0");
+  const endOfRange = new Date(endDate);
+  endOfRange.setHours(23, 59, 59, 999);
 
-  const endYear = endDate.getFullYear();
-  const endMonth = String(endDate.getMonth() + 1).padStart(2, "0");
-  const endDay = String(endDate.getDate()).padStart(2, "0");
-
-  // Create IST midnight timestamps and convert to UTC ISO
-  const startISO = new Date(
-    `${startYear}-${startMonth}-${startDay}T00:00:00.000${IST_OFFSET}`,
-  ).toISOString();
-  const endISO = new Date(
-    `${endYear}-${endMonth}-${endDay}T23:59:59.999${IST_OFFSET}`,
-  ).toISOString();
-
-  console.log(`📊 Fetching sales orders from ${startISO} to ${endISO}`);
+  console.log(
+    `📊 Fetching sales orders from ${startOfRange.toISOString()} to ${endOfRange.toISOString()}`,
+  );
 
   const ordersSnapshot = await db
     .collection("accounts")
     .doc(storeId)
     .collection("orders")
-    .where("createdAt", ">=", startISO)
-    .where("createdAt", "<=", endISO)
+    .where("createdAt", ">=", startOfRange.toISOString())
+    .where("createdAt", "<=", endOfRange.toISOString())
     .get();
 
   console.log(`Found ${ordersSnapshot.size} sales orders`);
@@ -301,27 +289,17 @@ async function processSalesReturnOrders(
   startDate: Date,
   endDate: Date,
 ): Promise<SalesReturnRow[]> {
-  // IST is UTC+5:30
-  const IST_OFFSET = "+05:30";
+  const startOfRange = new Date(startDate);
+  startOfRange.setHours(0, 0, 0, 0);
 
-  // Helper to get IST day boundaries
-  const getISTDayBounds = (date: Date) => {
-    const year = date.getFullYear();
-    const month = String(date.getMonth() + 1).padStart(2, "0");
-    const day = String(date.getDate()).padStart(2, "0");
-    return {
-      start: new Date(`${year}-${month}-${day}T00:00:00.000${IST_OFFSET}`).getTime(),
-      end: new Date(`${year}-${month}-${day}T23:59:59.999${IST_OFFSET}`).getTime(),
-    };
-  };
-
-  const rangeStart = getISTDayBounds(startDate).start;
-  const rangeEnd = getISTDayBounds(endDate).end;
+  const endOfRange = new Date(endDate);
+  endOfRange.setHours(23, 59, 59, 999);
 
   console.log(
-    `📊 Fetching sales return orders with status changes from ${new Date(rangeStart).toISOString()} to ${new Date(rangeEnd).toISOString()}`,
+    `📊 Fetching sales return orders with status changes from ${startOfRange.toDateString()} to ${endOfRange.toDateString()}`,
   );
 
+  // Fetch all orders (we need to filter by customStatusesLogs)
   const ordersSnapshot = await db.collection("accounts").doc(storeId).collection("orders").get();
 
   console.log(`Scanning ${ordersSnapshot.size} total orders for returns`);
@@ -338,13 +316,20 @@ async function processSalesReturnOrders(
     const returnLogs = statusLogs.filter((log: any) => {
       if (!log.createdAt || !log.status) return false;
 
-      // Convert to timestamp (milliseconds)
-      const logTimestamp = log.createdAt.toDate
-        ? log.createdAt.toDate().getTime()
-        : new Date(log.createdAt).getTime();
+      const logDate = log.createdAt.toDate ? log.createdAt.toDate() : new Date(log.createdAt);
+      const logDateOnly = new Date(logDate);
+      logDateOnly.setHours(0, 0, 0, 0);
+
+      const startDateOnly = new Date(startOfRange);
+      startDateOnly.setHours(0, 0, 0, 0);
+
+      const endDateOnly = new Date(endOfRange);
+      endDateOnly.setHours(0, 0, 0, 0);
 
       return (
-        logTimestamp >= rangeStart && logTimestamp <= rangeEnd && RETURN_STATUSES.has(log.status)
+        logDateOnly >= startDateOnly &&
+        logDateOnly <= endDateOnly &&
+        RETURN_STATUSES.has(log.status)
       );
     });
 
