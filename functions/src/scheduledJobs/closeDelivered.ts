@@ -1,17 +1,28 @@
 import { onSchedule } from "firebase-functions/v2/scheduler";
-import { CLOSE_AFTER_HOURS, TASKS_SECRET } from "../config";
+import { TASKS_SECRET } from "../config";
 import { createTask } from "../services";
 import { onRequest } from "firebase-functions/v2/https";
 import { chunkArray, requireHeaderSecret } from "../helpers";
-import { FieldValue, Timestamp } from "firebase-admin/firestore";
+import { FieldValue, Timestamp, QueryDocumentSnapshot } from "firebase-admin/firestore";
 import { db } from "../firebaseAdmin";
+
+// Cutoff constants
+const STORE_CREDIT_CLOSE_AFTER_HOURS = 48;
+const REGULAR_CLOSE_AFTER_HOURS = 120;
+
+// Pagination constants
+const QUERY_BATCH_SIZE = 500;
+const WRITE_BATCH_SIZE = 500;
+const MAX_ITERATIONS = 50; // Safety limit: 50 * 500 = 25,000 orders max per account
 
 interface CloseDeliveredOrdersPayload {
   accountId: string;
-  cutoffTime: string; // ISO string
+  storeCreditCutoffTime: string;
+  regularCutoffTime: string;
 }
+
 // ============================================================================
-// CRON JOB - Enqueue tasks to close delivered orders after 360 hours
+// CRON JOB - Enqueue tasks to close delivered orders
 // ============================================================================
 export const closeDeliveredOrdersJob = onSchedule(
   {
@@ -24,10 +35,13 @@ export const closeDeliveredOrdersJob = onSchedule(
   async () => {
     console.log("🚀 Starting closeDeliveredOrdersJob - Enqueueing tasks");
 
-    const cutoffTimeMs = CLOSE_AFTER_HOURS * 60 * 60 * 1000;
-    const cutoffTime = new Date(Date.now() - cutoffTimeMs);
+    const now = Date.now();
 
-    console.log(`📅 Cutoff time: ${cutoffTime.toISOString()}`);
+    const storeCreditCutoffTime = new Date(now - STORE_CREDIT_CLOSE_AFTER_HOURS * 60 * 60 * 1000);
+    const regularCutoffTime = new Date(now - REGULAR_CLOSE_AFTER_HOURS * 60 * 60 * 1000);
+
+    console.log(`📅 Store Credit Cutoff (48hrs): ${storeCreditCutoffTime.toISOString()}`);
+    console.log(`📅 Regular Cutoff (120hrs): ${regularCutoffTime.toISOString()}`);
 
     const accountsSnapshot = await db.collection("accounts").get();
     console.log(`📊 Found ${accountsSnapshot.size} accounts to check`);
@@ -40,7 +54,8 @@ export const closeDeliveredOrdersJob = onSchedule(
     for (const accountDoc of accountsSnapshot.docs) {
       const payload: CloseDeliveredOrdersPayload = {
         accountId: accountDoc.id,
-        cutoffTime: cutoffTime.toISOString(),
+        storeCreditCutoffTime: storeCreditCutoffTime.toISOString(),
+        regularCutoffTime: regularCutoffTime.toISOString(),
       };
 
       const taskPromise = createTask(payload, {
@@ -59,20 +74,60 @@ export const closeDeliveredOrdersJob = onSchedule(
       taskPromises.push(taskPromise);
     }
 
-    // Wait for all tasks to be enqueued
     await Promise.allSettled(taskPromises);
-
     console.log(`✅ Job complete - Tasks enqueued: ${tasksEnqueued}, Failed: ${tasksFailed}`);
   },
 );
 
 // ============================================================================
-// HTTP ENDPOINT - Close delivered orders for one account
+// HELPER: Close orders in batches with proper Firestore batch writes
+// ============================================================================
+async function closeOrdersBatch(
+  orders: QueryDocumentSnapshot[],
+  getRemarks: (doc: QueryDocumentSnapshot) => string,
+): Promise<number> {
+  if (orders.length === 0) return 0;
+
+  const chunks = chunkArray(orders, WRITE_BATCH_SIZE);
+  let totalClosed = 0;
+
+  for (const chunk of chunks) {
+    const batch = db.batch();
+
+    chunk.forEach((doc) => {
+      batch.update(doc.ref, {
+        customStatus: "Closed",
+        lastStatusUpdate: FieldValue.serverTimestamp(),
+        customStatusesLogs: FieldValue.arrayUnion({
+          status: "Closed",
+          createdAt: Timestamp.now(),
+          remarks: getRemarks(doc),
+        }),
+      });
+    });
+
+    await batch.commit();
+    totalClosed += chunk.length;
+  }
+
+  return totalClosed;
+}
+
+// ============================================================================
+// HELPER: Check if order has store credit payment
+// ============================================================================
+function hasStoreCredit(doc: QueryDocumentSnapshot): boolean {
+  const paymentGatewayNames: string[] = doc.data()?.raw?.payment_gateway_names || [];
+  return paymentGatewayNames.includes("shopify_store_credit");
+}
+
+// ============================================================================
+// HTTP ENDPOINT - Close delivered orders for one account (with pagination)
 // ============================================================================
 export const closeDeliveredOrdersTask = onRequest(
   {
     cors: true,
-    timeoutSeconds: 300,
+    timeoutSeconds: 540, // Increased for large volumes
     secrets: [TASKS_SECRET],
     memory: "512MiB",
   },
@@ -95,87 +150,174 @@ export const closeDeliveredOrdersTask = onRequest(
     // ✅ PARSE PAYLOAD
     const payload = req.body as CloseDeliveredOrdersPayload;
 
-    if (!payload || !payload.accountId || !payload.cutoffTime) {
+    if (
+      !payload ||
+      !payload.accountId ||
+      !payload.storeCreditCutoffTime ||
+      !payload.regularCutoffTime
+    ) {
       res.status(400).json({
         error: "invalid_payload",
-        message: "Missing required fields: accountId, cutoffTime",
+        message: "Missing required fields: accountId, storeCreditCutoffTime, regularCutoffTime",
       });
       return;
     }
 
-    const { accountId, cutoffTime } = payload;
+    const { accountId, storeCreditCutoffTime, regularCutoffTime } = payload;
 
     console.log(`🔄 Processing account ${accountId} - closing delivered orders`);
+    console.log(`📅 Store Credit Cutoff (48hrs): ${storeCreditCutoffTime}`);
+    console.log(`📅 Regular Cutoff (120hrs): ${regularCutoffTime}`);
 
     try {
       const accountDoc = await db.collection("accounts").doc(accountId).get();
 
       if (!accountDoc.exists) {
         console.warn(`⚠️ Account ${accountId} not found - skipping`);
-        res.status(404).json({
-          error: "account_not_found",
-          accountId,
-        });
+        res.status(404).json({ error: "account_not_found", accountId });
         return;
       }
 
-      const cutoffDate = new Date(cutoffTime);
+      const storeCreditCutoffDate = new Date(storeCreditCutoffTime);
+      const regularCutoffDate = new Date(regularCutoffTime);
 
-      // Query orders that need to be closed
-      const ordersToClose = await accountDoc.ref
-        .collection("orders")
-        .where("customStatus", "==", "Delivered")
-        .where("lastStatusUpdate", "<=", cutoffDate)
-        .limit(500)
-        .get();
+      let totalStoreCreditClosed = 0;
+      let totalRegularClosed = 0;
 
-      if (ordersToClose.empty) {
-        console.log(`✓ No orders to close for account ${accountId}`);
-        res.status(200).json({
-          success: true,
-          message: "No orders to close",
-          ordersClosed: 0,
-        });
-        return;
+      // =========================================================================
+      // PROCESS STORE CREDIT ORDERS (48 hour cutoff) - with pagination
+      // =========================================================================
+      console.log("💳 Processing store credit orders (48hr cutoff)...");
+
+      let storeCreditLastDoc: QueryDocumentSnapshot | null = null;
+      let storeCreditIterations = 0;
+
+      while (storeCreditIterations < MAX_ITERATIONS) {
+        let query = accountDoc.ref
+          .collection("orders")
+          .where("customStatus", "==", "Delivered")
+          .where("raw.payment_gateway_names", "array-contains", "shopify_store_credit")
+          .where("lastStatusUpdate", "<=", storeCreditCutoffDate)
+          .orderBy("lastStatusUpdate", "asc")
+          .limit(QUERY_BATCH_SIZE);
+
+        if (storeCreditLastDoc) {
+          query = query.startAfter(storeCreditLastDoc);
+        }
+
+        const snapshot = await query.get();
+
+        if (snapshot.empty) {
+          console.log(`💳 No more store credit orders to process`);
+          break;
+        }
+
+        console.log(
+          `💳 Found ${snapshot.size} store credit orders in batch ${storeCreditIterations + 1}`,
+        );
+
+        const closed = await closeOrdersBatch(
+          snapshot.docs,
+          () => "Order closed after 48 hours of being Delivered (Store Credit order).",
+        );
+
+        totalStoreCreditClosed += closed;
+        storeCreditLastDoc = snapshot.docs[snapshot.docs.length - 1];
+        storeCreditIterations++;
+
+        // If we got less than batch size, we're done
+        if (snapshot.size < QUERY_BATCH_SIZE) {
+          break;
+        }
       }
 
-      console.log(`📦 Found ${ordersToClose.size} orders to close for account ${accountId}`);
-
-      // Process in batches (Firestore batch limit is 500 operations)
-      const BATCH_SIZE = 500;
-      const orderChunks = chunkArray(ordersToClose.docs, BATCH_SIZE);
-
-      for (const chunk of orderChunks) {
-        const batch = db.batch();
-
-        chunk.forEach((doc) => {
-          batch.update(doc.ref, {
-            customStatus: "Closed",
-            lastStatusUpdate: FieldValue.serverTimestamp(),
-            customStatusesLogs: FieldValue.arrayUnion({
-              status: "Closed",
-              createdAt: Timestamp.now(),
-              remarks: "This order Closed after approximately 15 days of being Delivered.",
-            }),
-          });
-        });
-
-        await batch.commit();
-        console.log(`✅ Closed batch of ${chunk.length} orders`);
+      if (storeCreditIterations >= MAX_ITERATIONS) {
+        console.warn(
+          `⚠️ Hit max iterations (${MAX_ITERATIONS}) for store credit orders - some may remain`,
+        );
       }
 
-      console.log(`✅ Successfully closed ${ordersToClose.size} orders for account ${accountId}`);
+      // =========================================================================
+      // PROCESS REGULAR ORDERS (120 hour cutoff) - with pagination
+      // =========================================================================
+      console.log("📦 Processing regular orders (120hr cutoff)...");
 
-      // ✅ SUCCESS RESPONSE
+      let regularLastDoc: QueryDocumentSnapshot | null = null;
+      let regularIterations = 0;
+
+      while (regularIterations < MAX_ITERATIONS) {
+        let query = accountDoc.ref
+          .collection("orders")
+          .where("customStatus", "==", "Delivered")
+          .where("lastStatusUpdate", "<=", regularCutoffDate)
+          .orderBy("lastStatusUpdate", "asc")
+          .limit(QUERY_BATCH_SIZE);
+
+        if (regularLastDoc) {
+          query = query.startAfter(regularLastDoc);
+        }
+
+        const snapshot = await query.get();
+
+        if (snapshot.empty) {
+          console.log(`📦 No more regular orders to process`);
+          break;
+        }
+
+        // Filter out store credit orders (can't use "array-does-not-contain" in Firestore)
+        const regularOrders = snapshot.docs.filter((doc) => !hasStoreCredit(doc));
+
+        console.log(
+          `📦 Found ${snapshot.size} orders in batch ${regularIterations + 1}, ` +
+            `${regularOrders.length} are regular (non-store-credit)`,
+        );
+
+        if (regularOrders.length > 0) {
+          const closed = await closeOrdersBatch(
+            regularOrders,
+            () => "Order closed after 120 hours of being Delivered.",
+          );
+          totalRegularClosed += closed;
+        }
+
+        regularLastDoc = snapshot.docs[snapshot.docs.length - 1];
+        regularIterations++;
+
+        // If we got less than batch size, we're done
+        if (snapshot.size < QUERY_BATCH_SIZE) {
+          break;
+        }
+      }
+
+      if (regularIterations >= MAX_ITERATIONS) {
+        console.warn(
+          `⚠️ Hit max iterations (${MAX_ITERATIONS}) for regular orders - some may remain`,
+        );
+      }
+
+      // =========================================================================
+      // SUMMARY
+      // =========================================================================
+      const totalClosed = totalStoreCreditClosed + totalRegularClosed;
+
+      console.log(`✅ Account ${accountId} processing complete:`);
+      console.log(`   💳 Store Credit Orders Closed: ${totalStoreCreditClosed}`);
+      console.log(`   📦 Regular Orders Closed: ${totalRegularClosed}`);
+      console.log(`   📊 Total Orders Closed: ${totalClosed}`);
+
       res.status(200).json({
         success: true,
         accountId,
-        ordersClosed: ordersToClose.size,
+        storeCreditOrdersClosed: totalStoreCreditClosed,
+        regularOrdersClosed: totalRegularClosed,
+        totalOrdersClosed: totalClosed,
+        storeCreditIterations,
+        regularIterations,
+        hitMaxIterations:
+          storeCreditIterations >= MAX_ITERATIONS || regularIterations >= MAX_ITERATIONS,
       });
     } catch (error: any) {
       console.error(`❌ Error closing orders for account ${accountId}:`, error);
-
-      // ✅ ERROR RESPONSE
       res.status(500).json({
         error: "processing_failed",
         accountId,

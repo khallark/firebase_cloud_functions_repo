@@ -5,6 +5,7 @@
 import { FieldValue } from "firebase-admin/firestore";
 import { onDocumentWritten } from "firebase-functions/firestore";
 import { db } from "../../firebaseAdmin";
+import { SHARED_STORE_ID } from "../../config";
 
 export const updateOrderCounts = onDocumentWritten(
   {
@@ -71,6 +72,42 @@ export const updateOrderCounts = onDocumentWritten(
           { merge: true },
         );
 
+        console.log(storeId === SHARED_STORE_ID, newOrder.vendors, Array.isArray(newOrder.vendors));
+
+        if (storeId === SHARED_STORE_ID && newOrder.vendors && Array.isArray(newOrder.vendors)) {
+          console.log(
+            "Shared Store detected, incrementing the 'All Orders' count of vendors too...",
+          );
+          const vendors = newOrder.vendors;
+          for (let i = 0; i < vendors.length; i++) {
+            const memberDocQuery = await db
+              .collection("accounts")
+              .doc(storeId)
+              .collection("members")
+              .where("vendorName", "==", vendors[i])
+              .get();
+            console.log(
+              `for vendor "${vendors[i]}", ${memberDocQuery.empty ? "document not found" : `document ${memberDocQuery.docs[0].id} found`}`,
+            );
+            if (!memberDocQuery.empty) {
+              console.log(
+                `Found vendor ${vendors[i]} with member document id ${memberDocQuery.docs[0].id}, updating 'All Orders' Count...`,
+              );
+              await memberDocQuery.docs[0].ref.set(
+                {
+                  counts: {
+                    "All Orders": FieldValue.increment(1),
+                    [newStatus]: FieldValue.increment(1),
+                  },
+                  lastUpdated: FieldValue.serverTimestamp(),
+                },
+                { merge: true },
+              );
+              console.log(`Vendor ${vendors[i]} Counts updated!`);
+            }
+          }
+        }
+
         console.log(`✅ Incremented count for new order (${newStatus})`);
         return;
       }
@@ -100,6 +137,31 @@ export const updateOrderCounts = onDocumentWritten(
       };
 
       await metadataRef.update(updates);
+
+      console.log(storeId === SHARED_STORE_ID, newOrder.vendors, Array.isArray(newOrder.vendors));
+
+      if (storeId === SHARED_STORE_ID && newOrder.vendors && Array.isArray(newOrder.vendors)) {
+        console.log("Shared Store detected, updating count of vendors too...");
+        const vendors = newOrder.vendors;
+        for (let i = 0; i < vendors.length; i++) {
+          const memberDocQuery = await db
+            .collection("accounts")
+            .doc(storeId)
+            .collection("members")
+            .where("vendorName", "==", vendors[i])
+            .get();
+          console.log(
+            `for vendor "${vendors[i]}", ${memberDocQuery.empty ? "document not found" : `document ${memberDocQuery.docs[0].id} found`}`,
+          );
+          if (!memberDocQuery.empty) {
+            console.log(
+              `Found vendor ${vendors[i]} with member document id ${memberDocQuery.docs[0].id}, updating counts...`,
+            );
+            await memberDocQuery.docs[0].ref.update(updates);
+            console.log(`Vendor ${vendors[i]} Counts updated!`);
+          }
+        }
+      }
 
       console.log(`✅ Updated counts: ${oldStatus} → ${newStatus}`);
     } catch (error) {

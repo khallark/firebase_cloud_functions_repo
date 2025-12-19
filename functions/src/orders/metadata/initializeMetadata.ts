@@ -16,8 +16,29 @@ async function initializeAccountMetadata(accountId: string): Promise<{
   counts: Record<string, number>;
 }> {
   console.log(`  📊 Counting orders for account: ${accountId}`);
-
-  const ordersSnapshot = await db.collection("accounts").doc(accountId).collection("orders").get();
+  const allPermutations = [
+    ["OWR"],
+    ["Ghamand"],
+    ["BBB"],
+    ["OWR", "Ghamand"],
+    ["Ghamand", "OWR"],
+    ["OWR", "BBB"],
+    ["BBB", "OWR"],
+    ["Ghamand", "BBB"],
+    ["BBB", "Ghamand"],
+    ["OWR", "Ghamand", "BBB"],
+    ["OWR", "BBB", "Ghamand"],
+    ["Ghamand", "OWR", "BBB"],
+    ["Ghamand", "BBB", "OWR"],
+    ["BBB", "OWR", "Ghamand"],
+    ["BBB", "Ghamand", "OWR"],
+  ];
+  const ordersSnapshot = await db
+    .collection("accounts")
+    .doc(accountId)
+    .collection("orders")
+    .where("vendors", "in", allPermutations)
+    .get();
 
   const counts: Record<string, number> = {
     "All Orders": 0,
@@ -64,10 +85,20 @@ async function initializeAccountMetadata(accountId: string): Promise<{
   counts["All Orders"] = allOrdersCount;
 
   // Save to metadata document
-  await db.collection("accounts").doc(accountId).collection("metadata").doc("orderCounts").set({
-    counts,
-    lastUpdated: FieldValue.serverTimestamp(),
-  });
+  await (
+    await db
+      .collection("accounts")
+      .doc(accountId)
+      .collection("members")
+      .where("vendorName", "==", "OWR")
+      .get()
+  ).docs?.[0]?.ref.set(
+    {
+      counts,
+      lastUpdated: FieldValue.serverTimestamp(),
+    },
+    { merge: true },
+  );
 
   console.log(`  ✅ Metadata created: ${ordersSnapshot.size} orders counted`);
 
