@@ -33,6 +33,8 @@ export const enqueueOrderSplitBatch = onRequest(
         requestedBy?: string;
       };
 
+      console.log(shop, orderId, requestedBy);
+
       if (!shop || !orderId || !requestedBy) {
         console.error("missing_shop_or_orderId");
         res.status(400).json({ error: "missing_shop_or_orderId" });

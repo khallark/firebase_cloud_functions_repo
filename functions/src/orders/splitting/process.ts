@@ -371,6 +371,23 @@ export const processOrderSplitJob = onRequest(
       // Get the actual order ID (draft_order.order_id is the real order ID after completion)
       const actualOrderId = newOrder.order_id;
 
+      // Fetch actual order details
+      const actualOrderUrl = `https://${shop}/admin/api/2025-01/orders/${actualOrderId}.json`;
+      const actualOrderResp = await fetch(actualOrderUrl, {
+        headers: {
+          "X-Shopify-Access-Token": accessToken,
+        },
+      });
+
+      if (!actualOrderResp.ok) {
+        console.warn(`⚠ Could not fetch actual order details, using draft order name`);
+      }
+
+      const actualOrderData = actualOrderResp.ok ? ((await actualOrderResp.json()) as any) : null;
+      const actualOrderName = actualOrderData?.order?.name || newOrder.name;
+
+      console.log(`✓ Actual order name: ${actualOrderName}`);
+
       // Step 4: Handle payment based on original order status
       console.log(`\n--- Handling payment ---`);
       let splitPaidAmount = 0;
@@ -450,12 +467,12 @@ export const processOrderSplitJob = onRequest(
       await db.runTransaction(async (tx: Transaction) => {
         tx.update(jobRef, {
           status: "success",
-          newOrderName: newOrder.name,
+          newOrderName: actualOrderName,
           product_name: newOrder?.line_items?.[0]?.name ?? "---",
           product_quantity: newOrder?.line_items?.[0]?.quantity ?? "---",
           draftOrderId: String(draftOrder.id),
           splitOrderId: String(actualOrderId),
-          splitOrderName: newOrder.name,
+          splitOrderName: actualOrderName,
           paidAmount: splitPaidAmount,
           outstandingAmount: splitOutstanding,
           financialStatus: finalFinancialStatus,
@@ -523,8 +540,8 @@ export const processOrderSplitJob = onRequest(
 
       res.status(200).json({
         success: true,
-        splitOrderId: newOrder.id,
-        splitOrderName: newOrder.name,
+        splitOrderId: actualOrderId,
+        splitOrderName: actualOrderName,
         vendor: jobData.vendorName,
         paidAmount: splitPaidAmount,
         outstandingAmount: splitOutstanding,

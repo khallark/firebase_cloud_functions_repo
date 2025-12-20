@@ -72,8 +72,6 @@ export const updateOrderCounts = onDocumentWritten(
           { merge: true },
         );
 
-        console.log(storeId === SHARED_STORE_ID, newOrder.vendors, Array.isArray(newOrder.vendors));
-
         if (storeId === SHARED_STORE_ID && newOrder.vendors && Array.isArray(newOrder.vendors)) {
           console.log(
             "Shared Store detected, incrementing the 'All Orders' count of vendors too...",
@@ -137,8 +135,6 @@ export const updateOrderCounts = onDocumentWritten(
       };
 
       await metadataRef.update(updates);
-
-      console.log(storeId === SHARED_STORE_ID, newOrder.vendors, Array.isArray(newOrder.vendors));
 
       if (storeId === SHARED_STORE_ID && newOrder.vendors && Array.isArray(newOrder.vendors)) {
         console.log("Shared Store detected, updating count of vendors too...");

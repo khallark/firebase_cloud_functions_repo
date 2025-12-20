@@ -5,7 +5,7 @@ import { ENQUEUE_FUNCTION_SECRET, SHARED_STORE_ID, SUPER_ADMIN_ID } from "../../
 import { requireHeaderSecret } from "../../helpers";
 import { db } from "../../firebaseAdmin";
 
-// Define the status categories
+// Define the status categories with their individual statuses
 const STATUS_CATEGORIES = {
   cancellations: ["Cancellation Requested", "Cancelled"],
   pendingDispatch: ["New", "Confirmed", "Ready To Dispatch"],
@@ -29,19 +29,56 @@ const STATUS_CATEGORIES = {
   delivered: ["Closed", "Delivered"],
 };
 
+// All status labels for display purposes
+// const STATUS_LABELS: Record<string, string> = {
+//   // Cancellations
+//   "Cancellation Requested": "Cancellation Requested",
+//   Cancelled: "Cancelled",
+//   // Pending Dispatch
+//   New: "New",
+//   Confirmed: "Confirmed",
+//   "Ready To Dispatch": "Ready To Dispatch",
+//   // Returns
+//   "RTO Delivered": "RTO Delivered",
+//   "RTO Closed": "RTO Closed",
+//   "RTO In Transit": "RTO In Transit",
+//   "DTO Delivered": "DTO Delivered",
+//   "Pending Refund": "Pending Refund",
+//   "DTO Refunded": "DTO Refunded",
+//   Lost: "Lost",
+//   // In Transit
+//   Dispatched: "Dispatched",
+//   "In Transit": "In Transit",
+//   "Out For Delivery": "Out For Delivery",
+//   "DTO Requested": "DTO Requested",
+//   "DTO Booked": "DTO Booked",
+//   "DTO In Transit": "DTO In Transit",
+//   // Delivered
+//   Closed: "Closed",
+//   Delivered: "Delivered",
+// };
+
 interface TableRowData {
   orderCount: number;
   itemCount: number;
   netSaleValue: number;
 }
 
+interface StatusBreakdown {
+  [status: string]: TableRowData;
+}
+
+interface CategoryData extends TableRowData {
+  breakdown: StatusBreakdown;
+}
+
 interface TableData {
   grossSales: TableRowData;
-  cancellations: TableRowData;
-  pendingDispatch: TableRowData;
-  returns: TableRowData;
-  inTransit: TableRowData;
-  delivered: TableRowData;
+  cancellations: CategoryData;
+  pendingDispatch: CategoryData;
+  returns: CategoryData;
+  inTransit: CategoryData;
+  delivered: CategoryData;
 }
 
 interface OrderDoc {
@@ -82,16 +119,42 @@ function isWithinDateRange(orderCreatedAt: string, startTime: string, endTime: s
   return orderDate >= startDate && orderDate <= endDate;
 }
 
+// Initialize empty row data
+function initializeRowData(): TableRowData {
+  return { orderCount: 0, itemCount: 0, netSaleValue: 0 };
+}
+
+// Initialize empty category data with breakdown
+function initializeCategoryData(statuses: string[]): CategoryData {
+  const breakdown: StatusBreakdown = {};
+  statuses.forEach((status) => {
+    breakdown[status] = initializeRowData();
+  });
+  return {
+    orderCount: 0,
+    itemCount: 0,
+    netSaleValue: 0,
+    breakdown,
+  };
+}
+
 // Initialize empty table data
 function initializeTableData(): TableData {
   return {
-    grossSales: { orderCount: 0, itemCount: 0, netSaleValue: 0 },
-    cancellations: { orderCount: 0, itemCount: 0, netSaleValue: 0 },
-    pendingDispatch: { orderCount: 0, itemCount: 0, netSaleValue: 0 },
-    returns: { orderCount: 0, itemCount: 0, netSaleValue: 0 },
-    inTransit: { orderCount: 0, itemCount: 0, netSaleValue: 0 },
-    delivered: { orderCount: 0, itemCount: 0, netSaleValue: 0 },
+    grossSales: initializeRowData(),
+    cancellations: initializeCategoryData(STATUS_CATEGORIES.cancellations),
+    pendingDispatch: initializeCategoryData(STATUS_CATEGORIES.pendingDispatch),
+    returns: initializeCategoryData(STATUS_CATEGORIES.returns),
+    inTransit: initializeCategoryData(STATUS_CATEGORIES.inTransit),
+    delivered: initializeCategoryData(STATUS_CATEGORIES.delivered),
   };
+}
+
+// Add to row data
+function addToRowData(target: TableRowData, itemCount: number, netSaleValue: number): void {
+  target.orderCount += 1;
+  target.itemCount += itemCount;
+  target.netSaleValue += netSaleValue;
 }
 
 // Categorize and accumulate order data
@@ -101,32 +164,50 @@ function categorizeOrder(order: OrderDoc, tableData: TableData): void {
   const netSaleValue = getNetSaleValue(order);
 
   // Always add to gross sales
-  tableData.grossSales.orderCount += 1;
-  tableData.grossSales.itemCount += itemCount;
-  tableData.grossSales.netSaleValue += netSaleValue;
+  addToRowData(tableData.grossSales, itemCount, netSaleValue);
 
-  // Categorize by status
+  // Categorize by status and update both category totals and breakdown
   if (STATUS_CATEGORIES.cancellations.includes(status)) {
-    tableData.cancellations.orderCount += 1;
-    tableData.cancellations.itemCount += itemCount;
-    tableData.cancellations.netSaleValue += netSaleValue;
+    addToRowData(tableData.cancellations, itemCount, netSaleValue);
+    addToRowData(tableData.cancellations.breakdown[status], itemCount, netSaleValue);
   } else if (STATUS_CATEGORIES.pendingDispatch.includes(status)) {
-    tableData.pendingDispatch.orderCount += 1;
-    tableData.pendingDispatch.itemCount += itemCount;
-    tableData.pendingDispatch.netSaleValue += netSaleValue;
+    addToRowData(tableData.pendingDispatch, itemCount, netSaleValue);
+    addToRowData(tableData.pendingDispatch.breakdown[status], itemCount, netSaleValue);
   } else if (STATUS_CATEGORIES.returns.includes(status)) {
-    tableData.returns.orderCount += 1;
-    tableData.returns.itemCount += itemCount;
-    tableData.returns.netSaleValue += netSaleValue;
+    addToRowData(tableData.returns, itemCount, netSaleValue);
+    addToRowData(tableData.returns.breakdown[status], itemCount, netSaleValue);
   } else if (STATUS_CATEGORIES.inTransit.includes(status)) {
-    tableData.inTransit.orderCount += 1;
-    tableData.inTransit.itemCount += itemCount;
-    tableData.inTransit.netSaleValue += netSaleValue;
+    addToRowData(tableData.inTransit, itemCount, netSaleValue);
+    addToRowData(tableData.inTransit.breakdown[status], itemCount, netSaleValue);
   } else if (STATUS_CATEGORIES.delivered.includes(status)) {
-    tableData.delivered.orderCount += 1;
-    tableData.delivered.itemCount += itemCount;
-    tableData.delivered.netSaleValue += netSaleValue;
+    addToRowData(tableData.delivered, itemCount, netSaleValue);
+    addToRowData(tableData.delivered.breakdown[status], itemCount, netSaleValue);
   }
+}
+
+// Round all values in the table data
+function roundTableData(tableData: TableData): void {
+  // Round gross sales
+  tableData.grossSales.netSaleValue = Math.round(tableData.grossSales.netSaleValue * 100) / 100;
+
+  // Round each category and its breakdown
+  const categories: (keyof Omit<TableData, "grossSales">)[] = [
+    "cancellations",
+    "pendingDispatch",
+    "returns",
+    "inTransit",
+    "delivered",
+  ];
+
+  categories.forEach((category) => {
+    const categoryData = tableData[category];
+    categoryData.netSaleValue = Math.round(categoryData.netSaleValue * 100) / 100;
+
+    Object.keys(categoryData.breakdown).forEach((status) => {
+      categoryData.breakdown[status].netSaleValue =
+        Math.round(categoryData.breakdown[status].netSaleValue * 100) / 100;
+    });
+  });
 }
 
 export const generateTableData = onRequest(
@@ -247,14 +328,10 @@ export const generateTableData = onRequest(
         });
       }
 
-      // Round net sale values to 2 decimal places
-      Object.keys(aggregatedData).forEach((key) => {
-        const category = key as keyof TableData;
-        aggregatedData[category].netSaleValue =
-          Math.round(aggregatedData[category].netSaleValue * 100) / 100;
-      });
+      // Round all net sale values to 2 decimal places
+      roundTableData(aggregatedData);
 
-      console.log("📊 Aggregated data:", aggregatedData);
+      console.log("📊 Aggregated data:", JSON.stringify(aggregatedData, null, 2));
 
       // Update the business document with the calculated data
       await businessDocRef.update({

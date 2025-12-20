@@ -16,28 +16,12 @@ async function initializeAccountMetadata(accountId: string): Promise<{
   counts: Record<string, number>;
 }> {
   console.log(`  📊 Counting orders for account: ${accountId}`);
-  const allPermutations = [
-    ["OWR"],
-    ["Ghamand"],
-    ["BBB"],
-    ["OWR", "Ghamand"],
-    ["Ghamand", "OWR"],
-    ["OWR", "BBB"],
-    ["BBB", "OWR"],
-    ["Ghamand", "BBB"],
-    ["BBB", "Ghamand"],
-    ["OWR", "Ghamand", "BBB"],
-    ["OWR", "BBB", "Ghamand"],
-    ["Ghamand", "OWR", "BBB"],
-    ["Ghamand", "BBB", "OWR"],
-    ["BBB", "OWR", "Ghamand"],
-    ["BBB", "Ghamand", "OWR"],
-  ];
+
   const ordersSnapshot = await db
     .collection("accounts")
     .doc(accountId)
     .collection("orders")
-    .where("vendors", "in", allPermutations)
+    .where("vendors", "array-contains", "ENDORA")
     .get();
 
   const counts: Record<string, number> = {
@@ -56,6 +40,7 @@ async function initializeAccountMetadata(accountId: string): Promise<{
     "DTO In Transit": 0,
     "DTO Delivered": 0,
     "Pending Refunds": 0,
+    "DTO Refunded": 0,
     Lost: 0,
     Closed: 0,
     "RTO Closed": 0,
@@ -90,7 +75,7 @@ async function initializeAccountMetadata(accountId: string): Promise<{
       .collection("accounts")
       .doc(accountId)
       .collection("members")
-      .where("vendorName", "==", "OWR")
+      .where("vendorName", "==", "ENDORA")
       .get()
   ).docs?.[0]?.ref.set(
     {
