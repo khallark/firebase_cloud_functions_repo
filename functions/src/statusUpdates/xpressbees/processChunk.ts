@@ -28,6 +28,7 @@ export async function processXpressbeesOrderChunk(
     "Cancellation Requested",
     "Pending Refunds",
     "DTO Refunded",
+    "Cancelled",
   ]);
 
   const shopRef = db.collection("accounts").doc(accountId);

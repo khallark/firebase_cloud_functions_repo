@@ -224,15 +224,15 @@ export const generateCustomTaxReportPreliminary = onRequest(
       const daysDiff = Math.ceil((end.getTime() - start.getTime()) / (1000 * 60 * 60 * 24));
 
       // Validate range is not too large (limit to 31 days)
-      if (daysDiff > 31) {
-        res.status(400).json({
-          error: "Date range too large",
-          message: "Please limit the date range to 31 days or less",
-          requestedDays: daysDiff + 1,
-          maxDays: 31,
-        });
-        return;
-      }
+      // if (daysDiff > 31) {
+      //   res.status(400).json({
+      //     error: "Date range too large",
+      //     message: "Please limit the date range to 31 days or less",
+      //     requestedDays: daysDiff + 1,
+      //     maxDays: 31,
+      //   });
+      //   return;
+      // }
 
       // Validate date is not in the future
       const today = new Date();
@@ -367,14 +367,14 @@ export const generateCustomTaxReport = onRequest(
 
       // Check if range is too large (optional: limit to 31 days)
       const daysDiff = Math.ceil((end.getTime() - start.getTime()) / (1000 * 60 * 60 * 24));
-      if (daysDiff > 31) {
-        res.status(400).json({
-          error: "Date range too large",
-          message: "Please limit the date range to 31 days or less",
-          requestedDays: daysDiff,
-        });
-        return;
-      }
+      // if (daysDiff > 31) {
+      //   res.status(400).json({
+      //     error: "Date range too large",
+      //     message: "Please limit the date range to 31 days or less",
+      //     requestedDays: daysDiff,
+      //   });
+      //   return;
+      // }
 
       // console.log(`🚀 Starting Custom Tax Report Generation...`);
       console.log(`📅 Date Range: ${startDate} to ${endDate} (${daysDiff + 1} days)`);

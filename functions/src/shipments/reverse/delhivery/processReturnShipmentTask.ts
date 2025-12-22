@@ -28,6 +28,45 @@ export const processReturnShipmentTask = onRequest(
       }
     };
 
+    /** Fetch pickup location from Delhivery tracking API */
+    async function fetchPickupLocation(
+      forwardAwb: string,
+      apiKey: string,
+    ): Promise<{ ok: boolean; pickupName?: string; error?: string }> {
+      try {
+        const trackingUrl = `https://track.delhivery.com/api/v1/packages/json/?waybill=${forwardAwb}`;
+        const resp = await fetch(trackingUrl, {
+          method: "GET",
+          headers: {
+            Authorization: `Token ${apiKey}`,
+            Accept: "application/json",
+          },
+        });
+
+        if (!resp.ok) {
+          return { ok: false, error: `Tracking API returned HTTP ${resp.status}` };
+        }
+
+        const data = (await resp.json()) as any;
+        const shipment = data?.ShipmentData?.[0]?.Shipment;
+
+        if (!shipment) {
+          return { ok: false, error: "No shipment data found in tracking response" };
+        }
+
+        const pickupLocation = shipment.PickupLocation;
+
+        if (!pickupLocation) {
+          return { ok: false, error: "PickupLocation not found in shipment data" };
+        }
+
+        return { ok: true, pickupName: String(pickupLocation) };
+      } catch (error) {
+        const message = error instanceof Error ? error.message : String(error);
+        return { ok: false, error: `Failed to fetch tracking data: ${message}` };
+      }
+    }
+
     /** Classify Delhivery return response */
     function evalDelhiveryReturnResp(carrier: any): {
       ok: boolean;
@@ -108,16 +147,15 @@ export const processReturnShipmentTask = onRequest(
         return;
       }
 
-      const { businessId, shop, batchId, jobId, pickupName, shippingMode } = (req.body || {}) as {
+      const { businessId, shop, batchId, jobId, shippingMode } = (req.body || {}) as {
         businessId?: string;
         shop?: string;
         batchId?: string;
         jobId?: string;
-        pickupName?: string;
         shippingMode?: string;
       };
 
-      if (!businessId || !shop || !batchId || !jobId || !pickupName) {
+      if (!businessId || !shop || !batchId || !jobId) {
         res.status(400).json({ error: "bad_payload" });
         return;
       }
@@ -251,6 +289,68 @@ export const processReturnShipmentTask = onRequest(
         return;
       }
 
+      // Carrier API key (needed for both tracking and creating return)
+      const apiKey = businessData?.integrations?.couriers?.delhivery?.apiKey as string | undefined;
+      if (!apiKey) throw new Error("CARRIER_KEY_MISSING");
+
+      // Check if order has forward AWB
+      const forwardAwb = order?.awb;
+      if (!forwardAwb) {
+        const failure = await handleReturnJobFailure({
+          shop,
+          batchRef,
+          jobRef,
+          jobId,
+          errorCode: "FORWARD_AWB_MISSING",
+          errorMessage: "Order does not have a forward AWB. Cannot fetch pickup location.",
+          isRetryable: false,
+        });
+
+        if (failure.shouldReturnFailure) {
+          res.status(failure.statusCode).json({
+            ok: false,
+            reason: failure.reason,
+            code: "FORWARD_AWB_MISSING",
+          });
+        } else {
+          res.status(failure.statusCode).json({
+            ok: true,
+            action: failure.reason,
+          });
+        }
+        return;
+      }
+
+      // Fetch pickup location from tracking API
+      const pickupResult = await fetchPickupLocation(forwardAwb, apiKey);
+      if (!pickupResult.ok || !pickupResult.pickupName) {
+        const failure = await handleReturnJobFailure({
+          shop,
+          batchRef,
+          jobRef,
+          jobId,
+          errorCode: "PICKUP_LOCATION_FETCH_FAILED",
+          errorMessage: pickupResult.error || "Failed to fetch pickup location from tracking API",
+          isRetryable: true, // Retry as it might be a transient issue
+        });
+
+        if (failure.shouldReturnFailure) {
+          res.status(failure.statusCode).json({
+            ok: false,
+            reason: failure.reason,
+            code: "PICKUP_LOCATION_FETCH_FAILED",
+          });
+        } else {
+          res.status(failure.statusCode).json({
+            ok: true,
+            action: failure.reason,
+          });
+        }
+        return;
+      }
+
+      const pickupName = pickupResult.pickupName;
+
       // Allocate AWB
       awb = await allocateAwb(businessId);
 
@@ -262,10 +362,6 @@ export const processReturnShipmentTask = onRequest(
         pickupName,
         shippingMode,
       });
-
-      // Carrier API key
-      const apiKey = businessData?.integrations?.couriers?.delhivery?.apiKey as string | undefined;
-      if (!apiKey) throw new Error("CARRIER_KEY_MISSING");
 
       // Call Delhivery
       const base = "https://track.delhivery.com";

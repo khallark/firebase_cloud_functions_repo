@@ -12,13 +12,13 @@ const STATUS_CATEGORIES = {
   returns: [
     "RTO Delivered",
     "RTO Closed",
-    "RTO In Transit",
     "DTO Delivered",
     "Pending Refund",
     "DTO Refunded",
     "Lost",
   ],
   inTransit: [
+    "RTO In Transit",
     "Dispatched",
     "In Transit",
     "Out For Delivery",
@@ -101,15 +101,6 @@ function calculateItemCount(order: OrderDoc): number {
   }, 0);
 }
 
-// Helper function to get net sale value
-function getNetSaleValue(order: OrderDoc): number {
-  // Special case for DTO Refunded - use refundedAmount
-  if (order.customStatus === "DTO Refunded" && order.refundedAmount !== undefined) {
-    return Number(order.refundedAmount) || 0;
-  }
-  return Number(order.raw?.total_price) || 0;
-}
-
 // Helper function to check if order falls within date range (IST aware)
 function isWithinDateRange(orderCreatedAt: string, startTime: string, endTime: string): boolean {
   const orderDate = new Date(orderCreatedAt);
@@ -157,31 +148,43 @@ function addToRowData(target: TableRowData, itemCount: number, netSaleValue: num
   target.netSaleValue += netSaleValue;
 }
 
+// Helper function to get total price (for gross sales)
+function getTotalPrice(order: OrderDoc): number {
+  return Number(order.raw?.total_price) || 0;
+}
+
+// Helper function to get refunded amount (for DTO Refunded returns)
+function getRefundedAmount(order: OrderDoc): number {
+  return Number(order.refundedAmount) || 0;
+}
+
 // Categorize and accumulate order data
 function categorizeOrder(order: OrderDoc, tableData: TableData): void {
   const status = order.customStatus || "";
   const itemCount = calculateItemCount(order);
-  const netSaleValue = getNetSaleValue(order);
+  const totalPrice = getTotalPrice(order);
 
-  // Always add to gross sales
-  addToRowData(tableData.grossSales, itemCount, netSaleValue);
+  // Always add total_price to gross sales
+  addToRowData(tableData.grossSales, itemCount, totalPrice);
 
-  // Categorize by status and update both category totals and breakdown
+  // Categorize by status
   if (STATUS_CATEGORIES.cancellations.includes(status)) {
-    addToRowData(tableData.cancellations, itemCount, netSaleValue);
-    addToRowData(tableData.cancellations.breakdown[status], itemCount, netSaleValue);
+    addToRowData(tableData.cancellations, itemCount, totalPrice);
+    addToRowData(tableData.cancellations.breakdown[status], itemCount, totalPrice);
   } else if (STATUS_CATEGORIES.pendingDispatch.includes(status)) {
-    addToRowData(tableData.pendingDispatch, itemCount, netSaleValue);
-    addToRowData(tableData.pendingDispatch.breakdown[status], itemCount, netSaleValue);
+    addToRowData(tableData.pendingDispatch, itemCount, totalPrice);
+    addToRowData(tableData.pendingDispatch.breakdown[status], itemCount, totalPrice);
   } else if (STATUS_CATEGORIES.returns.includes(status)) {
-    addToRowData(tableData.returns, itemCount, netSaleValue);
-    addToRowData(tableData.returns.breakdown[status], itemCount, netSaleValue);
+    // Special case: DTO Refunded uses refundedAmount
+    const returnValue = status === "DTO Refunded" ? getRefundedAmount(order) : totalPrice;
+    addToRowData(tableData.returns, itemCount, returnValue);
+    addToRowData(tableData.returns.breakdown[status], itemCount, returnValue);
   } else if (STATUS_CATEGORIES.inTransit.includes(status)) {
-    addToRowData(tableData.inTransit, itemCount, netSaleValue);
-    addToRowData(tableData.inTransit.breakdown[status], itemCount, netSaleValue);
+    addToRowData(tableData.inTransit, itemCount, totalPrice);
+    addToRowData(tableData.inTransit.breakdown[status], itemCount, totalPrice);
   } else if (STATUS_CATEGORIES.delivered.includes(status)) {
-    addToRowData(tableData.delivered, itemCount, netSaleValue);
-    addToRowData(tableData.delivered.breakdown[status], itemCount, netSaleValue);
+    addToRowData(tableData.delivered, itemCount, totalPrice);
+    addToRowData(tableData.delivered.breakdown[status], itemCount, totalPrice);
   }
 }
 
@@ -275,34 +278,10 @@ export const generateTableData = onRequest(
             const memberDoc = await storeRef.collection("members").doc(businessId).get();
             if (memberDoc.exists && memberDoc.data()?.vendorName) {
               const vendorName = memberDoc.data()?.vendorName;
-              if (vendorName === "OWR") {
-                const allPermutations = [
-                  ["OWR"],
-                  ["Ghamand"],
-                  ["BBB"],
-                  ["OWR", "Ghamand"],
-                  ["Ghamand", "OWR"],
-                  ["OWR", "BBB"],
-                  ["BBB", "OWR"],
-                  ["Ghamand", "BBB"],
-                  ["BBB", "Ghamand"],
-                  ["OWR", "Ghamand", "BBB"],
-                  ["OWR", "BBB", "Ghamand"],
-                  ["Ghamand", "OWR", "BBB"],
-                  ["Ghamand", "BBB", "OWR"],
-                  ["BBB", "OWR", "Ghamand"],
-                  ["BBB", "Ghamand", "OWR"],
-                ];
-                ordersQuery = ordersRef
-                  .where("createdAt", ">=", startTime)
-                  .where("createdAt", "<=", endTime)
-                  .where("vendors", "in", allPermutations);
-              } else {
-                ordersQuery = ordersRef
-                  .where("createdAt", ">=", startTime)
-                  .where("createdAt", "<=", endTime)
-                  .where("vendors", "array-contains", vendorName);
-              }
+              ordersQuery = ordersRef
+                .where("createdAt", ">=", startTime)
+                .where("createdAt", "<=", endTime)
+                .where("vendors", "array-contains", vendorName);
             } else {
               ordersQuery = ordersRef.where("some-random-shit", "==", "some-random-shit");
             }
@@ -317,14 +296,32 @@ export const generateTableData = onRequest(
 
         console.log(`   Found ${ordersSnapshot.size} orders for store ${storeId}`);
 
+        // Add these before the store processing loop
+        let earliestOrder: { name: string; createdAt: string } | null = null;
+        let latestOrder: { name: string; createdAt: string } | null = null;
+
         // Process each order
         ordersSnapshot.forEach((doc) => {
           const order = doc.data() as OrderDoc;
 
           // Double-check date range (in case of timezone issues)
           if (order.createdAt && isWithinDateRange(order.createdAt, startTime, endTime)) {
+            // Track earliest and latest orders
+            if (!earliestOrder || new Date(order.createdAt) < new Date(earliestOrder.createdAt)) {
+              earliestOrder = { name: doc.id, createdAt: order.createdAt };
+            }
+            if (!latestOrder || new Date(order.createdAt) > new Date(latestOrder.createdAt)) {
+              latestOrder = { name: doc.id, createdAt: order.createdAt };
+            }
+
             categorizeOrder(order, aggregatedData);
           }
+        });
+
+        // Then after the store processing loop, log them:
+        console.log("📅 Date range of processed orders:", {
+          earliest: earliestOrder,
+          latest: latestOrder,
         });
       }
 

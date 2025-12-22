@@ -19,6 +19,7 @@ interface SalesRow {
   awb: string;
   mrp: number;
   discountLinewise: number;
+  proportionateShippingPrice: number;
   salePrice: number;
   hsn: string;
   taxRate: number;
@@ -181,14 +182,11 @@ function calculateProportionalRefund(order: any, item: any, salePrice: number): 
 
   // Calculate item's proportion of total order
   const items = order.raw?.line_items || [];
-  const orderTotal =
-    Number(order.raw.current_subtotal_price || order.raw.subtotal_price) ||
-    items.reduce((sum: number, item: any) => {
-      return sum + Number(item.price) * Number(item.quantity);
-    }, 0);
+  const orderTotal = items.reduce((sum: number, item: any) => {
+    return sum + Number(item.price) * Number(item.quantity);
+  }, 0);
 
   if (orderTotal === 0) return 0;
-
   const itemTotal = Number(item.price) * Number(item.quantity);
   const proportion = itemTotal / orderTotal;
 
@@ -229,6 +227,8 @@ async function processSalesOrders(
   for (const orderDoc of ordersSnapshot.docs) {
     const order = orderDoc.data();
     const items = order.raw?.line_items || [];
+    const itemsArr = Array.isArray(items) ? items : [];
+    const totalMRP = itemsArr.reduce((acc, item) => acc + Number(item.price), 0);
 
     for (const item of items) {
       try {
@@ -244,8 +244,19 @@ async function processSalesOrders(
         const itemQty = Number(item.quantity || 0);
         const itemPrice = Number(item.price || 0);
         const mrp = Number((itemQty * itemPrice).toFixed(2));
-        const discountLinewise = Number(item.discount_allocations?.[0]?.amount || 0);
-        const salePrice = Number((mrp - discountLinewise).toFixed(2));
+        const discountArr = item.discount_allocations;
+        const discountLinewise = (Array.isArray(discountArr) ? discountArr : []).reduce(
+          (a, i) => a + Number(i.amount),
+          0,
+        );
+
+        const proportionateShippingPrice = Number(
+          (
+            (Number(order.raw.total_shipping_price_set.presentment_money.amount) * mrp) /
+            totalMRP
+          ).toFixed(2),
+        );
+        const salePrice = Number((mrp - discountLinewise + proportionateShippingPrice).toFixed(2));
 
         // Get HSN and Tax Rate
         const productInfo = await getProductInfo(storeId, item.title);
@@ -263,6 +274,7 @@ async function processSalesOrders(
           awb: String(order.awb || "-"),
           mrp: mrp,
           discountLinewise: discountLinewise,
+          proportionateShippingPrice: proportionateShippingPrice,
           salePrice: salePrice,
           hsn: String(productInfo.hsn),
           taxRate: Number(productInfo.taxRate),
@@ -299,8 +311,13 @@ async function processSalesReturnOrders(
     `📊 Fetching sales return orders with status changes from ${startOfRange.toDateString()} to ${endOfRange.toDateString()}`,
   );
 
-  // Fetch all orders (we need to filter by customStatusesLogs)
-  const ordersSnapshot = await db.collection("accounts").doc(storeId).collection("orders").get();
+  // Fetch orders with return statuses only
+  const ordersSnapshot = await db
+    .collection("accounts")
+    .doc(storeId)
+    .collection("orders")
+    .where("customStatus", "in", Array.from(RETURN_STATUSES))
+    .get();
 
   console.log(`Scanning ${ordersSnapshot.size} total orders for returns`);
 
@@ -337,6 +354,8 @@ async function processSalesReturnOrders(
 
     eligibleOrdersCount++;
     const items = order.raw?.line_items || [];
+    const itemsArr = Array.isArray(items) ? items : [];
+    const totalMRP = itemsArr.reduce((acc, item) => acc + Number(item.price), 0);
 
     // Use the first return log for date of return
     const dateOfReturn = returnLogs[0].createdAt;
@@ -355,8 +374,19 @@ async function processSalesReturnOrders(
         const itemQty = Number(item.quantity || 0);
         const itemPrice = Number(item.price || 0);
         const mrp = Number((itemQty * itemPrice).toFixed(2));
-        const discountLinewise = Number(item.discount_allocations?.[0]?.amount || 0);
-        const salePrice = Number((mrp - discountLinewise).toFixed(2));
+        const discountArr = item.discount_allocations;
+        const discountLinewise = (Array.isArray(discountArr) ? discountArr : []).reduce(
+          (a, i) => a + Number(i.amount),
+          0,
+        );
+
+        const proportionateShippingPrice = Number(
+          (
+            (Number(order.raw.total_shipping_price_set.presentment_money.amount) * mrp) /
+            totalMRP
+          ).toFixed(2),
+        );
+        const salePrice = Number((mrp - discountLinewise + proportionateShippingPrice).toFixed(2));
 
         // Calculate refund amount
         const refundAmount = calculateProportionalRefund(order, item, salePrice);
@@ -381,6 +411,7 @@ async function processSalesReturnOrders(
           awb: String(order.awb_reverse || order.awb || "-"),
           mrp: mrp,
           discountLinewise: discountLinewise,
+          proportionateShippingPrice: proportionateShippingPrice,
           salePrice: salePrice,
           refundAmount: refundAmount,
           hsn: String(productInfo.hsn),
@@ -618,6 +649,7 @@ async function createExcelWorkbook(
     { header: "AWB", key: "awb", width: 20 },
     { header: "MRP", key: "mrp", width: 12 },
     { header: "Discount Line wise", key: "discountLinewise", width: 18 },
+    { header: "Proportionate Shipping Price", key: "proportionateShippingPrice", width: 12 },
     { header: "Sale Price", key: "salePrice", width: 12 },
     { header: "HSN", key: "hsn", width: 10 },
     { header: "Tax Rate", key: "taxRate", width: 10 },
@@ -632,7 +664,7 @@ async function createExcelWorkbook(
 
   // Style header with all borders
   const salesHeaderRow = salesSheet.getRow(1);
-  for (let col = 1; col <= 18; col++) {
+  for (let col = 1; col <= 19; col++) {
     const cell = salesHeaderRow.getCell(col);
     cell.font = { bold: true, color: { argb: "FFFFFFFF" } };
     cell.fill = {
@@ -651,7 +683,7 @@ async function createExcelWorkbook(
 
   // Add side borders to all data rows
   for (let row = 2; row <= salesRows.length + 1; row++) {
-    for (let col = 1; col <= 18; col++) {
+    for (let col = 1; col <= 19; col++) {
       const cell = salesSheet.getCell(row, col);
       cell.border = {
         left: { style: "thin" },
@@ -678,6 +710,7 @@ async function createExcelWorkbook(
     { header: "AWB", key: "awb", width: 20 },
     { header: "MRP", key: "mrp", width: 12 },
     { header: "Discount Line wise", key: "discountLinewise", width: 18 },
+    { header: "Proportionate Shipping Price", key: "proportionateShippingPrice", width: 12 },
     { header: "Sale Price", key: "salePrice", width: 12 },
     { header: "Refund/Sale Return Amount", key: "refundAmount", width: 25 },
     { header: "HSN", key: "hsn", width: 10 },

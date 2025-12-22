@@ -16,12 +16,11 @@ export const enqueueReturnShipmentTasks = onRequest(
         return;
       }
 
-      const { businessId, shop, orderIds, pickupName, shippingMode, requestedBy } = (req.body ||
+      const { businessId, shop, orderIds, shippingMode, requestedBy } = (req.body ||
         {}) as {
         businessId?: string;
         shop?: string;
         orderIds?: string[];
-        pickupName?: string;
         shippingMode?: string;
         requestedBy?: string;
       };
@@ -29,7 +28,6 @@ export const enqueueReturnShipmentTasks = onRequest(
       if (
         !businessId ||
         !shop ||
-        !pickupName ||
         !shippingMode ||
         !Array.isArray(orderIds) ||
         orderIds.length === 0
@@ -98,7 +96,6 @@ export const enqueueReturnShipmentTasks = onRequest(
 
       await batchRef.set({
         shop,
-        pickupName,
         shippingMode,
         createdAt: FieldValue.serverTimestamp(),
         createdBy: requestedBy || "system",
@@ -145,7 +142,6 @@ export const enqueueReturnShipmentTasks = onRequest(
               shop,
               batchId: batchRef.id,
               jobId: String(o),
-              pickupName,
               shippingMode,
             } as any,
             {
