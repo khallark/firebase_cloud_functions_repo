@@ -16,6 +16,7 @@ interface SalesRow {
   state: string;
   itemName: string;
   itemQty: number;
+  finalStatus: string;
   awb: string;
   mrp: number;
   discountLinewise: number;
@@ -166,34 +167,6 @@ function calculateTaxes(
 }
 
 /**
- * Calculates proportional refund amount for an item
- */
-function calculateProportionalRefund(order: any, item: any, salePrice: number): number {
-  const refundedAmount = order?.refundedAmount;
-
-  if (refundedAmount === undefined || refundedAmount === null || refundedAmount === "") {
-    return salePrice;
-  }
-
-  const refundedAmountNum = Number(refundedAmount);
-  if (isNaN(refundedAmountNum) || refundedAmountNum <= 0) {
-    return 0;
-  }
-
-  // Calculate item's proportion of total order
-  const items = order.raw?.line_items || [];
-  const orderTotal = items.reduce((sum: number, item: any) => {
-    return sum + Number(item.price) * Number(item.quantity);
-  }, 0);
-
-  if (orderTotal === 0) return 0;
-  const itemTotal = Number(item.price) * Number(item.quantity);
-  const proportion = itemTotal / orderTotal;
-
-  return Number((refundedAmountNum * proportion).toFixed(2));
-}
-
-/**
  * Processes sales orders (created within the date range)
  */
 async function processSalesOrders(
@@ -271,6 +244,7 @@ async function processSalesOrders(
           state: state,
           itemName: String(item.name || ""),
           itemQty: itemQty,
+          finalStatus: String(order.customStatus || ""),
           awb: String(order.awb || "-"),
           mrp: mrp,
           discountLinewise: discountLinewise,
@@ -295,6 +269,9 @@ async function processSalesOrders(
 
 /**
  * Processes sales return orders (status changed to return statuses within date range)
+ *
+ * If order.refundedAmount exists: Uses item-wise refundedAmount, skips items with 0 refund
+ * If order.refundedAmount doesn't exist: Uses salePrice as the refund amount (full refund)
  */
 async function processSalesReturnOrders(
   storeId: string,
@@ -324,10 +301,12 @@ async function processSalesReturnOrders(
   const salesReturnRows: SalesReturnRow[] = [];
   let srNo = 1;
   let eligibleOrdersCount = 0;
+  let skippedItemsCount = 0;
 
   for (const orderDoc of ordersSnapshot.docs) {
     const order = orderDoc.data();
     const statusLogs = order.customStatusesLogs || [];
+    const hasRefundedAmount = order.refundedAmount !== undefined && order.refundedAmount !== null;
 
     // Find logs from date range with return statuses
     const returnLogs = statusLogs.filter((log: any) => {
@@ -388,13 +367,26 @@ async function processSalesReturnOrders(
         );
         const salePrice = Number((mrp - discountLinewise + proportionateShippingPrice).toFixed(2));
 
-        // Calculate refund amount
-        const refundAmount = calculateProportionalRefund(order, item, salePrice);
+        // Determine refund amount based on whether order has refundedAmount
+        let refundAmount: number;
+
+        if (hasRefundedAmount) {
+          // Order has refundedAmount: use item-wise refundedAmount, skip if 0
+          const itemRefundAmount = Number(item.refundedAmount || 0);
+          if (itemRefundAmount <= 0) {
+            skippedItemsCount++;
+            continue;
+          }
+          refundAmount = itemRefundAmount;
+        } else {
+          // No refundedAmount on order: use full salePrice
+          refundAmount = salePrice;
+        }
 
         // Get HSN and Tax Rate
         const productInfo = await getProductInfo(storeId, item.title);
 
-        // Calculate taxable on refund amount instead of sale price
+        // Calculate taxable on the refund amount
         const taxable = calculateTaxable(refundAmount, productInfo.taxRate);
         const taxes = calculateTaxes(taxable, productInfo.taxRate, state);
 
@@ -429,6 +421,9 @@ async function processSalesReturnOrders(
   }
 
   console.log(`Found ${eligibleOrdersCount} eligible return orders`);
+  console.log(
+    `Skipped ${skippedItemsCount} items with zero refundedAmount (from orders with refundedAmount set)`,
+  );
 
   return salesReturnRows;
 }
@@ -646,6 +641,7 @@ async function createExcelWorkbook(
     { header: "State", key: "state", width: 20 },
     { header: "Item Name", key: "itemName", width: 30 },
     { header: "Item Qty", key: "itemQty", width: 10 },
+    { header: "Final Status", key: "finalStatus", width: 20 },
     { header: "AWB", key: "awb", width: 20 },
     { header: "MRP", key: "mrp", width: 12 },
     { header: "Discount Line wise", key: "discountLinewise", width: 18 },

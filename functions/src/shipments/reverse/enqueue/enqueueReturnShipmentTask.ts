@@ -16,8 +16,7 @@ export const enqueueReturnShipmentTasks = onRequest(
         return;
       }
 
-      const { businessId, shop, orderIds, shippingMode, requestedBy } = (req.body ||
-        {}) as {
+      const { businessId, shop, orderIds, shippingMode, requestedBy } = (req.body || {}) as {
         businessId?: string;
         shop?: string;
         orderIds?: string[];
