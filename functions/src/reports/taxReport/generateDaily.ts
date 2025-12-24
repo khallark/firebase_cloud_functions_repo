@@ -267,7 +267,7 @@ export const generateCustomTaxReportPreliminary = onRequest(
         {
           tasksSecret: TASKS_SECRET.value() || "",
           url: workerUrl,
-          queue: String(process.env.SHIPMENT_QUEUE_NAME),
+          queue: process.env.TAX_REPORT_QUEUE_NAME || "tax-report-queue",
         },
       );
 
