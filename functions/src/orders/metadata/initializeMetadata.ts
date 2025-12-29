@@ -21,7 +21,7 @@ async function initializeAccountMetadata(accountId: string): Promise<{
     .collection("accounts")
     .doc(accountId)
     .collection("orders")
-    .where("vendors", "array-contains", "ENDORA")
+    .where("vendors", "array-contains", "STYLE 05")
     .get();
 
   const counts: Record<string, number> = {
@@ -75,7 +75,7 @@ async function initializeAccountMetadata(accountId: string): Promise<{
       .collection("accounts")
       .doc(accountId)
       .collection("members")
-      .where("vendorName", "==", "ENDORA")
+      .where("vendorName", "==", "STYLE 05")
       .get()
   ).docs?.[0]?.ref.set(
     {
