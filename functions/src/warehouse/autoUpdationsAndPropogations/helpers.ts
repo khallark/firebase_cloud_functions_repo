@@ -211,6 +211,15 @@ export async function propagateShelfNameChange(
     shelfId: string,
     shelf: Shelf
 ) {
+    // Compute correct path
+    const computedPath = `${shelf.zoneName} > ${shelf.rackName} > ${shelf.name}`;
+
+    // Update shelf's own path
+    await db.doc(`${businessId}/shelves/${shelfId}`).update({
+        path: computedPath
+    });
+
+    // Update placements
     const placements = await db
         .collection(`${businessId}/placements`)
         .where("shelfId", "==", shelfId)
@@ -222,7 +231,7 @@ export async function propagateShelfNameChange(
         ref: doc.ref,
         data: {
             shelfName: shelf.name,
-            locationPath: shelf.path,
+            locationPath: computedPath,
         },
     }));
 
@@ -234,6 +243,15 @@ export async function propagateShelfLocationChange(
     shelfId: string,
     shelf: Shelf
 ) {
+    // Compute correct path
+    const computedPath = `${shelf.zoneName} > ${shelf.rackName} > ${shelf.name}`;
+
+    // Update shelf's own path
+    await db.doc(`${businessId}/shelves/${shelfId}`).update({
+        path: computedPath
+    });
+
+    // Update placements
     const placements = await db
         .collection(`${businessId}/placements`)
         .where("shelfId", "==", shelfId)
@@ -250,7 +268,7 @@ export async function propagateShelfLocationChange(
             zoneName: shelf.zoneName,
             warehouseId: shelf.warehouseId,
             warehouseName: shelf.warehouseName,
-            locationPath: shelf.path,
+            locationPath: computedPath,
         },
     }));
 
@@ -384,6 +402,7 @@ export async function propagateRackLocationChange(
 
     const shelfUpdates = shelves.docs.map((doc) => {
         const shelf = doc.data() as Shelf;
+        const computedPath = `${rack.zoneName} > ${rack.name} > ${shelf.name}`;
         return {
             ref: doc.ref,
             data: {
@@ -391,7 +410,7 @@ export async function propagateRackLocationChange(
                 zoneName: rack.zoneName,
                 warehouseId: rack.warehouseId,
                 warehouseName: rack.warehouseName,
-                path: `${rack.zoneName} > ${rack.name} > ${shelf.name}`,
+                path: computedPath,  // Also update shelf.path
             },
         };
     });
@@ -404,6 +423,7 @@ export async function propagateRackLocationChange(
 
     const placementUpdates = placements.docs.map((doc) => {
         const placement = doc.data() as Placement;
+        const computedPath = `${rack.zoneName} > ${rack.name} > ${placement.shelfName}`;
         return {
             ref: doc.ref,
             data: {
@@ -411,7 +431,7 @@ export async function propagateRackLocationChange(
                 zoneName: rack.zoneName,
                 warehouseId: rack.warehouseId,
                 warehouseName: rack.warehouseName,
-                locationPath: `${rack.zoneName} > ${rack.name} > ${placement.shelfName}`,
+                locationPath: computedPath,
             },
         };
     });
@@ -432,11 +452,12 @@ export async function propagateRackNameChange(
 
     const shelfUpdates = shelves.docs.map((doc) => {
         const shelf = doc.data() as Shelf;
+        const computedPath = `${rack.zoneName} > ${rack.name} > ${shelf.name}`;
         return {
             ref: doc.ref,
             data: {
                 rackName: rack.name,
-                path: `${rack.zoneName} > ${rack.name} > ${shelf.name}`,
+                path: computedPath,  // Also update shelf.path
             },
         };
     });
@@ -449,11 +470,12 @@ export async function propagateRackNameChange(
 
     const placementUpdates = placements.docs.map((doc) => {
         const placement = doc.data() as Placement;
+        const computedPath = `${placement.zoneName} > ${rack.name} > ${placement.shelfName}`;
         return {
             ref: doc.ref,
             data: {
                 rackName: rack.name,
-                locationPath: `${placement.zoneName} > ${rack.name} > ${placement.shelfName}`,
+                locationPath: computedPath,
             },
         };
     });
@@ -608,11 +630,12 @@ export async function propagateZoneNameChange(
 
     const shelfUpdates = shelves.docs.map((doc) => {
         const shelf = doc.data() as Shelf;
+        const computedPath = `${newName} > ${shelf.rackName} > ${shelf.name}`;
         return {
             ref: doc.ref,
             data: {
                 zoneName: newName,
-                path: `${newName} > ${shelf.rackName} > ${shelf.name}`,
+                path: computedPath,  // Also update shelf.path
             },
         };
     });
@@ -625,11 +648,12 @@ export async function propagateZoneNameChange(
 
     const placementUpdates = placements.docs.map((doc) => {
         const placement = doc.data() as Placement;
+        const computedPath = `${newName} > ${placement.rackName} > ${placement.shelfName}`;
         return {
             ref: doc.ref,
             data: {
                 zoneName: newName,
-                locationPath: `${newName} > ${placement.rackName} > ${placement.shelfName}`,
+                locationPath: computedPath,
             },
         };
     });

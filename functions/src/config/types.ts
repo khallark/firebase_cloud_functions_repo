@@ -189,7 +189,7 @@ export interface Placement {
 
 // /{businessId}/placements/{placementId}/logs/{logId}
 export interface PlacementLog {
-    type: 'added' | 'removed' | 'quantity_adjusted' | 'moved_in' | 'moved_out';
+    type: 'added' | 'removed' | 'quantity_adjusted';
     quantity: number;
     quantityBefore?: number;
     quantityAfter?: number;

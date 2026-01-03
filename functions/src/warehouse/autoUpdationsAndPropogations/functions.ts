@@ -46,28 +46,12 @@ export const onPlacementWritten = onDocumentWritten(
             await createMovement(businessId, 'outbound', before, null, before.quantity);
         }
 
-        // Updated
+        // Updated → adjustment only (shelfId can't change with composite ID)
         else if (before && after) {
-            if (before.shelfId === after.shelfId) {
-                // Same shelf - quantity changed → adjustment
-                const diff = after.quantity - before.quantity;
-                if (diff !== 0) {
-                    await updateLocationStats(businessId, after, diff);
-                    await createMovement(businessId, 'adjustment', before, after, diff);
-                }
-            } else {
-                // Moved to different shelf → transfer
-                //
-                // IMPORTANT: If quantity also changes during transfer (e.g., before: 50, after: 30),
-                // stats will correctly reflect -50 from source, +30 to destination.
-                // Movement will record after.quantity (30) as transferred.
-                // The difference (20) is treated as implicit adjustment/loss during transfer.
-                // To avoid ambiguity, client should NOT change quantity and shelfId simultaneously.
-                // Instead: (1) adjust quantity first, (2) then transfer.
-                //
-                await updateLocationStats(businessId, before, -before.quantity);
-                await updateLocationStats(businessId, after, after.quantity);
-                await createMovement(businessId, 'transfer', before, after, after.quantity);
+            const diff = after.quantity - before.quantity;
+            if (diff !== 0) {
+                await updateLocationStats(businessId, after, diff);
+                await createMovement(businessId, 'adjustment', before, after, diff);
             }
         }
     }
