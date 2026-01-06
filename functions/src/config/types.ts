@@ -2,241 +2,231 @@
 
 import { Timestamp } from "firebase-admin/firestore";
 
-
 // /{businessId}/warehouses/{warehouseId}
 export interface Warehouse {
-    id: string;
-    name: string;
-    address: string;
-    storageCapacity: number;
-    operationalHours: number;
-    defaultGSTstate: string;
-    isDeleted: boolean;
-    deletedAt?: Timestamp;
-    createdBy: string;
-    createdAt: Timestamp;
-    updatedAt: Timestamp;
+  id: string;
+  name: string;
+  code: string;
+  address: string;
+  storageCapacity: number;
+  operationalHours: number;
+  defaultGSTstate: string;
+  isDeleted: boolean;
+  deletedAt: Timestamp | null;
+  createdBy: string;
+  createdAt: Timestamp;
+  updatedAt: Timestamp;
+  updatedBy: string;
 
-    stats: {
-        totalZones: number;
-        totalRacks: number;
-        totalShelves: number;
-        totalProducts: number;
-    };
+  stats: {
+    totalZones: number;
+    totalRacks: number;
+    totalShelves: number;
+    totalProducts: number;
+  };
 }
 
 // /{businessId}/zones/{zoneId}
 export interface Zone {
-    id: string;
-    name: string;
-    code: string;              // e.g.; "Z-001"
-    description?: string;
-    isDeleted: boolean;
-    deletedAt?: Timestamp;
-    createdAt: Timestamp;
-    updatedAt: Timestamp;
-    createdBy: string;
-    updatedBy: string;
+  id: string;
+  name: string;
+  code: string;
+  description: string | null;
+  isDeleted: boolean;
+  deletedAt: Timestamp | null;
+  createdAt: Timestamp;
+  updatedAt: Timestamp;
+  createdBy: string;
+  updatedBy: string;
 
-    warehouseId: string;
-    warehouseName: string;     // Denormalized for display
+  warehouseId: string;
+  warehouseName: string;
 
-    // Stats (denormalized; update via cloud function)
-    stats: {
-        totalRacks: number;
-        totalShelves: number;
-        totalProducts: number;
-    };
+  stats: {
+    totalRacks: number;
+    totalShelves: number;
+    totalProducts: number;
+  };
 }
 
 // /{businessId}/zones/{zoneId}/logs/{logsId}
 export interface ZoneLog {
-    type: 'created' | 'updated' | 'deleted' | 'restored';
-    changes?: {
-        [field: string]: { from: any; to: any; };
-    };
-    note?: string;
-    timestamp: Timestamp;
-    userId: string;
+  type: "created" | "updated" | "deleted" | "restored";
+  changes: {
+    [field: string]: { from: any; to: any };
+  } | null;
+  note: string | null;
+  timestamp: Timestamp;
+  userId: string;
 }
 
 // /{businessId}/racks/{rackId}
 export interface Rack {
-    id: string;
-    name: string;
-    code: string;              // e.g.; "R-001"
-    isDeleted: boolean;
-    deletedAt?: Timestamp;
-    createdAt: Timestamp;
-    updatedAt: Timestamp;
-    createdBy: string;
-    updatedBy: string;
+  id: string;
+  name: string;
+  code: string;
+  isDeleted: boolean;
+  deletedAt: Timestamp | null;
+  createdAt: Timestamp;
+  updatedAt: Timestamp;
+  createdBy: string;
+  updatedBy: string;
 
-    warehouseId: string;
-    warehouseName: string;     // Denormalized for display
+  warehouseId: string;
+  warehouseName: string;
 
-    zoneId: string;
-    zoneName: string;
-    position: number;          // Order within zone
+  zoneId: string;
+  zoneName: string;
+  position: number;
 
-    stats: {
-        totalShelves: number;
-        totalProducts: number;
-    };
+  stats: {
+    totalShelves: number;
+    totalProducts: number;
+  };
 }
 
 // /{businessId}/racks/{rackId}/logs/{logId}
 export interface RackLog {
-    type: 'created' | 'updated' | 'deleted' | 'restored' | 'moved';
-    changes?: {
-        [field: string]: { from: any; to: any; };
-    };
-    // For 'moved' type
-    fromZone?: { id: string; name: string; };
-    toZone?: { id: string; name: string; };
-    timestamp: Timestamp;
-    userId: string;
+  type: "created" | "updated" | "deleted" | "restored" | "moved";
+  changes: {
+    [field: string]: { from: any; to: any };
+  } | null;
+  fromZone: { id: string; name: string } | null;
+  toZone: { id: string; name: string } | null;
+  timestamp: Timestamp;
+  userId: string;
 }
 
 // /{businessId}/shelves/{shelfId}
 export interface Shelf {
-    id: string;
-    name: string;
-    code: string;              // e.g.; "S-001"
-    capacity?: number;         // Max items/weight
-    isDeleted: boolean;
-    deletedAt?: Timestamp;
-    createdAt: Timestamp;
-    updatedAt: Timestamp;
-    createdBy: string;
-    updatedBy: string;
+  id: string;
+  name: string;
+  code: string;
+  capacity: number | null;
+  isDeleted: boolean;
+  deletedAt: Timestamp | null;
+  createdAt: Timestamp;
+  updatedAt: Timestamp;
+  createdBy: string;
+  updatedBy: string;
 
-    warehouseId: string;
-    warehouseName: string;     // Denormalized for display
+  warehouseId: string;
+  warehouseName: string;
 
-    zoneId: string;
-    zoneName: string;
+  zoneId: string;
+  zoneName: string;
 
-    rackId: string;
-    rackName: string;
-    position: number;          // Order within rack
+  rackId: string;
+  rackName: string;
+  position: number;
 
-    // Full path for easy display
-    path: string;              // "Zone A > Rack 1 > Shelf 3"
+  stats: {
+    totalProducts: number;
+    currentOccupancy: number;
+  };
 
-    stats: {
-        totalProducts: number;
-        currentOccupancy: number;
-    };
-
-    coordinates?: {
-        aisle: string;      // "A", "B", "C"
-        bay: number;        // 1, 2, 3...
-        level: number;      // 1=floor, 2=middle, 3=top
-    };
+  coordinates: {
+    aisle: string;
+    bay: number;
+    level: number;
+  } | null;
 }
 
 // /{businessId}/shelves/{shelfId}/logs/{logId}
 export interface ShelfLog {
-    type: 'created' | 'updated' | 'deleted' | 'restored' | 'moved';
-    changes?: {
-        [field: string]: { from: any; to: any; };
-    };
-    fromRack?: { id: string; name: string; zoneId: string; };
-    toRack?: { id: string; name: string; zoneId: string; };
-    timestamp: Timestamp;
-    userId: string;
+  type: "created" | "updated" | "deleted" | "restored" | "moved";
+  changes: {
+    [field: string]: { from: any; to: any };
+  } | null;
+  fromRack: { id: string; name: string; zoneId: string } | null;
+  toRack: { id: string; name: string; zoneId: string } | null;
+  timestamp: Timestamp;
+  userId: string;
 }
 
 // /{businessId}/placements/{placementId}
+// placementId = `${productId}_${shelfId}` (composite ID)
 export interface Placement {
-    id: string;
-    quantity: number;
-    createdAt: Timestamp;
-    updatedAt: Timestamp;
-    createdBy: string;
-    updatedBy: string;
-    coordinates?: {
-        aisle: string;
-        bay: number;
-        level: number;
-    };
+  id: string;
+  quantity: number;
+  createdAt: Timestamp;
+  updatedAt: Timestamp;
+  createdBy: string;
+  updatedBy: string;
+  coordinates: {
+    aisle: string;
+    bay: number;
+    level: number;
+  } | null;
+  locationCode: string | null;
 
-    // Product reference
-    productId: string;
-    productSKU: string;        // Denormalized
+  productId: string;
+  productSKU: string;
 
-    // Location (denormalized for queries)
-    warehouseId: string;
-    warehouseName: string;     // Denormalized for display
+  warehouseId: string;
+  warehouseName: string;
 
-    zoneId: string;
-    zoneName: string;
+  zoneId: string;
+  zoneName: string;
 
-    rackId: string;
-    rackName: string;
+  rackId: string;
+  rackName: string;
 
-    shelfId: string;
-    shelfName: string;
+  shelfId: string;
+  shelfName: string;
 
-    // Full location path
-    locationPath: string;      // "Zone A > Rack 1 > Shelf 3"
-
-    // Optional context for movement tracking
-    lastMovementReason?: string;    // "damaged", "order fulfillment", "stock received"
-    lastMovementReference?: string; // orderId, PO number, etc.
+  lastMovementReason: string | null;
+  lastMovementReference: string | null;
 }
 
 // /{businessId}/placements/{placementId}/logs/{logId}
 export interface PlacementLog {
-    type: 'added' | 'removed' | 'quantity_adjusted';
-    quantity: number;
-    quantityBefore?: number;
-    quantityAfter?: number;
-    relatedMovementId?: string;  // Links to movements collection
-    note?: string;
-    timestamp: Timestamp;
-    userId: string;
+  type: "added" | "removed" | "quantity_adjusted";
+  quantity: number;
+  quantityBefore: number | null;
+  quantityAfter: number | null;
+  relatedMovementId: string | null;
+  note: string | null;
+  timestamp: Timestamp;
+  userId: string;
 }
 
 // /{businessId}/movements/{movementId}
 export interface Movement {
-    id: string;
+  id: string;
 
-    productId: string;
-    productSKU: string;        // Denormalized
+  productId: string;
+  productSKU: string;
 
-    type: 'transfer' | 'inbound' | 'outbound' | 'adjustment';
+  type: "transfer" | "inbound" | "outbound" | "adjustment";
 
-    from: {
-        shelfId: string | null;
-        shelfName: string | null;
-        rackId: string | null;
-        rackName: string | null;
-        zoneId: string | null;
-        zoneName: string | null;
-        warehouseId: string | null;
-        warehouseName: string | null;
-        path: string | null;       // null for inbound
-    };
+  from: {
+    shelfId: string | null;
+    shelfName: string | null;
+    rackId: string | null;
+    rackName: string | null;
+    zoneId: string | null;
+    zoneName: string | null;
+    warehouseId: string | null;
+    warehouseName: string | null;
+  };
 
-    to: {
-        shelfId: string | null;
-        shelfName: string | null;
-        rackId: string | null;
-        rackName: string | null;
-        zoneId: string | null;
-        zoneName: string | null;
-        warehouseId: string | null;
-        warehouseName: string | null;
-        path: string | null;       // null for outbound
-    };
+  to: {
+    shelfId: string | null;
+    shelfName: string | null;
+    rackId: string | null;
+    rackName: string | null;
+    zoneId: string | null;
+    zoneName: string | null;
+    warehouseId: string | null;
+    warehouseName: string | null;
+  };
 
-    quantity: number;
-    reason?: string;
-    reference?: string;        // Order ID, PO number, etc.
+  quantity: number;
+  reason: string | null;
+  reference: string | null;
 
-    timestamp: Timestamp;
-    userId: string;
-    userName: string;
+  timestamp: Timestamp;
+  userId: string;
+  userName: string;
 }

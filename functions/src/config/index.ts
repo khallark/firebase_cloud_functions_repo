@@ -2,4 +2,4 @@
 
 export * from "./constants";
 export * from "./secrets";
-export * from "./types"
+export * from "./types";
