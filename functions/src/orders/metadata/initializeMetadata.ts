@@ -1,4 +1,4 @@
-import { FieldValue } from "firebase-admin/firestore";
+import { DocumentData, FieldValue } from "firebase-admin/firestore";
 import { db } from "../../firebaseAdmin";
 import { onRequest } from "firebase-functions/v2/https";
 import { ENQUEUE_FUNCTION_SECRET } from "../../config";
@@ -11,18 +11,133 @@ interface InitializeStats {
   errors: number;
 }
 
+// async function initializeAccountMetadata(accountId: string): Promise<{
+//   totalOrders: number;
+//   counts: Record<string, number>;
+// }> {
+//   console.log(`  📊 Counting orders for account: ${accountId}`);
+
+//   const ordersSnapshot = await db
+//     .collection("accounts")
+//     .doc(accountId)
+//     .collection("orders")
+//     .where("vendors", "array-contains", "OWR")
+//     .get();
+
+//   const counts: Record<string, number> = {
+//     "All Orders": 0,
+//     New: 0,
+//     Confirmed: 0,
+//     "Ready To Dispatch": 0,
+//     Dispatched: 0,
+//     "In Transit": 0,
+//     "Out For Delivery": 0,
+//     Delivered: 0,
+//     "RTO In Transit": 0,
+//     "RTO Delivered": 0,
+//     "DTO Requested": 0,
+//     "DTO Booked": 0,
+//     "DTO In Transit": 0,
+//     "DTO Delivered": 0,
+//     "Pending Refunds": 0,
+//     "DTO Refunded": 0,
+//     Lost: 0,
+//     Closed: 0,
+//     "RTO Closed": 0,
+//     "Cancellation Requested": 0,
+//     Cancelled: 0,
+//   };
+
+//   let allOrdersCount = 0;
+
+//   ordersSnapshot.docs.forEach((doc) => {
+//     const order = doc.data();
+//     const isShopifyCancelled = !!order.raw?.cancelled_at && order?.customStatus === "Cancelled";
+
+//     allOrdersCount++;
+//     if (isShopifyCancelled) {
+//       counts["Cancelled"]++;
+//     } else {
+//       const status = order.customStatus || "New";
+//       if (counts[status] !== undefined) {
+//         counts[status]++;
+//       } else {
+//         console.warn(`  ⚠️ Unknown status found: ${status}`);
+//       }
+//     }
+//   });
+
+//   counts["All Orders"] = allOrdersCount;
+
+//   // Save to metadata document
+//   await (
+//     await db
+//       .collection("accounts")
+//       .doc(accountId)
+//       .collection("members")
+//       .where("vendorName", "==", "STYLE 05")
+//       .get()
+//   ).docs?.[0]?.ref.set(
+//     {
+//       counts,
+//       lastUpdated: FieldValue.serverTimestamp(),
+//     },
+//     { merge: true },
+//   );
+
+//   // await db
+//   //   .collection("accounts")
+//   //   .doc(accountId)
+//   //   .collection("metadata")
+//   //   .doc('orderCounts')
+//   //   .set(
+//   //     {
+//   //       counts,
+//   //       lastUpdated: FieldValue.serverTimestamp(),
+//   //     },
+//   //     { merge: true },
+//   //   );
+
+//   console.log(`  ✅ Metadata created: ${ordersSnapshot.size} orders counted`);
+
+//   return {
+//     totalOrders: ordersSnapshot.size,
+//     counts,
+//   };
+// }
+
 async function initializeAccountMetadata(accountId: string): Promise<{
   totalOrders: number;
   counts: Record<string, number>;
 }> {
   console.log(`  📊 Counting orders for account: ${accountId}`);
 
-  const ordersSnapshot = await db
-    .collection("accounts")
-    .doc(accountId)
-    .collection("orders")
-    .where("vendors", "array-contains", "STYLE 05")
-    .get();
+  const vendorsToMatch = ["OWR", "Ghamand", "BBB"];
+
+  // Run one query per vendor
+  const promises = vendorsToMatch.map((vendor) =>
+    db
+      .collection("accounts")
+      .doc(accountId)
+      .collection("orders")
+      .where("vendors", "array-contains", vendor)
+      .get(),
+  );
+
+  const snapshots = await Promise.all(promises);
+
+  // Merge all docs without duplicates
+  const seenOrders = new Set<string>();
+  const orders: DocumentData[] = [];
+
+  snapshots.forEach((snapshot) => {
+    snapshot.docs.forEach((doc) => {
+      if (!seenOrders.has(doc.id)) {
+        seenOrders.add(doc.id);
+        orders.push(doc.data());
+      }
+    });
+  });
 
   const counts: Record<string, number> = {
     "All Orders": 0,
@@ -50,8 +165,7 @@ async function initializeAccountMetadata(accountId: string): Promise<{
 
   let allOrdersCount = 0;
 
-  ordersSnapshot.docs.forEach((doc) => {
-    const order = doc.data();
+  orders.forEach((order) => {
     const isShopifyCancelled = !!order.raw?.cancelled_at && order?.customStatus === "Cancelled";
 
     allOrdersCount++;
@@ -69,26 +183,31 @@ async function initializeAccountMetadata(accountId: string): Promise<{
 
   counts["All Orders"] = allOrdersCount;
 
-  // Save to metadata document
-  await (
-    await db
-      .collection("accounts")
-      .doc(accountId)
-      .collection("members")
-      .where("vendorName", "==", "STYLE 05")
-      .get()
-  ).docs?.[0]?.ref.set(
-    {
-      counts,
-      lastUpdated: FieldValue.serverTimestamp(),
-    },
-    { merge: true },
-  );
+  // Save counts to the OWR member only
+  const owrMemberSnapshot = await db
+    .collection("accounts")
+    .doc(accountId)
+    .collection("members")
+    .where("vendorName", "==", "OWR")
+    .get();
 
-  console.log(`  ✅ Metadata created: ${ordersSnapshot.size} orders counted`);
+  if (owrMemberSnapshot.docs.length > 0) {
+    await owrMemberSnapshot.docs[0].ref.set(
+      {
+        counts,
+        lastUpdated: FieldValue.serverTimestamp(),
+      },
+      { merge: true },
+    );
+    console.log(`  ✅ Metadata saved to OWR member`);
+  } else {
+    console.warn(`  ⚠️ No OWR member found for account ${accountId}`);
+  }
+
+  console.log(`  ✅ Metadata created: ${orders.length} orders counted`);
 
   return {
-    totalOrders: ordersSnapshot.size,
+    totalOrders: orders.length,
     counts,
   };
 }

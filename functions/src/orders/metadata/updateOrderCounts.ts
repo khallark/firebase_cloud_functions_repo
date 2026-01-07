@@ -312,7 +312,13 @@ export const updateOrderCounts = onDocumentWritten(
           console.log(
             "Shared Store detected, incrementing the 'All Orders' count of vendors too...",
           );
-          const vendors = newOrder.vendors;
+          const vendors = [
+            ...new Set(
+              newOrder.vendors.map((v) =>
+                ["ghamand", "bbb"].includes(v.toLowerCase()) ? "OWR" : v,
+              ),
+            ),
+          ];
           for (const vendor of vendors) {
             const memberDocQuery = await db
               .collection("accounts")

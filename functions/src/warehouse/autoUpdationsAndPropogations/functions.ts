@@ -61,7 +61,6 @@ export const onPlacementWritten = onDocumentWritten(
     else if (before && !after) {
       // await updateLocationStats(businessId, before, -before.quantity);
       // await createMovement(businessId, "outbound", before, null, before.quantity);
-
       // Note: Cannot create log in deleted document's subcollection
       // The movement record serves as the audit trail for deletions
     }
