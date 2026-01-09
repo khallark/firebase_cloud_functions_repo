@@ -3,6 +3,8 @@ import {
   Movement,
   Placement,
   PlacementLog,
+  PropagationTask,
+  PropagationTracker,
   Rack,
   RackLog,
   Shelf,
@@ -12,6 +14,7 @@ import {
 } from "../../config/types";
 import { db } from "../../firebaseAdmin";
 import { chunkArray } from "../../helpers";
+import { enqueuePropogationTask } from "../../services";
 
 const increment = FieldValue.increment;
 
@@ -88,8 +91,8 @@ export async function createRackLog(
   type: RackLog["type"],
   userId: string,
   changes: Record<string, { from: any; to: any }> | null,
-  fromZone: { id: string; name: string } | null,
-  toZone: { id: string; name: string } | null,
+  fromZone: { id: string } | null,
+  toZone: { id: string } | null,
 ) {
   const logRef = db.collection(`users/${businessId}/racks/${rackId}/logs`).doc();
 
@@ -117,8 +120,8 @@ export async function createShelfLog(
   type: ShelfLog["type"],
   userId: string,
   changes: Record<string, { from: any; to: any }> | null,
-  fromRack: { id: string; name: string; zoneId: string } | null,
-  toRack: { id: string; name: string; zoneId: string } | null,
+  fromRack: { id: string; zoneId: string } | null,
+  toRack: { id: string; zoneId: string } | null,
 ) {
   const logRef = db.collection(`users/${businessId}/shelves/${shelfId}/logs`).doc();
 
@@ -174,6 +177,98 @@ export async function createPlacementLog(
 }
 
 // ============================================================================
+// PROPAGATION WITH CLOUD TASKS
+// ============================================================================
+
+async function createPropagationTasks(
+  type: PropagationTask['type'],
+  businessId: string,
+  entityId: string,
+  data: any,
+  query: FirebaseFirestore.Query,
+  version?: number,
+) {
+  // Check for in-progress propagation
+  const existingTrackers = await db
+    .collection(`users/${businessId}/propagation_trackers`)
+    .where('entityId', '==', entityId)
+    .where('type', '==', type)
+    .where('status', 'in', ['pending', 'in_progress'])
+    .limit(1)
+    .get();
+  
+  if (!existingTrackers.empty) {
+    console.log(`Propagation already in progress for ${type} ${entityId}`);
+    return;
+  }
+  
+  // Count total documents
+  const snapshot = await query.select().get();
+  const totalDocs = snapshot.size;
+  
+  if (totalDocs === 0) {
+    console.log(`No documents to propagate for ${type} ${entityId}`);
+    return;
+  }
+  
+  const chunkSize = 500;
+  const totalChunks = Math.ceil(totalDocs / chunkSize);
+  
+  // Create unique propagation ID
+  const propagationId = `${type}-${entityId}-${Date.now()}`;
+  
+  // Create tracker document
+  await db.doc(`users/${businessId}/propagation_trackers/${propagationId}`).set({
+    id: propagationId,
+    type,
+    businessId,
+    entityId,
+    status: 'pending',
+    totalDocuments: totalDocs,
+    processedDocuments: 0,
+    failedDocuments: 0,
+    chunksTotal: totalChunks,
+    chunksCompleted: 0,
+    chunksFailed: 0,
+    startedAt: Timestamp.now(),
+    completedAt: null,
+    lastError: null,
+    version: version || 0,
+  } as PropagationTracker);
+  
+  // Enqueue tasks for each chunk
+  const tasks: Promise<void>[] = [];
+  
+  for (let chunkIndex = 0; chunkIndex < totalChunks; chunkIndex++) {
+    const taskPayload: PropagationTask = {
+      type,
+      businessId,
+      entityId,
+      data,
+      chunkIndex,
+      totalChunks,
+      chunkSize,
+      propagationId,
+      version,
+    };
+    
+    // Use deterministic task ID for deduplication
+    const taskId = `${propagationId}-chunk-${chunkIndex}`;
+    
+    tasks.push(enqueuePropogationTask(taskPayload, taskId));
+  }
+  
+  await Promise.all(tasks);
+  
+  console.log(`Enqueued ${totalChunks} tasks for propagation ${propagationId}`);
+  
+  // Update tracker status
+  await db.doc(`users/${businessId}/propagation_trackers/${propagationId}`).update({
+    status: 'in_progress',
+  });
+}
+
+// ============================================================================
 // PLACEMENT TRIGGERS → Update Location Stats
 // ============================================================================
 
@@ -184,9 +279,18 @@ export async function createMovement(
   to: Placement | null,
   quantity: number,
 ): Promise<string> {
-  const ref = db.collection(`users/${businessId}/movements`).doc();
-
   const source = to ?? from;
+  
+  // Create deterministic ID for idempotency
+  const timestamp = Date.now();
+  const deterministicId = `${type}_${source!.productId}_${source!.shelfId}_${timestamp}`;
+  const ref = db.collection(`users/${businessId}/movements`).doc(deterministicId);
+
+  // Check if already exists (idempotency)
+  const existing = await ref.get();
+  if (existing.exists) {
+    return ref.id;
+  }
 
   const movement: Movement = {
     id: ref.id,
@@ -196,44 +300,28 @@ export async function createMovement(
     from: from
       ? {
           shelfId: from.shelfId,
-          shelfName: from.shelfName,
           rackId: from.rackId,
-          rackName: from.rackName,
           zoneId: from.zoneId,
-          zoneName: from.zoneName,
           warehouseId: from.warehouseId,
-          warehouseName: from.warehouseName,
         }
       : {
           shelfId: null,
-          shelfName: null,
           rackId: null,
-          rackName: null,
           zoneId: null,
-          zoneName: null,
           warehouseId: null,
-          warehouseName: null,
         },
     to: to
       ? {
           shelfId: to.shelfId,
-          shelfName: to.shelfName,
           rackId: to.rackId,
-          rackName: to.rackName,
           zoneId: to.zoneId,
-          zoneName: to.zoneName,
           warehouseId: to.warehouseId,
-          warehouseName: to.warehouseName,
         }
       : {
           shelfId: null,
-          shelfName: null,
           rackId: null,
-          rackName: null,
           zoneId: null,
-          zoneName: null,
           warehouseId: null,
-          warehouseName: null,
         },
     quantity,
     reason: source!.lastMovementReason ?? "",
@@ -248,58 +336,52 @@ export async function createMovement(
   return ref.id;
 }
 
-export async function updateLocationStats(
+export function updateLocationStatsInTransaction(
+  transaction: FirebaseFirestore.Transaction,
   businessId: string,
   placement: Placement,
   quantityDelta: number,
 ) {
-  const batch = db.batch();
-
-  batch.update(db.doc(`users/${businessId}/shelves/${placement.shelfId}`), {
+  transaction.update(db.doc(`users/${businessId}/shelves/${placement.shelfId}`), {
     "stats.totalProducts": increment(quantityDelta),
   });
 
-  batch.update(db.doc(`users/${businessId}/racks/${placement.rackId}`), {
+  transaction.update(db.doc(`users/${businessId}/racks/${placement.rackId}`), {
     "stats.totalProducts": increment(quantityDelta),
   });
 
-  batch.update(db.doc(`users/${businessId}/zones/${placement.zoneId}`), {
+  transaction.update(db.doc(`users/${businessId}/zones/${placement.zoneId}`), {
     "stats.totalProducts": increment(quantityDelta),
   });
 
-  batch.update(db.doc(`users/${businessId}/warehouses/${placement.warehouseId}`), {
+  transaction.update(db.doc(`users/${businessId}/warehouses/${placement.warehouseId}`), {
     "stats.totalProducts": increment(quantityDelta),
   });
-
-  await batch.commit();
 }
 
 // ============================================================================
 // SHELF TRIGGERS → Update Rack/Zone Shelf Counts + Propagate Name Changes
 // ============================================================================
 
-export async function updateShelfCounts(
+export function updateShelfCountsInTransaction(
+  transaction: FirebaseFirestore.Transaction,
   businessId: string,
   rackId: string,
   zoneId: string,
   warehouseId: string,
   delta: number,
 ) {
-  const batch = db.batch();
-
-  batch.update(db.doc(`users/${businessId}/racks/${rackId}`), {
+  transaction.update(db.doc(`users/${businessId}/racks/${rackId}`), {
     "stats.totalShelves": increment(delta),
   });
 
-  batch.update(db.doc(`users/${businessId}/zones/${zoneId}`), {
+  transaction.update(db.doc(`users/${businessId}/zones/${zoneId}`), {
     "stats.totalShelves": increment(delta),
   });
 
-  batch.update(db.doc(`users/${businessId}/warehouses/${warehouseId}`), {
+  transaction.update(db.doc(`users/${businessId}/warehouses/${warehouseId}`), {
     "stats.totalShelves": increment(delta),
   });
-
-  await batch.commit();
 }
 
 export async function transferProductStats(
@@ -312,6 +394,7 @@ export async function transferProductStats(
   toZoneId: string,
   toWarehouseId: string,
 ) {
+  // Query first (outside transaction)
   const placements = await db
     .collection(`users/${businessId}/placements`)
     .where("shelfId", "==", shelfId)
@@ -321,55 +404,36 @@ export async function transferProductStats(
 
   const totalProducts = placements.docs.reduce((sum, doc) => sum + (doc.data().quantity || 0), 0);
 
-  const batch = db.batch();
-
-  // Rack stats
-  batch.update(db.doc(`users/${businessId}/racks/${fromRackId}`), {
-    "stats.totalProducts": increment(-totalProducts),
-  });
-  batch.update(db.doc(`users/${businessId}/racks/${toRackId}`), {
-    "stats.totalProducts": increment(totalProducts),
-  });
-
-  // Zone stats (only if changed)
-  if (fromZoneId !== toZoneId) {
-    batch.update(db.doc(`users/${businessId}/zones/${fromZoneId}`), {
+  // Use transaction for atomic stats transfer
+  await db.runTransaction(async (transaction) => {
+    // Rack stats
+    transaction.update(db.doc(`users/${businessId}/racks/${fromRackId}`), {
       "stats.totalProducts": increment(-totalProducts),
     });
-    batch.update(db.doc(`users/${businessId}/zones/${toZoneId}`), {
+    transaction.update(db.doc(`users/${businessId}/racks/${toRackId}`), {
       "stats.totalProducts": increment(totalProducts),
     });
-  }
 
-  // Warehouse stats (only if changed)
-  if (fromWarehouseId !== toWarehouseId) {
-    batch.update(db.doc(`users/${businessId}/warehouses/${fromWarehouseId}`), {
-      "stats.totalProducts": increment(-totalProducts),
-    });
-    batch.update(db.doc(`users/${businessId}/warehouses/${toWarehouseId}`), {
-      "stats.totalProducts": increment(totalProducts),
-    });
-  }
+    // Zone stats (only if changed)
+    if (fromZoneId !== toZoneId) {
+      transaction.update(db.doc(`users/${businessId}/zones/${fromZoneId}`), {
+        "stats.totalProducts": increment(-totalProducts),
+      });
+      transaction.update(db.doc(`users/${businessId}/zones/${toZoneId}`), {
+        "stats.totalProducts": increment(totalProducts),
+      });
+    }
 
-  await batch.commit();
-}
-
-export async function propagateShelfNameChange(businessId: string, shelfId: string, shelf: Shelf) {
-  const placements = await db
-    .collection(`users/${businessId}/placements`)
-    .where("shelfId", "==", shelfId)
-    .get();
-
-  if (placements.empty) return;
-
-  const updates = placements.docs.map((doc) => ({
-    ref: doc.ref,
-    data: {
-      shelfName: shelf.name,
-    },
-  }));
-
-  await batchedUpdate(updates);
+    // Warehouse stats (only if changed)
+    if (fromWarehouseId !== toWarehouseId) {
+      transaction.update(db.doc(`users/${businessId}/warehouses/${fromWarehouseId}`), {
+        "stats.totalProducts": increment(-totalProducts),
+      });
+      transaction.update(db.doc(`users/${businessId}/warehouses/${toWarehouseId}`), {
+        "stats.totalProducts": increment(totalProducts),
+      });
+    }
+  });
 }
 
 export async function propagateShelfLocationChange(
@@ -377,76 +441,42 @@ export async function propagateShelfLocationChange(
   shelfId: string,
   shelf: Shelf,
 ) {
-  const placements = await db
+  const query = db
     .collection(`users/${businessId}/placements`)
-    .where("shelfId", "==", shelfId)
-    .get();
-
-  if (placements.empty) return;
-
-  const updates = placements.docs.map((doc) => ({
-    ref: doc.ref,
-    data: {
+    .where("shelfId", "==", shelfId);
+  
+  await createPropagationTasks(
+    'shelf-location',
+    businessId,
+    shelfId,
+    {
       rackId: shelf.rackId,
-      rackName: shelf.rackName,
       zoneId: shelf.zoneId,
-      zoneName: shelf.zoneName,
       warehouseId: shelf.warehouseId,
-      warehouseName: shelf.warehouseName,
     },
-  }));
-
-  await batchedUpdate(updates);
-}
-
-export async function propagateShelfCoordinatesChange(
-  businessId: string,
-  shelfId: string,
-  shelf: Shelf,
-) {
-  const placements = await db
-    .collection(`users/${businessId}/placements`)
-    .where("shelfId", "==", shelfId)
-    .get();
-
-  if (placements.empty) return;
-
-  const locationCode = shelf.coordinates
-    ? `${shelf.coordinates.aisle}-${String(shelf.coordinates.bay).padStart(2, "0")}-${shelf.coordinates.level}`
-    : null;
-
-  const updates = placements.docs.map((doc) => ({
-    ref: doc.ref,
-    data: {
-      coordinates: shelf.coordinates ?? null,
-      locationCode,
-    },
-  }));
-
-  await batchedUpdate(updates);
+    query,
+    shelf.locationVersion,
+  );
 }
 
 // ============================================================================
 // RACK TRIGGERS → Update Zone Rack Counts + Propagate Name Changes
 // ============================================================================
 
-export async function updateRackCounts(
+export function updateRackCountsInTransaction(
+  transaction: FirebaseFirestore.Transaction,
   businessId: string,
   zoneId: string,
   warehouseId: string,
   delta: number,
 ) {
-  const batch = db.batch();
-
-  batch.update(db.doc(`users/${businessId}/zones/${zoneId}`), {
+  transaction.update(db.doc(`users/${businessId}/zones/${zoneId}`), {
     "stats.totalRacks": increment(delta),
   });
 
-  batch.update(db.doc(`users/${businessId}/warehouses/${warehouseId}`), {
+  transaction.update(db.doc(`users/${businessId}/warehouses/${warehouseId}`), {
     "stats.totalRacks": increment(delta),
   });
-
-  await batch.commit();
 }
 
 export async function transferRackStats(
@@ -457,6 +487,7 @@ export async function transferRackStats(
   toZoneId: string,
   toWarehouseId: string,
 ) {
+  // Query first (outside transaction)
   const shelves = await db
     .collection(`users/${businessId}/shelves`)
     .where("rackId", "==", rackId)
@@ -474,116 +505,92 @@ export async function transferRackStats(
 
   if (totalShelves === 0 && totalProducts === 0) return;
 
-  const batch = db.batch();
+  // Use transaction for atomic stats transfer
+  await db.runTransaction(async (transaction) => {
+    if (totalShelves > 0) {
+      transaction.update(db.doc(`users/${businessId}/zones/${fromZoneId}`), {
+        "stats.totalShelves": increment(-totalShelves),
+      });
+      transaction.update(db.doc(`users/${businessId}/zones/${toZoneId}`), {
+        "stats.totalShelves": increment(totalShelves),
+      });
+    }
 
-  if (totalShelves > 0) {
-    batch.update(db.doc(`users/${businessId}/zones/${fromZoneId}`), {
-      "stats.totalShelves": increment(-totalShelves),
-    });
-    batch.update(db.doc(`users/${businessId}/zones/${toZoneId}`), {
-      "stats.totalShelves": increment(totalShelves),
-    });
-  }
+    if (totalProducts > 0) {
+      transaction.update(db.doc(`users/${businessId}/zones/${fromZoneId}`), {
+        "stats.totalProducts": increment(-totalProducts),
+      });
+      transaction.update(db.doc(`users/${businessId}/zones/${toZoneId}`), {
+        "stats.totalProducts": increment(totalProducts),
+      });
+    }
 
-  if (totalProducts > 0) {
-    batch.update(db.doc(`users/${businessId}/zones/${fromZoneId}`), {
-      "stats.totalProducts": increment(-totalProducts),
-    });
-    batch.update(db.doc(`users/${businessId}/zones/${toZoneId}`), {
-      "stats.totalProducts": increment(totalProducts),
-    });
-  }
-
-  if (fromWarehouseId !== toWarehouseId) {
-    batch.update(db.doc(`users/${businessId}/warehouses/${fromWarehouseId}`), {
-      "stats.totalShelves": increment(-totalShelves),
-      "stats.totalProducts": increment(-totalProducts),
-    });
-    batch.update(db.doc(`users/${businessId}/warehouses/${toWarehouseId}`), {
-      "stats.totalShelves": increment(totalShelves),
-      "stats.totalProducts": increment(totalProducts),
-    });
-  }
-
-  await batch.commit();
+    if (fromWarehouseId !== toWarehouseId) {
+      transaction.update(db.doc(`users/${businessId}/warehouses/${fromWarehouseId}`), {
+        "stats.totalShelves": increment(-totalShelves),
+        "stats.totalProducts": increment(-totalProducts),
+      });
+      transaction.update(db.doc(`users/${businessId}/warehouses/${toWarehouseId}`), {
+        "stats.totalShelves": increment(totalShelves),
+        "stats.totalProducts": increment(totalProducts),
+      });
+    }
+  });
 }
 
-export async function propagateRackLocationChange(businessId: string, rackId: string, rack: Rack) {
-  const shelves = await db
+export async function propagateRackLocationChange(
+  businessId: string,
+  rackId: string,
+  rack: Rack,
+) {
+  // Create tasks for shelves
+  const shelvesQuery = db
     .collection(`users/${businessId}/shelves`)
-    .where("rackId", "==", rackId)
-    .get();
-
-  const shelfUpdates = shelves.docs.map((doc) => {
-    return {
-      ref: doc.ref,
-      data: {
-        zoneId: rack.zoneId,
-        zoneName: rack.zoneName,
-        warehouseId: rack.warehouseId,
-        warehouseName: rack.warehouseName,
-      },
-    };
-  });
-
-  const placements = await db
+    .where("rackId", "==", rackId);
+  
+  await createPropagationTasks(
+    'rack-location',
+    businessId,
+    `${rackId}-shelves`,
+    {
+      collection: 'shelves',
+      zoneId: rack.zoneId,
+      warehouseId: rack.warehouseId,
+    },
+    shelvesQuery,
+    rack.locationVersion,
+  );
+  
+  // Create tasks for placements
+  const placementsQuery = db
     .collection(`users/${businessId}/placements`)
-    .where("rackId", "==", rackId)
-    .get();
-
-  const placementUpdates = placements.docs.map((doc) => {
-    return {
-      ref: doc.ref,
-      data: {
-        zoneId: rack.zoneId,
-        zoneName: rack.zoneName,
-        warehouseId: rack.warehouseId,
-        warehouseName: rack.warehouseName,
-      },
-    };
-  });
-
-  await batchedUpdate([...shelfUpdates, ...placementUpdates]);
-}
-
-export async function propagateRackNameChange(businessId: string, rackId: string, rack: Rack) {
-  const shelves = await db
-    .collection(`users/${businessId}/shelves`)
-    .where("rackId", "==", rackId)
-    .get();
-
-  const shelfUpdates = shelves.docs.map((doc) => {
-    return {
-      ref: doc.ref,
-      data: {
-        rackName: rack.name,
-      },
-    };
-  });
-
-  const placements = await db
-    .collection(`users/${businessId}/placements`)
-    .where("rackId", "==", rackId)
-    .get();
-
-  const placementUpdates = placements.docs.map((doc) => {
-    return {
-      ref: doc.ref,
-      data: {
-        rackName: rack.name,
-      },
-    };
-  });
-
-  await batchedUpdate([...shelfUpdates, ...placementUpdates]);
+    .where("rackId", "==", rackId);
+  
+  await createPropagationTasks(
+    'rack-location',
+    businessId,
+    `${rackId}-placements`,
+    {
+      collection: 'placements',
+      zoneId: rack.zoneId,
+      warehouseId: rack.warehouseId,
+    },
+    placementsQuery,
+    rack.locationVersion,
+  );
 }
 
 // ============================================================================
 // ZONE TRIGGERS → Propagate Name Changes
 // ============================================================================
 
-export async function updateZoneCounts(businessId: string, warehouseId: string, delta: number) {
-  await db.doc(`users/${businessId}/warehouses/${warehouseId}`).update({
+export function updateZoneCountsInTransaction(
+  transaction: FirebaseFirestore.Transaction,
+  businessId: string,
+  warehouseId: string,
+  delta: number,
+) {
+  transaction.update(db.doc(`users/${businessId}/warehouses/${warehouseId}`), {
     "stats.totalZones": increment(delta),
   });
 }
@@ -594,6 +601,7 @@ export async function transferZoneStats(
   fromWarehouseId: string,
   toWarehouseId: string,
 ) {
+  // Query first (outside transaction)
   const racks = await db
     .collection(`users/${businessId}/racks`)
     .where("zoneId", "==", zoneId)
@@ -619,162 +627,81 @@ export async function transferZoneStats(
 
   if (totalRacks === 0 && totalShelves === 0 && totalProducts === 0) return;
 
-  const batch = db.batch();
+  // Use transaction for atomic stats transfer
+  await db.runTransaction(async (transaction) => {
+    const fromRef = db.doc(`users/${businessId}/warehouses/${fromWarehouseId}`);
+    const toRef = db.doc(`users/${businessId}/warehouses/${toWarehouseId}`);
 
-  const fromRef = db.doc(`users/${businessId}/warehouses/${fromWarehouseId}`);
-  const toRef = db.doc(`users/${businessId}/warehouses/${toWarehouseId}`);
+    if (totalRacks > 0) {
+      transaction.update(fromRef, { "stats.totalRacks": increment(-totalRacks) });
+      transaction.update(toRef, { "stats.totalRacks": increment(totalRacks) });
+    }
 
-  if (totalRacks > 0) {
-    batch.update(fromRef, { "stats.totalRacks": increment(-totalRacks) });
-    batch.update(toRef, { "stats.totalRacks": increment(totalRacks) });
-  }
+    if (totalShelves > 0) {
+      transaction.update(fromRef, { "stats.totalShelves": increment(-totalShelves) });
+      transaction.update(toRef, { "stats.totalShelves": increment(totalShelves) });
+    }
 
-  if (totalShelves > 0) {
-    batch.update(fromRef, { "stats.totalShelves": increment(-totalShelves) });
-    batch.update(toRef, { "stats.totalShelves": increment(totalShelves) });
-  }
-
-  if (totalProducts > 0) {
-    batch.update(fromRef, { "stats.totalProducts": increment(-totalProducts) });
-    batch.update(toRef, { "stats.totalProducts": increment(totalProducts) });
-  }
-
-  await batch.commit();
-}
-
-export async function propagateZoneLocationChange(businessId: string, zoneId: string, zone: Zone) {
-  const racks = await db
-    .collection(`users/${businessId}/racks`)
-    .where("zoneId", "==", zoneId)
-    .get();
-
-  const rackUpdates = racks.docs.map((doc) => ({
-    ref: doc.ref,
-    data: {
-      warehouseId: zone.warehouseId,
-      warehouseName: zone.warehouseName,
-    },
-  }));
-
-  const shelves = await db
-    .collection(`users/${businessId}/shelves`)
-    .where("zoneId", "==", zoneId)
-    .get();
-
-  const shelfUpdates = shelves.docs.map((doc) => ({
-    ref: doc.ref,
-    data: {
-      warehouseId: zone.warehouseId,
-      warehouseName: zone.warehouseName,
-    },
-  }));
-
-  const placements = await db
-    .collection(`users/${businessId}/placements`)
-    .where("zoneId", "==", zoneId)
-    .get();
-
-  const placementUpdates = placements.docs.map((doc) => ({
-    ref: doc.ref,
-    data: {
-      warehouseId: zone.warehouseId,
-      warehouseName: zone.warehouseName,
-    },
-  }));
-
-  await batchedUpdate([...rackUpdates, ...shelfUpdates, ...placementUpdates]);
-}
-
-export async function propagateZoneNameChange(businessId: string, zoneId: string, newName: string) {
-  const racks = await db
-    .collection(`users/${businessId}/racks`)
-    .where("zoneId", "==", zoneId)
-    .get();
-
-  const rackUpdates = racks.docs.map((doc) => ({
-    ref: doc.ref,
-    data: { zoneName: newName },
-  }));
-
-  const shelves = await db
-    .collection(`users/${businessId}/shelves`)
-    .where("zoneId", "==", zoneId)
-    .get();
-
-  const shelfUpdates = shelves.docs.map((doc) => {
-    return {
-      ref: doc.ref,
-      data: {
-        zoneName: newName,
-      },
-    };
+    if (totalProducts > 0) {
+      transaction.update(fromRef, { "stats.totalProducts": increment(-totalProducts) });
+      transaction.update(toRef, { "stats.totalProducts": increment(totalProducts) });
+    }
   });
-
-  const placements = await db
-    .collection(`users/${businessId}/placements`)
-    .where("zoneId", "==", zoneId)
-    .get();
-
-  const placementUpdates = placements.docs.map((doc) => {
-    return {
-      ref: doc.ref,
-      data: {
-        zoneName: newName,
-      },
-    };
-  });
-
-  await batchedUpdate([...rackUpdates, ...shelfUpdates, ...placementUpdates]);
 }
 
-// ============================================================================
-// WAREHOUSE TRIGGERS → Propagate Name Changes
-// ============================================================================
-
-export async function propagateWarehouseNameChange(
+export async function propagateZoneLocationChange(
   businessId: string,
-  warehouseId: string,
-  newName: string,
+  zoneId: string,
+  zone: Zone,
 ) {
-  const zones = await db
-    .collection(`users/${businessId}/zones`)
-    .where("warehouseId", "==", warehouseId)
-    .get();
-
-  const zoneUpdates = zones.docs.map((doc) => ({
-    ref: doc.ref,
-    data: { warehouseName: newName },
-  }));
-
-  const racks = await db
+  // Create tasks for racks
+  const racksQuery = db
     .collection(`users/${businessId}/racks`)
-    .where("warehouseId", "==", warehouseId)
-    .get();
-
-  const rackUpdates = racks.docs.map((doc) => ({
-    ref: doc.ref,
-    data: { warehouseName: newName },
-  }));
-
-  const shelves = await db
+    .where("zoneId", "==", zoneId);
+  
+  await createPropagationTasks(
+    'zone-location',
+    businessId,
+    `${zoneId}-racks`,
+    {
+      collection: 'racks',
+      warehouseId: zone.warehouseId,
+    },
+    racksQuery,
+    zone.locationVersion,
+  );
+  
+  // Create tasks for shelves
+  const shelvesQuery = db
     .collection(`users/${businessId}/shelves`)
-    .where("warehouseId", "==", warehouseId)
-    .get();
-
-  const shelfUpdates = shelves.docs.map((doc) => ({
-    ref: doc.ref,
-    data: { warehouseName: newName },
-  }));
-
-  const placements = await db
+    .where("zoneId", "==", zoneId);
+  
+  await createPropagationTasks(
+    'zone-location',
+    businessId,
+    `${zoneId}-shelves`,
+    {
+      collection: 'shelves',
+      warehouseId: zone.warehouseId,
+    },
+    shelvesQuery,
+    zone.locationVersion,
+  );
+  
+  // Create tasks for placements
+  const placementsQuery = db
     .collection(`users/${businessId}/placements`)
-    .where("warehouseId", "==", warehouseId)
-    .get();
-
-  const placementUpdates = placements.docs.map((doc) => ({
-    ref: doc.ref,
-    data: { warehouseName: newName },
-  }));
-
-  await batchedUpdate([...zoneUpdates, ...rackUpdates, ...shelfUpdates, ...placementUpdates]);
+    .where("zoneId", "==", zoneId);
+  
+  await createPropagationTasks(
+    'zone-location',
+    businessId,
+    `${zoneId}-placements`,
+    {
+      collection: 'placements',
+      warehouseId: zone.warehouseId,
+    },
+    placementsQuery,
+    zone.locationVersion,
+  );
 }

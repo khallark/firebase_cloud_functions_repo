@@ -1,4 +1,4 @@
-import { DocumentData, FieldValue } from "firebase-admin/firestore";
+import { FieldValue } from "firebase-admin/firestore";
 import { db } from "../../firebaseAdmin";
 import { onRequest } from "firebase-functions/v2/https";
 import { ENQUEUE_FUNCTION_SECRET } from "../../config";
@@ -113,31 +113,7 @@ async function initializeAccountMetadata(accountId: string): Promise<{
   console.log(`  📊 Counting orders for account: ${accountId}`);
 
   const vendorsToMatch = ["OWR", "Ghamand", "BBB"];
-
-  // Run one query per vendor
-  const promises = vendorsToMatch.map((vendor) =>
-    db
-      .collection("accounts")
-      .doc(accountId)
-      .collection("orders")
-      .where("vendors", "array-contains", vendor)
-      .get(),
-  );
-
-  const snapshots = await Promise.all(promises);
-
-  // Merge all docs without duplicates
   const seenOrders = new Set<string>();
-  const orders: DocumentData[] = [];
-
-  snapshots.forEach((snapshot) => {
-    snapshot.docs.forEach((doc) => {
-      if (!seenOrders.has(doc.id)) {
-        seenOrders.add(doc.id);
-        orders.push(doc.data());
-      }
-    });
-  });
 
   const counts: Record<string, number> = {
     "All Orders": 0,
@@ -163,25 +139,36 @@ async function initializeAccountMetadata(accountId: string): Promise<{
     Cancelled: 0,
   };
 
-  let allOrdersCount = 0;
+  // Run one query per vendor (stream + dedupe)
+  for (const vendor of vendorsToMatch) {
+    const snapshot = await db
+      .collection("accounts")
+      .doc(accountId)
+      .collection("orders")
+      .where("vendors", "array-contains", vendor)
+      .get();
 
-  orders.forEach((order) => {
-    const isShopifyCancelled = !!order.raw?.cancelled_at && order?.customStatus === "Cancelled";
+    snapshot.docs.forEach((doc) => {
+      if (seenOrders.has(doc.id)) return;
+      seenOrders.add(doc.id);
 
-    allOrdersCount++;
-    if (isShopifyCancelled) {
-      counts["Cancelled"]++;
-    } else {
-      const status = order.customStatus || "New";
-      if (counts[status] !== undefined) {
-        counts[status]++;
+      const order = doc.data();
+      counts["All Orders"]++;
+
+      const isShopifyCancelled = !!order.raw?.cancelled_at && order?.customStatus === "Cancelled";
+
+      if (isShopifyCancelled) {
+        counts["Cancelled"]++;
       } else {
-        console.warn(`  ⚠️ Unknown status found: ${status}`);
+        const status = order.customStatus || "New";
+        if (counts[status] !== undefined) {
+          counts[status]++;
+        } else {
+          console.warn(`⚠️ Unknown status: ${status}`);
+        }
       }
-    }
-  });
-
-  counts["All Orders"] = allOrdersCount;
+    });
+  }
 
   // Save counts to the OWR member only
   const owrMemberSnapshot = await db
@@ -191,7 +178,7 @@ async function initializeAccountMetadata(accountId: string): Promise<{
     .where("vendorName", "==", "OWR")
     .get();
 
-  if (owrMemberSnapshot.docs.length > 0) {
+  if (!owrMemberSnapshot.empty) {
     await owrMemberSnapshot.docs[0].ref.set(
       {
         counts,
@@ -204,10 +191,10 @@ async function initializeAccountMetadata(accountId: string): Promise<{
     console.warn(`  ⚠️ No OWR member found for account ${accountId}`);
   }
 
-  console.log(`  ✅ Metadata created: ${orders.length} orders counted`);
+  console.log(`  ✅ Metadata created: ${counts["All Orders"]} orders counted`);
 
   return {
-    totalOrders: orders.length,
+    totalOrders: counts["All Orders"],
     counts,
   };
 }

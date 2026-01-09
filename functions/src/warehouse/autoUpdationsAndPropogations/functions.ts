@@ -2,7 +2,7 @@
 // Handles stats updates, denormalization propagation, and automatic log creation
 
 import { onDocumentWritten } from "firebase-functions/v2/firestore";
-import type { Warehouse, Zone, Rack, Shelf, Placement } from "../../config/types";
+import type { Warehouse, Zone, Rack, Shelf, Placement, PlacementLog, ShelfLog, RackLog, ZoneLog } from "../../config/types";
 import {
   createMovement,
   createPlacementLog,
@@ -11,22 +11,18 @@ import {
   createZoneLog,
   getChanges,
   propagateRackLocationChange,
-  propagateRackNameChange,
-  propagateShelfCoordinatesChange,
   propagateShelfLocationChange,
-  propagateShelfNameChange,
-  propagateWarehouseNameChange,
   propagateZoneLocationChange,
-  propagateZoneNameChange,
   transferProductStats,
   transferRackStats,
   transferZoneStats,
-  updateLocationStats,
-  updateRackCounts,
-  updateShelfCounts,
-  updateZoneCounts,
+  updateLocationStatsInTransaction,
+  updateRackCountsInTransaction,
+  updateShelfCountsInTransaction,
+  updateZoneCountsInTransaction,
 } from "./helpers";
 import { db } from "../../firebaseAdmin";
+import { FieldValue, Timestamp } from "firebase-admin/firestore";
 
 // ============================================================================
 // PLACEMENT TRIGGERS → Update Location Stats + Create Logs
@@ -41,48 +37,67 @@ export const onPlacementWritten = onDocumentWritten(
 
     // Created → inbound
     if (!before && after) {
-      await updateLocationStats(businessId, after, after.quantity);
-      const movementId = await createMovement(businessId, "inbound", null, after, after.quantity);
+      await db.runTransaction(async (transaction) => {
+        // Update stats
+        updateLocationStatsInTransaction(transaction, businessId, after, after.quantity);
 
-      await createPlacementLog(
-        businessId,
-        placementId,
-        "added",
-        after.createdBy,
-        after.quantity,
-        null,
-        after.quantity,
-        movementId,
-        after.lastMovementReason,
-      );
+        // Create movement (with idempotency check outside transaction)
+        const movementId = await createMovement(businessId, "inbound", null, after, after.quantity);
+
+        // Create log
+        const logRef = db.collection(`users/${businessId}/placements/${placementId}/logs`).doc();
+        const log: PlacementLog = {
+          type: "added",
+          quantity: after.quantity,
+          quantityBefore: null,
+          quantityAfter: after.quantity,
+          relatedMovementId: movementId,
+          note: after.lastMovementReason,
+          timestamp: Timestamp.now(),
+          userId: after.createdBy,
+        };
+        Object.keys(log).forEach((key) => {
+          if ((log as any)[key] === undefined) delete (log as any)[key];
+        });
+        transaction.set(logRef, log);
+      });
     }
 
     // Deleted → outbound
     else if (before && !after) {
-      // await updateLocationStats(businessId, before, -before.quantity);
-      // await createMovement(businessId, "outbound", before, null, before.quantity);
-      // Note: Cannot create log in deleted document's subcollection
-      // The movement record serves as the audit trail for deletions
+      // Note: Stats update and movement creation commented out as per original
+      // The movement record would serve as the audit trail for deletions
+      // Cannot create log in deleted document's subcollection
     }
 
     // Updated → adjustment only (shelfId can't change with composite ID)
     else if (before && after) {
       const diff = after.quantity - before.quantity;
       if (diff !== 0) {
-        await updateLocationStats(businessId, after, diff);
-        const movementId = await createMovement(businessId, "adjustment", before, after, diff);
+        await db.runTransaction(async (transaction) => {
+          // Update stats
+          updateLocationStatsInTransaction(transaction, businessId, after, diff);
 
-        await createPlacementLog(
-          businessId,
-          placementId,
-          "quantity_adjusted",
-          after.updatedBy,
-          diff,
-          before.quantity,
-          after.quantity,
-          movementId,
-          after.lastMovementReason,
-        );
+          // Create movement (with idempotency check outside transaction)
+          const movementId = await createMovement(businessId, "adjustment", before, after, diff);
+
+          // Create log
+          const logRef = db.collection(`users/${businessId}/placements/${placementId}/logs`).doc();
+          const log: PlacementLog = {
+            type: "quantity_adjusted",
+            quantity: diff,
+            quantityBefore: before.quantity,
+            quantityAfter: after.quantity,
+            relatedMovementId: movementId,
+            note: after.lastMovementReason,
+            timestamp: Timestamp.now(),
+            userId: after.updatedBy,
+          };
+          Object.keys(log).forEach((key) => {
+            if ((log as any)[key] === undefined) delete (log as any)[key];
+          });
+          transaction.set(logRef, log);
+        });
       }
     }
   },
@@ -99,20 +114,51 @@ export const onShelfWritten = onDocumentWritten(
     const after = event.data?.after?.data() as Shelf | undefined;
     const { businessId, shelfId } = event.params;
 
-    const fieldsToTrack = ["name", "code", "capacity", "position", "coordinates"];
+    const fieldsToTrack = ["name", "code", "capacity", "position"];
 
     // Created
     if (!before && after) {
-      await updateShelfCounts(businessId, after.rackId, after.zoneId, after.warehouseId, 1);
-      await createShelfLog(businessId, shelfId, "created", after.createdBy, null, null, null);
+      await db.runTransaction(async (transaction) => {
+        updateShelfCountsInTransaction(
+          transaction,
+          businessId,
+          after.rackId,
+          after.zoneId,
+          after.warehouseId,
+          1,
+        );
+
+        const logRef = db.collection(`users/${businessId}/shelves/${shelfId}/logs`).doc();
+        const log: ShelfLog = {
+          type: "created",
+          changes: null,
+          fromRack: null,
+          toRack: null,
+          timestamp: Timestamp.now(),
+          userId: after.createdBy,
+        };
+        Object.keys(log).forEach((key) => {
+          if ((log as any)[key] === undefined) delete (log as any)[key];
+        });
+        transaction.set(logRef, log);
+      });
     }
 
     // Hard deleted
     else if (before && !after) {
       if (!before.isDeleted) {
-        await updateShelfCounts(businessId, before.rackId, before.zoneId, before.warehouseId, -1);
+        // Cannot use transaction here as we can't write to deleted subcollection
+        await db.runTransaction(async (transaction) => {
+          updateShelfCountsInTransaction(
+            transaction,
+            businessId,
+            before.rackId,
+            before.zoneId,
+            before.warehouseId,
+            -1,
+          );
+        });
       }
-      // Cannot create log in deleted document's subcollection
     }
 
     // Updated
@@ -128,25 +174,106 @@ export const onShelfWritten = onDocumentWritten(
         if (!placements.empty) {
           console.warn(
             `Shelf ${shelfId} soft deleted with products on it. ` +
-              `This should be blocked at API level.`,
+            `This should be blocked at API level.`,
           );
         }
 
-        await updateShelfCounts(businessId, after.rackId, after.zoneId, after.warehouseId, -1);
-        await createShelfLog(businessId, shelfId, "deleted", after.updatedBy, null, null, null);
+        await db.runTransaction(async (transaction) => {
+          updateShelfCountsInTransaction(
+            transaction,
+            businessId,
+            after.rackId,
+            after.zoneId,
+            after.warehouseId,
+            -1,
+          );
+
+          const logRef = db.collection(`users/${businessId}/shelves/${shelfId}/logs`).doc();
+          const log: ShelfLog = {
+            type: "deleted",
+            changes: null,
+            fromRack: null,
+            toRack: null,
+            timestamp: Timestamp.now(),
+            userId: after.updatedBy,
+          };
+          Object.keys(log).forEach((key) => {
+            if ((log as any)[key] === undefined) delete (log as any)[key];
+          });
+          transaction.set(logRef, log);
+        });
       }
 
       // Restore: deleted → active
       else if (before.isDeleted && !after.isDeleted) {
-        await updateShelfCounts(businessId, after.rackId, after.zoneId, after.warehouseId, 1);
-        await createShelfLog(businessId, shelfId, "restored", after.updatedBy, null, null, null);
+        await db.runTransaction(async (transaction) => {
+          updateShelfCountsInTransaction(
+            transaction,
+            businessId,
+            after.rackId,
+            after.zoneId,
+            after.warehouseId,
+            1,
+          );
+
+          const logRef = db.collection(`users/${businessId}/shelves/${shelfId}/logs`).doc();
+          const log: ShelfLog = {
+            type: "restored",
+            changes: null,
+            fromRack: null,
+            toRack: null,
+            timestamp: Timestamp.now(),
+            userId: after.updatedBy,
+          };
+          Object.keys(log).forEach((key) => {
+            if ((log as any)[key] === undefined) delete (log as any)[key];
+          });
+          transaction.set(logRef, log);
+        });
       }
 
       // Moved to different rack
       else if (before.rackId !== after.rackId && !after.isDeleted) {
-        await updateShelfCounts(businessId, before.rackId, before.zoneId, before.warehouseId, -1);
-        await updateShelfCounts(businessId, after.rackId, after.zoneId, after.warehouseId, 1);
+        // Increment locationVersion
+        await db.doc(`users/${businessId}/shelves/${shelfId}`).update({
+          locationVersion: FieldValue.increment(1),
+        });
 
+        // Stats update in transaction
+        await db.runTransaction(async (transaction) => {
+          updateShelfCountsInTransaction(
+            transaction,
+            businessId,
+            before.rackId,
+            before.zoneId,
+            before.warehouseId,
+            -1,
+          );
+          updateShelfCountsInTransaction(
+            transaction,
+            businessId,
+            after.rackId,
+            after.zoneId,
+            after.warehouseId,
+            1,
+          );
+
+          const logRef = db.collection(`users/${businessId}/shelves/${shelfId}/logs`).doc();
+          const log: ShelfLog = {
+            type: "moved",
+            changes: null,
+            fromRack: { id: before.rackId, zoneId: before.zoneId },
+            toRack: { id: after.rackId, zoneId: after.zoneId },
+            timestamp: Timestamp.now(),
+            userId: after.updatedBy,
+          };
+          Object.keys(log).forEach((key) => {
+            if ((log as any)[key] === undefined) delete (log as any)[key];
+          });
+          transaction.set(logRef, log);
+        });
+
+        // Product stats transfer (also in transaction)
         await transferProductStats(
           businessId,
           shelfId,
@@ -158,20 +285,14 @@ export const onShelfWritten = onDocumentWritten(
           after.warehouseId,
         );
 
-        await propagateShelfLocationChange(businessId, shelfId, after);
-
-        await createShelfLog(
-          businessId,
-          shelfId,
-          "moved",
-          after.updatedBy,
-          null,
-          { id: before.rackId, name: before.rackName, zoneId: before.zoneId },
-          { id: after.rackId, name: after.rackName, zoneId: after.zoneId },
-        );
+        // Propagate location changes (batched - not in transaction)
+        await propagateShelfLocationChange(businessId, shelfId, {
+          ...after,
+          locationVersion: (after.locationVersion || 0) + 1,
+        });
       }
 
-      // Other field changes (name, code, capacity, position, coordinates)
+      // Other field changes (name, code, capacity, position)
       else if (!after.isDeleted) {
         const changes = getChanges(before, after, fieldsToTrack);
         if (changes) {
@@ -187,18 +308,12 @@ export const onShelfWritten = onDocumentWritten(
         }
       }
 
-      // Name changed - propagate to placements
+      // Name changed - propagate to placements (batched - not in transaction)
       if (before.name !== after.name) {
-        await propagateShelfNameChange(businessId, shelfId, after);
-      }
-
-      // Coordinates changed - propagate to placements
-      if (
-        before.coordinates?.aisle !== after.coordinates?.aisle ||
-        before.coordinates?.bay !== after.coordinates?.bay ||
-        before.coordinates?.level !== after.coordinates?.level
-      ) {
-        await propagateShelfCoordinatesChange(businessId, shelfId, after);
+        // Increment nameVersion
+        await db.doc(`users/${businessId}/shelves/${shelfId}`).update({
+          nameVersion: FieldValue.increment(1),
+        });
       }
     }
   },
@@ -219,14 +334,37 @@ export const onRackWritten = onDocumentWritten(
 
     // Created
     if (!before && after) {
-      await updateRackCounts(businessId, after.zoneId, after.warehouseId, 1);
-      await createRackLog(businessId, rackId, "created", after.createdBy, null, null, null);
+      await db.runTransaction(async (transaction) => {
+        updateRackCountsInTransaction(transaction, businessId, after.zoneId, after.warehouseId, 1);
+
+        const logRef = db.collection(`users/${businessId}/racks/${rackId}/logs`).doc();
+        const log: RackLog = {
+          type: "created",
+          changes: null,
+          fromZone: null,
+          toZone: null,
+          timestamp: Timestamp.now(),
+          userId: after.createdBy,
+        };
+        Object.keys(log).forEach((key) => {
+          if ((log as any)[key] === undefined) delete (log as any)[key];
+        });
+        transaction.set(logRef, log);
+      });
     }
 
     // Hard deleted
     else if (before && !after) {
       if (!before.isDeleted) {
-        await updateRackCounts(businessId, before.zoneId, before.warehouseId, -1);
+        await db.runTransaction(async (transaction) => {
+          updateRackCountsInTransaction(
+            transaction,
+            businessId,
+            before.zoneId,
+            before.warehouseId,
+            -1,
+          );
+        });
       }
     }
 
@@ -244,25 +382,96 @@ export const onRackWritten = onDocumentWritten(
         if (!shelves.empty) {
           console.warn(
             `Rack ${rackId} soft deleted with shelves on it. ` +
-              `This should be blocked at API level.`,
+            `This should be blocked at API level.`,
           );
         }
 
-        await updateRackCounts(businessId, after.zoneId, after.warehouseId, -1);
-        await createRackLog(businessId, rackId, "deleted", after.updatedBy, null, null, null);
+        await db.runTransaction(async (transaction) => {
+          updateRackCountsInTransaction(
+            transaction,
+            businessId,
+            after.zoneId,
+            after.warehouseId,
+            -1,
+          );
+
+          const logRef = db.collection(`users/${businessId}/racks/${rackId}/logs`).doc();
+          const log: RackLog = {
+            type: "deleted",
+            changes: null,
+            fromZone: null,
+            toZone: null,
+            timestamp: Timestamp.now(),
+            userId: after.updatedBy,
+          };
+          Object.keys(log).forEach((key) => {
+            if ((log as any)[key] === undefined) delete (log as any)[key];
+          });
+          transaction.set(logRef, log);
+        });
       }
 
       // Restore: deleted → active
       else if (before.isDeleted && !after.isDeleted) {
-        await updateRackCounts(businessId, after.zoneId, after.warehouseId, 1);
-        await createRackLog(businessId, rackId, "restored", after.updatedBy, null, null, null);
+        await db.runTransaction(async (transaction) => {
+          updateRackCountsInTransaction(transaction, businessId, after.zoneId, after.warehouseId, 1);
+
+          const logRef = db.collection(`users/${businessId}/racks/${rackId}/logs`).doc();
+          const log: RackLog = {
+            type: "restored",
+            changes: null,
+            fromZone: null,
+            toZone: null,
+            timestamp: Timestamp.now(),
+            userId: after.updatedBy,
+          };
+          Object.keys(log).forEach((key) => {
+            if ((log as any)[key] === undefined) delete (log as any)[key];
+          });
+          transaction.set(logRef, log);
+        });
       }
 
       // Moved to different zone
       else if (before.zoneId !== after.zoneId && !after.isDeleted) {
-        await updateRackCounts(businessId, before.zoneId, before.warehouseId, -1);
-        await updateRackCounts(businessId, after.zoneId, after.warehouseId, 1);
+        // Increment locationVersion
+        await db.doc(`users/${businessId}/racks/${rackId}`).update({
+          locationVersion: FieldValue.increment(1),
+        });
 
+        // Stats update in transaction
+        await db.runTransaction(async (transaction) => {
+          updateRackCountsInTransaction(
+            transaction,
+            businessId,
+            before.zoneId,
+            before.warehouseId,
+            -1,
+          );
+          updateRackCountsInTransaction(
+            transaction,
+            businessId,
+            after.zoneId,
+            after.warehouseId,
+            1,
+          );
+
+          const logRef = db.collection(`users/${businessId}/racks/${rackId}/logs`).doc();
+          const log: RackLog = {
+            type: "moved",
+            changes: null,
+            fromZone: { id: before.zoneId },
+            toZone: { id: after.zoneId },
+            timestamp: Timestamp.now(),
+            userId: after.updatedBy,
+          };
+          Object.keys(log).forEach((key) => {
+            if ((log as any)[key] === undefined) delete (log as any)[key];
+          });
+          transaction.set(logRef, log);
+        });
+
+        // Transfer stats (also in transaction)
         await transferRackStats(
           businessId,
           rackId,
@@ -272,17 +481,11 @@ export const onRackWritten = onDocumentWritten(
           after.warehouseId,
         );
 
-        await propagateRackLocationChange(businessId, rackId, after);
-
-        await createRackLog(
-          businessId,
-          rackId,
-          "moved",
-          after.updatedBy,
-          null,
-          { id: before.zoneId, name: before.zoneName },
-          { id: after.zoneId, name: after.zoneName },
-        );
+        // Propagate location changes (batched - not in transaction)
+        await propagateRackLocationChange(businessId, rackId, {
+          ...after,
+          locationVersion: (after.locationVersion || 0) + 1,
+        });
       }
 
       // Other field changes (name, code, position)
@@ -293,9 +496,12 @@ export const onRackWritten = onDocumentWritten(
         }
       }
 
-      // Name changed - propagate to shelves and placements
+      // Name changed - propagate to shelves and placements (batched - not in transaction)
       if (before.name !== after.name) {
-        await propagateRackNameChange(businessId, rackId, after);
+        // Increment nameVersion
+        await db.doc(`users/${businessId}/racks/${rackId}`).update({
+          nameVersion: FieldValue.increment(1),
+        });
       }
     }
   },
@@ -316,14 +522,30 @@ export const onZoneWritten = onDocumentWritten(
 
     // Created
     if (!before && after) {
-      await updateZoneCounts(businessId, after.warehouseId, 1);
-      await createZoneLog(businessId, zoneId, "created", after.createdBy, null, null);
+      await db.runTransaction(async (transaction) => {
+        updateZoneCountsInTransaction(transaction, businessId, after.warehouseId, 1);
+
+        const logRef = db.collection(`users/${businessId}/zones/${zoneId}/logs`).doc();
+        const log: ZoneLog = {
+          type: "created",
+          changes: null,
+          note: null,
+          timestamp: Timestamp.now(),
+          userId: after.createdBy,
+        };
+        Object.keys(log).forEach((key) => {
+          if ((log as any)[key] === undefined) delete (log as any)[key];
+        });
+        transaction.set(logRef, log);
+      });
     }
 
     // Hard deleted
     else if (before && !after) {
       if (!before.isDeleted) {
-        await updateZoneCounts(businessId, before.warehouseId, -1);
+        await db.runTransaction(async (transaction) => {
+          updateZoneCountsInTransaction(transaction, businessId, before.warehouseId, -1);
+        });
       }
     }
 
@@ -341,41 +563,85 @@ export const onZoneWritten = onDocumentWritten(
         if (!racks.empty) {
           console.warn(
             `Zone ${zoneId} soft deleted with racks in it. ` +
-              `This should be blocked at API level.`,
+            `This should be blocked at API level.`,
           );
         }
 
-        await updateZoneCounts(businessId, after.warehouseId, -1);
-        await createZoneLog(businessId, zoneId, "deleted", after.updatedBy, null, null);
+        await db.runTransaction(async (transaction) => {
+          updateZoneCountsInTransaction(transaction, businessId, after.warehouseId, -1);
+
+          const logRef = db.collection(`users/${businessId}/zones/${zoneId}/logs`).doc();
+          const log: ZoneLog = {
+            type: "deleted",
+            changes: null,
+            note: null,
+            timestamp: Timestamp.now(),
+            userId: after.updatedBy,
+          };
+          Object.keys(log).forEach((key) => {
+            if ((log as any)[key] === undefined) delete (log as any)[key];
+          });
+          transaction.set(logRef, log);
+        });
       }
 
       // Restore: deleted → active
       else if (before.isDeleted && !after.isDeleted) {
-        await updateZoneCounts(businessId, after.warehouseId, 1);
-        await createZoneLog(businessId, zoneId, "restored", after.updatedBy, null, null);
+        await db.runTransaction(async (transaction) => {
+          updateZoneCountsInTransaction(transaction, businessId, after.warehouseId, 1);
+
+          const logRef = db.collection(`users/${businessId}/zones/${zoneId}/logs`).doc();
+          const log: ZoneLog = {
+            type: "restored",
+            changes: null,
+            note: null,
+            timestamp: Timestamp.now(),
+            userId: after.updatedBy,
+          };
+          Object.keys(log).forEach((key) => {
+            if ((log as any)[key] === undefined) delete (log as any)[key];
+          });
+          transaction.set(logRef, log);
+        });
       }
 
       // Moved to different warehouse
       else if (before.warehouseId !== after.warehouseId && !after.isDeleted) {
-        await updateZoneCounts(businessId, before.warehouseId, -1);
-        await updateZoneCounts(businessId, after.warehouseId, 1);
+        // Increment locationVersion
+        await db.doc(`users/${businessId}/zones/${zoneId}`).update({
+          locationVersion: FieldValue.increment(1),
+        });
 
+        // Stats update in transaction
+        await db.runTransaction(async (transaction) => {
+          updateZoneCountsInTransaction(transaction, businessId, before.warehouseId, -1);
+          updateZoneCountsInTransaction(transaction, businessId, after.warehouseId, 1);
+
+          // Log warehouse change as an 'updated' with changes
+          const logRef = db.collection(`users/${businessId}/zones/${zoneId}/logs`).doc();
+          const log: ZoneLog = {
+            type: "updated",
+            changes: {
+              warehouseId: { from: before.warehouseId, to: after.warehouseId },
+            },
+            note: null,
+            timestamp: Timestamp.now(),
+            userId: after.updatedBy,
+          };
+          Object.keys(log).forEach((key) => {
+            if ((log as any)[key] === undefined) delete (log as any)[key];
+          });
+          transaction.set(logRef, log);
+        });
+
+        // Transfer stats (also in transaction)
         await transferZoneStats(businessId, zoneId, before.warehouseId, after.warehouseId);
 
-        await propagateZoneLocationChange(businessId, zoneId, after);
-
-        // Log warehouse change as an 'updated' with changes
-        await createZoneLog(
-          businessId,
-          zoneId,
-          "updated",
-          after.updatedBy,
-          {
-            warehouseId: { from: before.warehouseId, to: after.warehouseId },
-            warehouseName: { from: before.warehouseName, to: after.warehouseName },
-          },
-          null,
-        );
+        // Propagate location changes (batched - not in transaction)
+        await propagateZoneLocationChange(businessId, zoneId, {
+          ...after,
+          locationVersion: (after.locationVersion || 0) + 1,
+        });
       }
 
       // Other field changes (name, code, description)
@@ -386,9 +652,12 @@ export const onZoneWritten = onDocumentWritten(
         }
       }
 
-      // Name changed - propagate to racks, shelves, and placements
+      // Name changed - propagate to racks, shelves, and placements (batched - not in transaction)
       if (before.name !== after.name) {
-        await propagateZoneNameChange(businessId, zoneId, after.name);
+        // Increment nameVersion
+        await db.doc(`users/${businessId}/zones/${zoneId}`).update({
+          nameVersion: FieldValue.increment(1),
+        });
       }
     }
   },
@@ -419,14 +688,17 @@ export const onWarehouseWritten = onDocumentWritten(
         if (!zones.empty) {
           console.warn(
             `Warehouse ${warehouseId} soft deleted with zones in it. ` +
-              `This should be blocked at API level.`,
+            `This should be blocked at API level.`,
           );
         }
       }
 
       // Name changed - propagate to all children
       if (before.name !== after.name) {
-        await propagateWarehouseNameChange(businessId, warehouseId, after.name);
+        // Increment nameVersion
+        await db.doc(`users/${businessId}/warehouses/${warehouseId}`).update({
+          nameVersion: FieldValue.increment(1),
+        });
       }
     }
   },

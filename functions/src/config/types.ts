@@ -24,6 +24,8 @@ export interface Warehouse {
     totalShelves: number;
     totalProducts: number;
   };
+
+  nameVersion: number;
 }
 
 // /{businessId}/zones/{zoneId}
@@ -40,13 +42,15 @@ export interface Zone {
   updatedBy: string;
 
   warehouseId: string;
-  warehouseName: string;
 
   stats: {
     totalRacks: number;
     totalShelves: number;
     totalProducts: number;
   };
+
+  locationVersion: number;
+  nameVersion: number;
 }
 
 // /{businessId}/zones/{zoneId}/logs/{logsId}
@@ -73,16 +77,17 @@ export interface Rack {
   updatedBy: string;
 
   warehouseId: string;
-  warehouseName: string;
 
   zoneId: string;
-  zoneName: string;
   position: number;
 
   stats: {
     totalShelves: number;
     totalProducts: number;
   };
+
+  locationVersion: number;
+  nameVersion: number;
 }
 
 // /{businessId}/racks/{rackId}/logs/{logId}
@@ -91,8 +96,8 @@ export interface RackLog {
   changes: {
     [field: string]: { from: any; to: any };
   } | null;
-  fromZone: { id: string; name: string } | null;
-  toZone: { id: string; name: string } | null;
+  fromZone: { id: string; } | null;
+  toZone: { id: string; } | null;
   timestamp: Timestamp;
   userId: string;
 }
@@ -111,13 +116,10 @@ export interface Shelf {
   updatedBy: string;
 
   warehouseId: string;
-  warehouseName: string;
 
   zoneId: string;
-  zoneName: string;
 
   rackId: string;
-  rackName: string;
   position: number;
 
   stats: {
@@ -125,11 +127,8 @@ export interface Shelf {
     currentOccupancy: number;
   };
 
-  coordinates: {
-    aisle: string;
-    bay: number;
-    level: number;
-  } | null;
+  locationVersion: number;
+  nameVersion: number;
 }
 
 // /{businessId}/shelves/{shelfId}/logs/{logId}
@@ -138,8 +137,8 @@ export interface ShelfLog {
   changes: {
     [field: string]: { from: any; to: any };
   } | null;
-  fromRack: { id: string; name: string; zoneId: string } | null;
-  toRack: { id: string; name: string; zoneId: string } | null;
+  fromRack: { id: string; zoneId: string } | null;
+  toRack: { id: string; zoneId: string } | null;
   timestamp: Timestamp;
   userId: string;
 }
@@ -153,27 +152,18 @@ export interface Placement {
   updatedAt: Timestamp;
   createdBy: string;
   updatedBy: string;
-  coordinates: {
-    aisle: string;
-    bay: number;
-    level: number;
-  } | null;
   locationCode: string | null;
 
   productId: string;
   productSKU: string;
 
   warehouseId: string;
-  warehouseName: string;
 
   zoneId: string;
-  zoneName: string;
 
   rackId: string;
-  rackName: string;
 
   shelfId: string;
-  shelfName: string;
 
   lastMovementReason: string | null;
   lastMovementReference: string | null;
@@ -202,24 +192,16 @@ export interface Movement {
 
   from: {
     shelfId: string | null;
-    shelfName: string | null;
     rackId: string | null;
-    rackName: string | null;
     zoneId: string | null;
-    zoneName: string | null;
     warehouseId: string | null;
-    warehouseName: string | null;
   };
 
   to: {
     shelfId: string | null;
-    shelfName: string | null;
     rackId: string | null;
-    rackName: string | null;
     zoneId: string | null;
-    zoneName: string | null;
     warehouseId: string | null;
-    warehouseName: string | null;
   };
 
   quantity: number;
@@ -229,4 +211,52 @@ export interface Movement {
   timestamp: Timestamp;
   userId: string;
   userName: string;
+}
+
+export interface PropagationTask {
+  type:
+  | 'shelf-location'
+  | 'rack-location'
+  | 'zone-location'
+
+  businessId: string;
+  entityId: string; // shelfId, rackId, zoneId, or warehouseId
+
+  // Data needed for propagation
+  data: any;
+
+  // Pagination
+  chunkIndex: number;
+  totalChunks: number;
+  chunkSize: number;
+
+  // For idempotency & tracking
+  propagationId: string;
+
+  // Version control (prevent applying stale updates)
+  version?: number;
+}
+
+export interface PropagationTracker {
+  id: string; // propagationId
+  type: PropagationTask['type'];
+  businessId: string;
+  entityId: string;
+
+  status: 'pending' | 'in_progress' | 'completed' | 'failed' | 'obsolete';
+
+  totalDocuments: number;
+  processedDocuments: number;
+  failedDocuments: number;
+
+  chunksTotal: number;
+  chunksCompleted: number;
+  chunksFailed: number;
+
+  startedAt: Timestamp;
+  completedAt: Timestamp | null;
+  lastError: string | null;
+
+  // For version control
+  version?: number;
 }

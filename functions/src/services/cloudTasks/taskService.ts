@@ -1,6 +1,7 @@
 // services/cloudTasks/taskService.ts
 
 import { CloudTasksClient } from "@google-cloud/tasks";
+import { ENQUEUE_FUNCTION_SECRET } from "../../config";
 
 const client = new CloudTasksClient();
 
@@ -66,4 +67,37 @@ export async function createTask(payload: any, config: CloudTaskConfig): Promise
 export async function createTasks(payloads: any[], config: CloudTaskConfig): Promise<string[]> {
   const tasks = payloads.map((payload) => createTask(payload, config));
   return Promise.all(tasks);
+}
+
+export const PROPAGATION_QUEUE = 'propagation-queue';
+export const PROJECT_ID = process.env.GCLOUD_PROJECT || process.env.GCP_PROJECT;
+export const LOCATION = process.env.CLOUD_TASKS_LOCATION || "asia-south1";
+
+export async function enqueuePropogationTask(task: any, taskId?: string) {
+  const queuePath = client.queuePath(PROJECT_ID!, LOCATION, PROPAGATION_QUEUE);
+  
+  const url = `https://${LOCATION}-${PROJECT_ID}.cloudfunctions.net/processPropagationTask`;
+  
+  const taskPayload = {
+    httpRequest: {
+      httpMethod: 'POST' as const,
+      url,
+      headers: {
+        'Content-Type': 'application/json',
+        "X-Api-Key": ENQUEUE_FUNCTION_SECRET.value()!,
+      },
+      body: Buffer.from(JSON.stringify(task)).toString('base64'),
+    },
+    // Optional: Add task name for deduplication
+    ...(taskId && { name: client.taskPath(PROJECT_ID!, LOCATION, PROPAGATION_QUEUE, taskId) }),
+  };
+  
+  try {
+    await client.createTask({ parent: queuePath, task: taskPayload });
+  } catch (error: any) {
+    // Task already exists (409) - that's OK for deduplication
+    if (error.code !== 6) { // 6 = ALREADY_EXISTS
+      throw error;
+    }
+  }
 }

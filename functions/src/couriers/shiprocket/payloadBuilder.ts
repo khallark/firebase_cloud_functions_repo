@@ -14,7 +14,11 @@ interface ShiprocketShipmentParams {
  */
 export function buildShiprocketPayload(params: ShiprocketShipmentParams) {
   const { orderId, order, pickupName } = params;
-  const ship = order?.raw?.shipping_address || {};
+  const ship =
+    order?.raw?.shipping_address ||
+    order?.raw?.billing_address ||
+    order?.raw?.default_address ||
+    {};
 
   const name =
     `${ship?.first_name ?? ship?.firstName ?? ""}`.trim() ||
@@ -95,7 +99,6 @@ export function buildShiprocketPayload(params: ShiprocketShipmentParams) {
     billing_phone: normalizePhoneNumber(
       ship?.phone ||
         order?.raw?.phone ||
-        ship?.phone ||
         order?.raw?.billing_address?.phone ||
         order?.raw?.customer?.phone ||
         "",

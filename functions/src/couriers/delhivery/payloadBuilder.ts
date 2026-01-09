@@ -18,7 +18,10 @@ export function buildDelhiveryPayload(params: DelhiveryShipmentParams) {
   const { awb, order, pickupName, shippingMode } = params;
 
   const ship =
-    order?.raw?.shipping_address || order?.shipping_address || order?.shippingAddress || {};
+    order?.raw?.shipping_address ||
+    order?.raw?.billing_address ||
+    order?.raw?.default_address ||
+    {};
 
   const paid = !Number(order.raw.total_outstanding);
   const items =
