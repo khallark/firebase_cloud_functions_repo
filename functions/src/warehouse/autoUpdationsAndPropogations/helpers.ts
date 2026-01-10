@@ -21,7 +21,7 @@ import {
 } from "../../config/types";
 import { db } from "../../firebaseAdmin";
 import { chunkArray } from "../../helpers";
-import { enqueuePropogationTask } from "../../services";
+import { enqueuePropagationTask } from "../../services";
 
 const increment = FieldValue.increment;
 
@@ -262,7 +262,7 @@ async function createPropagationTasks(
     // Use deterministic task ID for deduplication
     const taskId = `${propagationId}-chunk-${chunkIndex}`;
 
-    tasks.push(enqueuePropogationTask(taskPayload, taskId));
+    tasks.push(enqueuePropagationTask(taskPayload, taskId));
   }
 
   await Promise.all(tasks);

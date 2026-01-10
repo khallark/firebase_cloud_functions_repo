@@ -24,8 +24,15 @@ export const processPropagationTask = onRequest(
         return;
       }
 
-      // Parse task payload
-      const task: PropagationTask = JSON.parse(Buffer.from(req.body, "base64").toString());
+      let task: PropagationTask;
+
+      if (typeof req.body === "string") {
+        // base64-encoded payload
+        task = JSON.parse(Buffer.from(req.body, "base64").toString("utf8"));
+      } else {
+        // already parsed JSON
+        task = req.body as PropagationTask;
+      }
 
       console.log(
         `Processing ${task.type} chunk ${task.chunkIndex}/${task.totalChunks} for ${task.entityId}`,

@@ -73,12 +73,23 @@ export const PROPAGATION_QUEUE = "propagation-queue";
 export const PROJECT_ID = process.env.GCLOUD_PROJECT || process.env.GCP_PROJECT;
 export const LOCATION = process.env.CLOUD_TASKS_LOCATION || "asia-south1";
 
-export async function enqueuePropogationTask(task: any, taskId?: string) {
-  const queuePath = client.queuePath(PROJECT_ID!, LOCATION, PROPAGATION_QUEUE);
+/**
+ * Sanitizes a string to be used as a Cloud Tasks task ID
+ * Cloud Tasks only allows: alphanumeric, hyphens, and underscores
+ */
+function sanitizeTaskId(id: string): string {
+  return id.replace(/[^a-zA-Z0-9_-]/g, "-");
+}
 
+export async function enqueuePropagationTask(task: any, taskId?: string): Promise<void> {
+  if (!PROJECT_ID) {
+    throw new Error("PROJECT_ID not set");
+  }
+
+  const queuePath = client.queuePath(PROJECT_ID, LOCATION, PROPAGATION_QUEUE);
   const url = `https://${LOCATION}-${PROJECT_ID}.cloudfunctions.net/processPropagationTask`;
 
-  const taskPayload = {
+  const taskPayload: any = {
     httpRequest: {
       httpMethod: "POST" as const,
       url,
@@ -88,17 +99,37 @@ export async function enqueuePropogationTask(task: any, taskId?: string) {
       },
       body: Buffer.from(JSON.stringify(task)).toString("base64"),
     },
-    // Optional: Add task name for deduplication
-    ...(taskId && { name: client.taskPath(PROJECT_ID!, LOCATION, PROPAGATION_QUEUE, taskId) }),
   };
 
+  // Add task name for deduplication if provided
+  if (taskId) {
+    const sanitizedTaskId = sanitizeTaskId(taskId);
+    taskPayload.name = client.taskPath(PROJECT_ID, LOCATION, PROPAGATION_QUEUE, sanitizedTaskId);
+  }
+
   try {
-    await client.createTask({ parent: queuePath, task: taskPayload });
+    await client.createTask({
+      parent: queuePath,
+      task: taskPayload,
+    });
+    console.log(`✅ Enqueued propagation task: ${taskId || "unnamed"}`);
   } catch (error: any) {
-    // Task already exists (409) - that's OK for deduplication
-    if (error.code !== 6) {
-      // 6 = ALREADY_EXISTS
-      throw error;
+    // Task already exists (code 6 = ALREADY_EXISTS) - that's OK for deduplication
+    if (error.code === 6) {
+      console.log(`Propagation task already exists: ${taskId}`);
+      return;
     }
+
+    // Log the actual error for debugging
+    console.error(`❌ Failed to enqueue propagation task:`, {
+      taskId,
+      code: error.code,
+      message: error.message,
+      details: error.details,
+      queue: PROPAGATION_QUEUE,
+      url,
+    });
+
+    throw error;
   }
 }
