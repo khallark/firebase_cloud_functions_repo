@@ -1,2 +1,2 @@
 export * from "./functions";
-export * from "./propagationTasks"
+export * from "./propagationTasks";

@@ -2,10 +2,19 @@
 // Handles stats updates, denormalization propagation, and automatic log creation
 
 import { onDocumentWritten } from "firebase-functions/v2/firestore";
-import type { Warehouse, Zone, Rack, Shelf, Placement, PlacementLog, ShelfLog, RackLog, ZoneLog } from "../../config/types";
+import type {
+  Warehouse,
+  Zone,
+  Rack,
+  Shelf,
+  Placement,
+  PlacementLog,
+  ShelfLog,
+  RackLog,
+  ZoneLog,
+} from "../../config/types";
 import {
   createMovement,
-  createPlacementLog,
   createRackLog,
   createShelfLog,
   createUPCsForPlacement,
@@ -24,13 +33,19 @@ import {
 } from "./helpers";
 import { db } from "../../firebaseAdmin";
 import { FieldValue, Timestamp } from "firebase-admin/firestore";
+import { TASKS_SECRET } from "../../config";
 
 // ============================================================================
 // PLACEMENT TRIGGERS → Update Location Stats + Create Logs + Create UPCs
 // ============================================================================
 
 export const onPlacementWritten = onDocumentWritten(
-  "users/{businessId}/placements/{placementId}",
+  {
+    document: "users/{businessId}/placements/{placementId}",
+    secrets: [TASKS_SECRET],
+    memory: "512MiB", // Heavy due to UPC batch creation
+    timeoutSeconds: 120, // 2 minutes for UPC creation
+  },
   async (event) => {
     const before = event.data?.before?.data() as Placement | undefined;
     const after = event.data?.after?.data() as Placement | undefined;
@@ -66,12 +81,7 @@ export const onPlacementWritten = onDocumentWritten(
 
       // Create UPCs if requested (outside transaction due to potential size)
       if (after.createUPCs) {
-        await createUPCsForPlacement(
-          businessId,
-          after,
-          after.quantity,
-          after.createdBy,
-        );
+        await createUPCsForPlacement(businessId, after, after.quantity, after.createdBy);
       }
     }
 
@@ -110,12 +120,7 @@ export const onPlacementWritten = onDocumentWritten(
 
       // ✅ Create UPCs ONLY if createUPCs flag changed AND diff is positive
       if (before.createUPCs !== after.createUPCs && diff > 0) {
-        await createUPCsForPlacement(
-          businessId,
-          after,
-          diff,
-          after.updatedBy,
-        );
+        await createUPCsForPlacement(businessId, after, diff, after.updatedBy);
       }
     }
   },
@@ -126,7 +131,12 @@ export const onPlacementWritten = onDocumentWritten(
 // ============================================================================
 
 export const onShelfWritten = onDocumentWritten(
-  "users/{businessId}/shelves/{shelfId}",
+  {
+    document: "users/{businessId}/shelves/{shelfId}",
+    secrets: [TASKS_SECRET],
+    memory: "256MiB", // Medium - queries + transactions
+    timeoutSeconds: 60, // 1 minute is sufficient
+  },
   async (event) => {
     const before = event.data?.before?.data() as Shelf | undefined;
     const after = event.data?.after?.data() as Shelf | undefined;
@@ -192,7 +202,7 @@ export const onShelfWritten = onDocumentWritten(
         if (!placements.empty) {
           console.warn(
             `Shelf ${shelfId} soft deleted with products on it. ` +
-            `This should be blocked at API level.`,
+              `This should be blocked at API level.`,
           );
         }
 
@@ -342,7 +352,12 @@ export const onShelfWritten = onDocumentWritten(
 // ============================================================================
 
 export const onRackWritten = onDocumentWritten(
-  "users/{businessId}/racks/{rackId}",
+  {
+    document: "users/{businessId}/racks/{rackId}",
+    secrets: [TASKS_SECRET],
+    memory: "512MiB", // Medium-Heavy - multiple queries
+    timeoutSeconds: 90, // 1.5 minutes
+  },
   async (event) => {
     const before = event.data?.before?.data() as Rack | undefined;
     const after = event.data?.after?.data() as Rack | undefined;
@@ -400,7 +415,7 @@ export const onRackWritten = onDocumentWritten(
         if (!shelves.empty) {
           console.warn(
             `Rack ${rackId} soft deleted with shelves on it. ` +
-            `This should be blocked at API level.`,
+              `This should be blocked at API level.`,
           );
         }
 
@@ -432,7 +447,13 @@ export const onRackWritten = onDocumentWritten(
       // Restore: deleted → active
       else if (before.isDeleted && !after.isDeleted) {
         await db.runTransaction(async (transaction) => {
-          updateRackCountsInTransaction(transaction, businessId, after.zoneId, after.warehouseId, 1);
+          updateRackCountsInTransaction(
+            transaction,
+            businessId,
+            after.zoneId,
+            after.warehouseId,
+            1,
+          );
 
           const logRef = db.collection(`users/${businessId}/racks/${rackId}/logs`).doc();
           const log: RackLog = {
@@ -530,7 +551,12 @@ export const onRackWritten = onDocumentWritten(
 // ============================================================================
 
 export const onZoneWritten = onDocumentWritten(
-  "users/{businessId}/zones/{zoneId}",
+  {
+    document: "users/{businessId}/zones/{zoneId}",
+    secrets: [TASKS_SECRET],
+    memory: "512MiB", // Medium-Heavy - 3 collection queries
+    timeoutSeconds: 120, // 2 minutes (most complex)
+  },
   async (event) => {
     const before = event.data?.before?.data() as Zone | undefined;
     const after = event.data?.after?.data() as Zone | undefined;
@@ -581,7 +607,7 @@ export const onZoneWritten = onDocumentWritten(
         if (!racks.empty) {
           console.warn(
             `Zone ${zoneId} soft deleted with racks in it. ` +
-            `This should be blocked at API level.`,
+              `This should be blocked at API level.`,
           );
         }
 
@@ -686,7 +712,12 @@ export const onZoneWritten = onDocumentWritten(
 // ============================================================================
 
 export const onWarehouseWritten = onDocumentWritten(
-  "users/{businessId}/warehouses/{warehouseId}",
+  {
+    document: "users/{businessId}/warehouses/{warehouseId}",
+    secrets: [TASKS_SECRET],
+    memory: "128MiB", // Light - minimal operations
+    timeoutSeconds: 30, // 30 seconds
+  },
   async (event) => {
     const before = event.data?.before?.data() as Warehouse | undefined;
     const after = event.data?.after?.data() as Warehouse | undefined;
@@ -706,7 +737,7 @@ export const onWarehouseWritten = onDocumentWritten(
         if (!zones.empty) {
           console.warn(
             `Warehouse ${warehouseId} soft deleted with zones in it. ` +
-            `This should be blocked at API level.`,
+              `This should be blocked at API level.`,
           );
         }
       }

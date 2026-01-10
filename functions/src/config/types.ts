@@ -96,8 +96,8 @@ export interface RackLog {
   changes: {
     [field: string]: { from: any; to: any };
   } | null;
-  fromZone: { id: string; } | null;
-  toZone: { id: string; } | null;
+  fromZone: { id: string } | null;
+  toZone: { id: string } | null;
   timestamp: Timestamp;
   userId: string;
 }
@@ -124,7 +124,6 @@ export interface Shelf {
 
   stats: {
     totalProducts: number;
-    currentOccupancy: number;
   };
 
   locationVersion: number;
@@ -169,39 +168,40 @@ export interface Placement {
 }
 
 // users/{businessId}/upcs/{upcId}
-export type UPC = {
-  id: string;
-  createdAt: Timestamp;
-  updatedAt: Timestamp;
-  createdBy: string;
-  updatedBy: string;
+export type UPC =
+  | {
+      id: string;
+      createdAt: Timestamp;
+      updatedAt: Timestamp;
+      createdBy: string;
+      updatedBy: string;
 
-  orderName: null;
+      orderName: null;
 
-  putAway: null;
+      putAway: null;
 
-  location: {
-    productId: string;
-    warehouseId: string;
-    zoneId: string;
-    rackId: string;
-    shelfId: string;
-    placementId: string;
-  }
+      location: {
+        productId: string;
+        warehouseId: string;
+        zoneId: string;
+        rackId: string;
+        shelfId: string;
+        placementId: string;
+      };
+    }
+  | {
+      id: string;
+      createdAt: Timestamp;
+      updatedAt: Timestamp;
+      createdBy: string;
+      updatedBy: string;
 
-} | {
-  id: string;
-  createdAt: Timestamp;
-  updatedAt: Timestamp;
-  createdBy: string;
-  updatedBy: string;
+      orderName: string;
 
-  orderName: string;
+      putAway: "inbound" | "outbound";
 
-  putAway: 'inbound' | 'outbound';
-
-  location: null;
-}
+      location: null;
+    };
 
 // users/{businessId}/placements/{placementId}/logs/{logId}
 export interface PlacementLog {
@@ -247,10 +247,7 @@ export interface Movement {
 }
 
 export interface PropagationTask {
-  type:
-  | 'shelf-location'
-  | 'rack-location'
-  | 'zone-location'
+  type: "shelf-location" | "rack-location" | "zone-location";
 
   businessId: string;
   entityId: string; // shelfId, rackId, zoneId, or warehouseId
@@ -272,11 +269,11 @@ export interface PropagationTask {
 
 export interface PropagationTracker {
   id: string; // propagationId
-  type: PropagationTask['type'];
+  type: PropagationTask["type"];
   businessId: string;
   entityId: string;
 
-  status: 'pending' | 'in_progress' | 'completed' | 'failed' | 'obsolete';
+  status: "pending" | "in_progress" | "completed" | "failed" | "obsolete";
 
   totalDocuments: number;
   processedDocuments: number;

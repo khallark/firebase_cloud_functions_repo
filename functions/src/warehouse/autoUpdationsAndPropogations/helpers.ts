@@ -1,4 +1,10 @@
-import { FieldValue, Timestamp, DocumentReference } from "firebase-admin/firestore";
+import {
+  FieldValue,
+  Timestamp,
+  DocumentReference,
+  Query,
+  Transaction,
+} from "firebase-admin/firestore";
 import {
   Movement,
   Placement,
@@ -182,49 +188,49 @@ export async function createPlacementLog(
 // ============================================================================
 
 async function createPropagationTasks(
-  type: PropagationTask['type'],
+  type: PropagationTask["type"],
   businessId: string,
   entityId: string,
   data: any,
-  query: FirebaseFirestore.Query,
+  query: Query,
   version?: number,
 ) {
   // Check for in-progress propagation
   const existingTrackers = await db
     .collection(`users/${businessId}/propagation_trackers`)
-    .where('entityId', '==', entityId)
-    .where('type', '==', type)
-    .where('status', 'in', ['pending', 'in_progress'])
+    .where("entityId", "==", entityId)
+    .where("type", "==", type)
+    .where("status", "in", ["pending", "in_progress"])
     .limit(1)
     .get();
-  
+
   if (!existingTrackers.empty) {
     console.log(`Propagation already in progress for ${type} ${entityId}`);
     return;
   }
-  
+
   // Count total documents
   const snapshot = await query.select().get();
   const totalDocs = snapshot.size;
-  
+
   if (totalDocs === 0) {
     console.log(`No documents to propagate for ${type} ${entityId}`);
     return;
   }
-  
+
   const chunkSize = 500;
   const totalChunks = Math.ceil(totalDocs / chunkSize);
-  
+
   // Create unique propagation ID
   const propagationId = `${type}-${entityId}-${Date.now()}`;
-  
+
   // Create tracker document
   await db.doc(`users/${businessId}/propagation_trackers/${propagationId}`).set({
     id: propagationId,
     type,
     businessId,
     entityId,
-    status: 'pending',
+    status: "pending",
     totalDocuments: totalDocs,
     processedDocuments: 0,
     failedDocuments: 0,
@@ -236,10 +242,10 @@ async function createPropagationTasks(
     lastError: null,
     version: version || 0,
   } as PropagationTracker);
-  
+
   // Enqueue tasks for each chunk
   const tasks: Promise<void>[] = [];
-  
+
   for (let chunkIndex = 0; chunkIndex < totalChunks; chunkIndex++) {
     const taskPayload: PropagationTask = {
       type,
@@ -252,20 +258,20 @@ async function createPropagationTasks(
       propagationId,
       version,
     };
-    
+
     // Use deterministic task ID for deduplication
     const taskId = `${propagationId}-chunk-${chunkIndex}`;
-    
+
     tasks.push(enqueuePropogationTask(taskPayload, taskId));
   }
-  
+
   await Promise.all(tasks);
-  
+
   console.log(`Enqueued ${totalChunks} tasks for propagation ${propagationId}`);
-  
+
   // Update tracker status
   await db.doc(`users/${businessId}/propagation_trackers/${propagationId}`).update({
-    status: 'in_progress',
+    status: "in_progress",
   });
 }
 
@@ -281,7 +287,7 @@ export async function createMovement(
   quantity: number,
 ): Promise<string> {
   const source = to ?? from;
-  
+
   // Create deterministic ID for idempotency
   const timestamp = Date.now();
   const deterministicId = `${type}_${source!.productId}_${source!.shelfId}_${timestamp}`;
@@ -337,7 +343,7 @@ export async function createMovement(
 }
 
 export function updateLocationStatsInTransaction(
-  transaction: FirebaseFirestore.Transaction,
+  transaction: Transaction,
   businessId: string,
   placement: Placement,
   quantityDelta: number,
@@ -380,7 +386,7 @@ export async function createUPCsForPlacement(
 
   for (let i = 0; i < count; i++) {
     const upcRef = db.collection(`users/${businessId}/upcs`).doc();
-    
+
     const upc: UPC = {
       id: upcRef.id,
       createdAt: timestamp,
@@ -411,7 +417,7 @@ export async function createUPCsForPlacement(
 // ============================================================================
 
 export function updateShelfCountsInTransaction(
-  transaction: FirebaseFirestore.Transaction,
+  transaction: Transaction,
   businessId: string,
   rackId: string,
   zoneId: string,
@@ -488,12 +494,10 @@ export async function propagateShelfLocationChange(
   shelfId: string,
   shelf: Shelf,
 ) {
-  const query = db
-    .collection(`users/${businessId}/placements`)
-    .where("shelfId", "==", shelfId);
-  
+  const query = db.collection(`users/${businessId}/placements`).where("shelfId", "==", shelfId);
+
   await createPropagationTasks(
-    'shelf-location',
+    "shelf-location",
     businessId,
     shelfId,
     {
@@ -511,7 +515,7 @@ export async function propagateShelfLocationChange(
 // ============================================================================
 
 export function updateRackCountsInTransaction(
-  transaction: FirebaseFirestore.Transaction,
+  transaction: Transaction,
   businessId: string,
   zoneId: string,
   warehouseId: string,
@@ -585,40 +589,34 @@ export async function transferRackStats(
   });
 }
 
-export async function propagateRackLocationChange(
-  businessId: string,
-  rackId: string,
-  rack: Rack,
-) {
+export async function propagateRackLocationChange(businessId: string, rackId: string, rack: Rack) {
   // Create tasks for shelves
-  const shelvesQuery = db
-    .collection(`users/${businessId}/shelves`)
-    .where("rackId", "==", rackId);
-  
+  const shelvesQuery = db.collection(`users/${businessId}/shelves`).where("rackId", "==", rackId);
+
   await createPropagationTasks(
-    'rack-location',
+    "rack-location",
     businessId,
     `${rackId}-shelves`,
     {
-      collection: 'shelves',
+      collection: "shelves",
       zoneId: rack.zoneId,
       warehouseId: rack.warehouseId,
     },
     shelvesQuery,
     rack.locationVersion,
   );
-  
+
   // Create tasks for placements
   const placementsQuery = db
     .collection(`users/${businessId}/placements`)
     .where("rackId", "==", rackId);
-  
+
   await createPropagationTasks(
-    'rack-location',
+    "rack-location",
     businessId,
     `${rackId}-placements`,
     {
-      collection: 'placements',
+      collection: "placements",
       zoneId: rack.zoneId,
       warehouseId: rack.warehouseId,
     },
@@ -632,7 +630,7 @@ export async function propagateRackLocationChange(
 // ============================================================================
 
 export function updateZoneCountsInTransaction(
-  transaction: FirebaseFirestore.Transaction,
+  transaction: Transaction,
   businessId: string,
   warehouseId: string,
   delta: number,
@@ -696,56 +694,48 @@ export async function transferZoneStats(
   });
 }
 
-export async function propagateZoneLocationChange(
-  businessId: string,
-  zoneId: string,
-  zone: Zone,
-) {
+export async function propagateZoneLocationChange(businessId: string, zoneId: string, zone: Zone) {
   // Create tasks for racks
-  const racksQuery = db
-    .collection(`users/${businessId}/racks`)
-    .where("zoneId", "==", zoneId);
-  
+  const racksQuery = db.collection(`users/${businessId}/racks`).where("zoneId", "==", zoneId);
+
   await createPropagationTasks(
-    'zone-location',
+    "zone-location",
     businessId,
     `${zoneId}-racks`,
     {
-      collection: 'racks',
+      collection: "racks",
       warehouseId: zone.warehouseId,
     },
     racksQuery,
     zone.locationVersion,
   );
-  
+
   // Create tasks for shelves
-  const shelvesQuery = db
-    .collection(`users/${businessId}/shelves`)
-    .where("zoneId", "==", zoneId);
-  
+  const shelvesQuery = db.collection(`users/${businessId}/shelves`).where("zoneId", "==", zoneId);
+
   await createPropagationTasks(
-    'zone-location',
+    "zone-location",
     businessId,
     `${zoneId}-shelves`,
     {
-      collection: 'shelves',
+      collection: "shelves",
       warehouseId: zone.warehouseId,
     },
     shelvesQuery,
     zone.locationVersion,
   );
-  
+
   // Create tasks for placements
   const placementsQuery = db
     .collection(`users/${businessId}/placements`)
     .where("zoneId", "==", zoneId);
-  
+
   await createPropagationTasks(
-    'zone-location',
+    "zone-location",
     businessId,
     `${zoneId}-placements`,
     {
-      collection: 'placements',
+      collection: "placements",
       warehouseId: zone.warehouseId,
     },
     placementsQuery,
