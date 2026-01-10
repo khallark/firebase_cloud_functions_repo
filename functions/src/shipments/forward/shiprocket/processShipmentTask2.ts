@@ -179,6 +179,21 @@ export const processShipmentTask2 = onRequest(
       // ----------------------------------------------------------------------
 
       const shiprocketCfg = businessData?.integrations?.couriers?.shiprocket || {};
+      // const email = shiprocketCfg?.email;
+      // const password = shiprocketCfg?.password;
+
+      // const response = await fetch('https://apiv2.shiprocket.in/v1/external/auth/login', {
+      //   method: 'POST',
+      //   headers: { 'Content-Type': 'application/json' },
+      //   body: JSON.stringify({ email, password }),
+      // });
+
+      // if(!response.ok) {
+
+      // }
+      // const text = await response.json();
+      // const srToken = json.
+
       const srToken =
         shiprocketCfg?.accessToken ||
         shiprocketCfg?.token ||
@@ -278,6 +293,7 @@ export const processShipmentTask2 = onRequest(
         srShipmentId = verdict.shipmentId ?? orderCreateJson?.shipment_id;
 
         if (!srShipmentId) {
+          console.log(orderCreateJson);
           // This shouldn't happen with successful verdict, but handle gracefully
           const failure = await handleJobFailure({
             businessId,
@@ -387,6 +403,7 @@ export const processShipmentTask2 = onRequest(
       const courierId = node?.courier_company_id ?? null;
 
       if (!awbCode) {
+        console.log(awbJson);
         // This shouldn't happen with successful verdict, but handle gracefully
         const failure = await handleJobFailure({
           businessId,

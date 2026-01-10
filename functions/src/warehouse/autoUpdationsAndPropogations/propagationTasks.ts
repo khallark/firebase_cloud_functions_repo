@@ -77,6 +77,7 @@ async function processShelfLocationChunk(task: PropagationTask) {
   } = task;
 
   const trackerRef = db.doc(`users/${businessId}/propagation_trackers/${propagationId}`);
+  let affectedCount = 0;
 
   try {
     // Check if this propagation is still valid (version check)
@@ -97,7 +98,7 @@ async function processShelfLocationChunk(task: PropagationTask) {
     // Query placements for this chunk
     const offset = chunkIndex * chunkSize;
 
-    const placements = await db
+    const docs = await db
       .collection(`users/${businessId}/placements`)
       .where("shelfId", "==", shelfId)
       .orderBy("__name__")
@@ -105,15 +106,15 @@ async function processShelfLocationChunk(task: PropagationTask) {
       .limit(chunkSize)
       .get();
 
-    if (placements.empty) {
-      await trackerRef.update({
-        chunksCompleted: FieldValue.increment(1),
-      });
+    affectedCount = docs.size;
+
+    if (docs.empty) {
+      await trackerRef.update({ chunksCompleted: FieldValue.increment(1) });
       return;
     }
 
     // Update placements
-    const updates = placements.docs.map((doc) => ({
+    const updates = docs.docs.map((doc) => ({
       ref: doc.ref,
       data: {
         rackId: data.rackId,
@@ -124,27 +125,34 @@ async function processShelfLocationChunk(task: PropagationTask) {
 
     await batchedUpdate(updates);
 
-    // Update tracker
-    await trackerRef.update({
-      chunksCompleted: FieldValue.increment(1),
-      processedDocuments: FieldValue.increment(placements.size),
-    });
+    await db.runTransaction(async (tx) => {
+      const snap = await tx.get(trackerRef);
+      const tracker = snap.data() as PropagationTracker;
 
-    // Check if all chunks are done
-    const tracker = (await trackerRef.get()).data() as PropagationTracker;
-    if (tracker.chunksCompleted === tracker.chunksTotal) {
-      await trackerRef.update({
-        status: "completed",
-        completedAt: Timestamp.now(),
+      if (tracker.status !== "in_progress") {
+        return;
+      }
+
+      const newCompleted = tracker.chunksCompleted + 1;
+
+      tx.update(trackerRef, {
+        chunksCompleted: newCompleted,
+        processedDocuments: FieldValue.increment(docs.size),
       });
-      console.log(`Propagation ${propagationId} completed successfully`);
-    }
+
+      if (newCompleted === tracker.chunksTotal) {
+        tx.update(trackerRef, {
+          status: "completed",
+          completedAt: Timestamp.now(),
+        });
+      }
+    });
   } catch (error: any) {
     console.error(`Chunk ${chunkIndex} failed:`, error);
 
     await trackerRef.update({
       chunksFailed: FieldValue.increment(1),
-      failedDocuments: FieldValue.increment(chunkSize),
+      failedDocuments: FieldValue.increment(affectedCount),
       lastError: error.message,
       status: "failed",
     });
@@ -154,12 +162,18 @@ async function processShelfLocationChunk(task: PropagationTask) {
 }
 
 async function processRackLocationChunk(task: PropagationTask) {
-  const { businessId, data, chunkIndex, chunkSize, propagationId, version } = task;
-
-  // Extract actual rackId from entityId (format: "rackId-shelves" or "rackId-placements")
-  const [rackId] = task.entityId.split("-");
+  const {
+    businessId,
+    entityId: rackId,
+    data,
+    chunkIndex,
+    chunkSize,
+    propagationId,
+    version,
+  } = task;
 
   const trackerRef = db.doc(`users/${businessId}/propagation_trackers/${propagationId}`);
+  let affectedCount = 0;
 
   try {
     if (version !== undefined) {
@@ -185,6 +199,8 @@ async function processRackLocationChunk(task: PropagationTask) {
       .limit(chunkSize)
       .get();
 
+    affectedCount = docs.size;
+
     if (docs.empty) {
       await trackerRef.update({ chunksCompleted: FieldValue.increment(1) });
       return;
@@ -200,23 +216,33 @@ async function processRackLocationChunk(task: PropagationTask) {
 
     await batchedUpdate(updates);
 
-    await trackerRef.update({
-      chunksCompleted: FieldValue.increment(1),
-      processedDocuments: FieldValue.increment(docs.size),
-    });
+    await db.runTransaction(async (tx) => {
+      const snap = await tx.get(trackerRef);
+      const tracker = snap.data() as PropagationTracker;
 
-    const tracker = (await trackerRef.get()).data() as PropagationTracker;
-    if (tracker.chunksCompleted === tracker.chunksTotal) {
-      await trackerRef.update({
-        status: "completed",
-        completedAt: Timestamp.now(),
+      if (tracker.status !== "in_progress") {
+        return;
+      }
+
+      const newCompleted = tracker.chunksCompleted + 1;
+
+      tx.update(trackerRef, {
+        chunksCompleted: newCompleted,
+        processedDocuments: FieldValue.increment(docs.size),
       });
-    }
+
+      if (newCompleted === tracker.chunksTotal) {
+        tx.update(trackerRef, {
+          status: "completed",
+          completedAt: Timestamp.now(),
+        });
+      }
+    });
   } catch (error: any) {
     console.error(`Chunk ${chunkIndex} failed:`, error);
     await trackerRef.update({
       chunksFailed: FieldValue.increment(1),
-      failedDocuments: FieldValue.increment(chunkSize),
+      failedDocuments: FieldValue.increment(affectedCount),
       lastError: error.message,
       status: "failed",
     });
@@ -225,10 +251,18 @@ async function processRackLocationChunk(task: PropagationTask) {
 }
 
 async function processZoneLocationChunk(task: PropagationTask) {
-  const { businessId, data, chunkIndex, chunkSize, propagationId, version } = task;
+  const {
+    businessId,
+    entityId: zoneId,
+    data,
+    chunkIndex,
+    chunkSize,
+    propagationId,
+    version,
+  } = task;
 
-  const [zoneId] = task.entityId.split("-");
   const trackerRef = db.doc(`users/${businessId}/propagation_trackers/${propagationId}`);
+  let affectedCount = 0;
 
   try {
     if (version !== undefined) {
@@ -254,6 +288,8 @@ async function processZoneLocationChunk(task: PropagationTask) {
       .limit(chunkSize)
       .get();
 
+    affectedCount = docs.size;
+
     if (docs.empty) {
       await trackerRef.update({ chunksCompleted: FieldValue.increment(1) });
       return;
@@ -268,23 +304,33 @@ async function processZoneLocationChunk(task: PropagationTask) {
 
     await batchedUpdate(updates);
 
-    await trackerRef.update({
-      chunksCompleted: FieldValue.increment(1),
-      processedDocuments: FieldValue.increment(docs.size),
-    });
+    await db.runTransaction(async (tx) => {
+      const snap = await tx.get(trackerRef);
+      const tracker = snap.data() as PropagationTracker;
 
-    const tracker = (await trackerRef.get()).data() as PropagationTracker;
-    if (tracker.chunksCompleted === tracker.chunksTotal) {
-      await trackerRef.update({
-        status: "completed",
-        completedAt: Timestamp.now(),
+      if (tracker.status !== "in_progress") {
+        return;
+      }
+
+      const newCompleted = tracker.chunksCompleted + 1;
+
+      tx.update(trackerRef, {
+        chunksCompleted: newCompleted,
+        processedDocuments: FieldValue.increment(docs.size),
       });
-    }
+
+      if (newCompleted === tracker.chunksTotal) {
+        tx.update(trackerRef, {
+          status: "completed",
+          completedAt: Timestamp.now(),
+        });
+      }
+    });
   } catch (error: any) {
     console.error(`Chunk ${chunkIndex} failed:`, error);
     await trackerRef.update({
       chunksFailed: FieldValue.increment(1),
-      failedDocuments: FieldValue.increment(chunkSize),
+      failedDocuments: FieldValue.increment(affectedCount),
       lastError: error.message,
       status: "failed",
     });

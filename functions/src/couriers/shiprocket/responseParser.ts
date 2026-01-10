@@ -17,10 +17,10 @@ interface ShiprocketResponseEvaluation {
  */
 export function evaluateShiprocketResponse(sr: any): ShiprocketResponseEvaluation {
   const msgFields = [
-    sr?.message,
-    sr?.msg,
-    sr?.error,
-    sr?.error_message,
+    sr?.message?.trim(),
+    sr?.msg?.trim(),
+    sr?.error?.trim(),
+    sr?.error_message?.trim(),
     sr?.errors ? JSON.stringify(sr?.errors) : "",
   ]
     .filter((x) => typeof x === "string" && x.length)
@@ -29,7 +29,7 @@ export function evaluateShiprocketResponse(sr: any): ShiprocketResponseEvaluatio
   const rawMsg = msgFields || "";
 
   // Success shape seen in docs: { order_id, shipment_id, status: "NEW", status_code: 1, ... }
-  const looksSuccess = !("status_code" in (sr ?? {})) || sr?.status_code === 1;
+  const looksSuccess = sr?.status_code === 1 || (!("status_code" in (sr ?? {})) && !rawMsg);
 
   if (looksSuccess) {
     return {

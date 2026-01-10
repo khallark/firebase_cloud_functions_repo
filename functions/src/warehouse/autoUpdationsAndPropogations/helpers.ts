@@ -22,6 +22,7 @@ import {
 import { db } from "../../firebaseAdmin";
 import { chunkArray } from "../../helpers";
 import { enqueuePropagationTask } from "../../services";
+import { customAlphabet } from "nanoid";
 
 const increment = FieldValue.increment;
 
@@ -200,6 +201,7 @@ async function createPropagationTasks(
     .collection(`users/${businessId}/propagation_trackers`)
     .where("entityId", "==", entityId)
     .where("type", "==", type)
+    .where("collection", "==", data.collection)
     .where("status", "in", ["pending", "in_progress"])
     .limit(1)
     .get();
@@ -221,15 +223,16 @@ async function createPropagationTasks(
   const chunkSize = 500;
   const totalChunks = Math.ceil(totalDocs / chunkSize);
 
-  // Create unique propagation ID
-  const propagationId = `${type}-${entityId}-${Date.now()}`;
+  // Create unique and deterministic propagation ID
+  const propagationId = `${businessId}__${type}__${entityId}__${data.collection}__v${version ?? 0}`;
 
   // Create tracker document
-  await db.doc(`users/${businessId}/propagation_trackers/${propagationId}`).set({
+  const doc: PropagationTracker = {
     id: propagationId,
     type,
     businessId,
     entityId,
+    collection: data.collection,
     status: "pending",
     totalDocuments: totalDocs,
     processedDocuments: 0,
@@ -241,7 +244,8 @@ async function createPropagationTasks(
     completedAt: null,
     lastError: null,
     version: version || 0,
-  } as PropagationTracker);
+  };
+  await db.doc(`users/${businessId}/propagation_trackers/${propagationId}`).set(doc);
 
   // Enqueue tasks for each chunk
   const tasks: Promise<void>[] = [];
@@ -596,7 +600,7 @@ export async function propagateRackLocationChange(businessId: string, rackId: st
   await createPropagationTasks(
     "rack-location",
     businessId,
-    `${rackId}-shelves`,
+    rackId,
     {
       collection: "shelves",
       zoneId: rack.zoneId,
@@ -614,7 +618,7 @@ export async function propagateRackLocationChange(businessId: string, rackId: st
   await createPropagationTasks(
     "rack-location",
     businessId,
-    `${rackId}-placements`,
+    rackId,
     {
       collection: "placements",
       zoneId: rack.zoneId,
@@ -701,7 +705,7 @@ export async function propagateZoneLocationChange(businessId: string, zoneId: st
   await createPropagationTasks(
     "zone-location",
     businessId,
-    `${zoneId}-racks`,
+    zoneId,
     {
       collection: "racks",
       warehouseId: zone.warehouseId,
@@ -716,7 +720,7 @@ export async function propagateZoneLocationChange(businessId: string, zoneId: st
   await createPropagationTasks(
     "zone-location",
     businessId,
-    `${zoneId}-shelves`,
+    zoneId,
     {
       collection: "shelves",
       warehouseId: zone.warehouseId,
@@ -733,7 +737,7 @@ export async function propagateZoneLocationChange(businessId: string, zoneId: st
   await createPropagationTasks(
     "zone-location",
     businessId,
-    `${zoneId}-placements`,
+    zoneId,
     {
       collection: "placements",
       warehouseId: zone.warehouseId,
