@@ -9,6 +9,7 @@ import {
   RackLog,
   Shelf,
   ShelfLog,
+  UPC,
   Zone,
   ZoneLog,
 } from "../../config/types";
@@ -295,7 +296,6 @@ export async function createMovement(
   const movement: Movement = {
     id: ref.id,
     productId: source!.productId,
-    productSKU: source!.productSKU,
     type,
     from: from
       ? {
@@ -357,6 +357,53 @@ export function updateLocationStatsInTransaction(
   transaction.update(db.doc(`users/${businessId}/warehouses/${placement.warehouseId}`), {
     "stats.totalProducts": increment(quantityDelta),
   });
+}
+
+/**
+ * Creates UPC documents for a placement
+ * Assumes count <= 500 (transaction limit)
+ */
+export async function createUPCsForPlacement(
+  businessId: string,
+  placement: Placement,
+  count: number,
+  userId: string,
+): Promise<void> {
+  if (count <= 0) return;
+  if (count > 500) {
+    console.warn(`UPC count ${count} exceeds 500, skipping UPC creation`);
+    return;
+  }
+
+  const batch = db.batch();
+  const timestamp = Timestamp.now();
+
+  for (let i = 0; i < count; i++) {
+    const upcRef = db.collection(`users/${businessId}/upcs`).doc();
+    
+    const upc: UPC = {
+      id: upcRef.id,
+      createdAt: timestamp,
+      updatedAt: timestamp,
+      createdBy: userId,
+      updatedBy: userId,
+      orderName: null,
+      putAway: null,
+      location: {
+        productId: placement.productId,
+        warehouseId: placement.warehouseId,
+        zoneId: placement.zoneId,
+        rackId: placement.rackId,
+        shelfId: placement.shelfId,
+        placementId: placement.id,
+      },
+    };
+
+    batch.set(upcRef, upc);
+  }
+
+  await batch.commit();
+  console.log(`Created ${count} UPCs for placement ${placement.id}`);
 }
 
 // ============================================================================

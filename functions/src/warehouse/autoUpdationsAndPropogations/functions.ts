@@ -8,6 +8,7 @@ import {
   createPlacementLog,
   createRackLog,
   createShelfLog,
+  createUPCsForPlacement,
   createZoneLog,
   getChanges,
   propagateRackLocationChange,
@@ -25,7 +26,7 @@ import { db } from "../../firebaseAdmin";
 import { FieldValue, Timestamp } from "firebase-admin/firestore";
 
 // ============================================================================
-// PLACEMENT TRIGGERS → Update Location Stats + Create Logs
+// PLACEMENT TRIGGERS → Update Location Stats + Create Logs + Create UPCs
 // ============================================================================
 
 export const onPlacementWritten = onDocumentWritten(
@@ -37,6 +38,7 @@ export const onPlacementWritten = onDocumentWritten(
 
     // Created → inbound
     if (!before && after) {
+      // Stats + Movement + Log in transaction
       await db.runTransaction(async (transaction) => {
         // Update stats
         updateLocationStatsInTransaction(transaction, businessId, after, after.quantity);
@@ -61,19 +63,25 @@ export const onPlacementWritten = onDocumentWritten(
         });
         transaction.set(logRef, log);
       });
-    }
 
-    // Deleted → outbound
-    else if (before && !after) {
-      // Note: Stats update and movement creation commented out as per original
-      // The movement record would serve as the audit trail for deletions
-      // Cannot create log in deleted document's subcollection
+      // Create UPCs if requested (outside transaction due to potential size)
+      if (after.createUPCs) {
+        await createUPCsForPlacement(
+          businessId,
+          after,
+          after.quantity,
+          after.createdBy,
+        );
+      }
     }
 
     // Updated → adjustment only (shelfId can't change with composite ID)
     else if (before && after) {
       const diff = after.quantity - before.quantity;
+
+      // Handle quantity change
       if (diff !== 0) {
+        // Stats + Movement + Log in transaction
         await db.runTransaction(async (transaction) => {
           // Update stats
           updateLocationStatsInTransaction(transaction, businessId, after, diff);
@@ -98,6 +106,16 @@ export const onPlacementWritten = onDocumentWritten(
           });
           transaction.set(logRef, log);
         });
+      }
+
+      // ✅ Create UPCs ONLY if createUPCs flag changed AND diff is positive
+      if (before.createUPCs !== after.createUPCs && diff > 0) {
+        await createUPCsForPlacement(
+          businessId,
+          after,
+          diff,
+          after.updatedBy,
+        );
       }
     }
   },

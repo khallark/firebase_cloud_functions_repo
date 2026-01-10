@@ -2,7 +2,7 @@
 
 import { Timestamp } from "firebase-admin/firestore";
 
-// /{businessId}/warehouses/{warehouseId}
+// users/{businessId}/warehouses/{warehouseId}
 export interface Warehouse {
   id: string;
   name: string;
@@ -28,7 +28,7 @@ export interface Warehouse {
   nameVersion: number;
 }
 
-// /{businessId}/zones/{zoneId}
+// users/{businessId}/zones/{zoneId}
 export interface Zone {
   id: string;
   name: string;
@@ -53,7 +53,7 @@ export interface Zone {
   nameVersion: number;
 }
 
-// /{businessId}/zones/{zoneId}/logs/{logsId}
+// users/{businessId}/zones/{zoneId}/logs/{logsId}
 export interface ZoneLog {
   type: "created" | "updated" | "deleted" | "restored";
   changes: {
@@ -64,7 +64,7 @@ export interface ZoneLog {
   userId: string;
 }
 
-// /{businessId}/racks/{rackId}
+// users/{businessId}/racks/{rackId}
 export interface Rack {
   id: string;
   name: string;
@@ -90,7 +90,7 @@ export interface Rack {
   nameVersion: number;
 }
 
-// /{businessId}/racks/{rackId}/logs/{logId}
+// users/{businessId}/racks/{rackId}/logs/{logId}
 export interface RackLog {
   type: "created" | "updated" | "deleted" | "restored" | "moved";
   changes: {
@@ -102,7 +102,7 @@ export interface RackLog {
   userId: string;
 }
 
-// /{businessId}/shelves/{shelfId}
+// users/{businessId}/shelves/{shelfId}
 export interface Shelf {
   id: string;
   name: string;
@@ -131,7 +131,7 @@ export interface Shelf {
   nameVersion: number;
 }
 
-// /{businessId}/shelves/{shelfId}/logs/{logId}
+// users/{businessId}/shelves/{shelfId}/logs/{logId}
 export interface ShelfLog {
   type: "created" | "updated" | "deleted" | "restored" | "moved";
   changes: {
@@ -143,19 +143,18 @@ export interface ShelfLog {
   userId: string;
 }
 
-// /{businessId}/placements/{placementId}
+// users/{businessId}/placements/{placementId}
 // placementId = `${productId}_${shelfId}` (composite ID)
 export interface Placement {
   id: string;
+  createUPCs: boolean;
   quantity: number;
   createdAt: Timestamp;
   updatedAt: Timestamp;
   createdBy: string;
   updatedBy: string;
-  locationCode: string | null;
 
   productId: string;
-  productSKU: string;
 
   warehouseId: string;
 
@@ -169,7 +168,42 @@ export interface Placement {
   lastMovementReference: string | null;
 }
 
-// /{businessId}/placements/{placementId}/logs/{logId}
+// users/{businessId}/upcs/{upcId}
+export type UPC = {
+  id: string;
+  createdAt: Timestamp;
+  updatedAt: Timestamp;
+  createdBy: string;
+  updatedBy: string;
+
+  orderName: null;
+
+  putAway: null;
+
+  location: {
+    productId: string;
+    warehouseId: string;
+    zoneId: string;
+    rackId: string;
+    shelfId: string;
+    placementId: string;
+  }
+
+} | {
+  id: string;
+  createdAt: Timestamp;
+  updatedAt: Timestamp;
+  createdBy: string;
+  updatedBy: string;
+
+  orderName: string;
+
+  putAway: 'inbound' | 'outbound';
+
+  location: null;
+}
+
+// users/{businessId}/placements/{placementId}/logs/{logId}
 export interface PlacementLog {
   type: "added" | "removed" | "quantity_adjusted";
   quantity: number;
@@ -181,12 +215,11 @@ export interface PlacementLog {
   userId: string;
 }
 
-// /{businessId}/movements/{movementId}
+// users/{businessId}/movements/{movementId}
 export interface Movement {
   id: string;
 
   productId: string;
-  productSKU: string;
 
   type: "transfer" | "inbound" | "outbound" | "adjustment";
 
