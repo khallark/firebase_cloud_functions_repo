@@ -308,30 +308,30 @@ export async function createMovement(
     type,
     from: from
       ? {
-        shelfId: from.shelfId,
-        rackId: from.rackId,
-        zoneId: from.zoneId,
-        warehouseId: from.warehouseId,
-      }
+          shelfId: from.shelfId,
+          rackId: from.rackId,
+          zoneId: from.zoneId,
+          warehouseId: from.warehouseId,
+        }
       : {
-        shelfId: null,
-        rackId: null,
-        zoneId: null,
-        warehouseId: null,
-      },
+          shelfId: null,
+          rackId: null,
+          zoneId: null,
+          warehouseId: null,
+        },
     to: to
       ? {
-        shelfId: to.shelfId,
-        rackId: to.rackId,
-        zoneId: to.zoneId,
-        warehouseId: to.warehouseId,
-      }
+          shelfId: to.shelfId,
+          rackId: to.rackId,
+          zoneId: to.zoneId,
+          warehouseId: to.warehouseId,
+        }
       : {
-        shelfId: null,
-        rackId: null,
-        zoneId: null,
-        warehouseId: null,
-      },
+          shelfId: null,
+          rackId: null,
+          zoneId: null,
+          warehouseId: null,
+        },
     quantity,
     reason: source!.lastMovementReason ?? "",
     reference: source!.lastMovementReference ?? "",
@@ -512,6 +512,23 @@ export async function propagateShelfLocationChange(
     placementsQuery,
     shelf.locationVersion,
   );
+
+  // Create tasks for upcs
+  const upcsQuery = db.collection(`users/${businessId}/upcs`).where("shelfId", "==", shelfId);
+
+  await createPropagationTasks(
+    "shelf-location",
+    businessId,
+    shelfId,
+    {
+      collection: "upcs",
+      rackId: shelf.rackId,
+      zoneId: shelf.zoneId,
+      warehouseId: shelf.warehouseId,
+    },
+    upcsQuery,
+    shelf.locationVersion,
+  );
 }
 
 // ============================================================================
@@ -625,6 +642,22 @@ export async function propagateRackLocationChange(businessId: string, rackId: st
       warehouseId: rack.warehouseId,
     },
     placementsQuery,
+    rack.locationVersion,
+  );
+
+  // Create tasks for upcs
+  const upcsQuery = db.collection(`users/${businessId}/upcs`).where("rackId", "==", rackId);
+
+  await createPropagationTasks(
+    "rack-location",
+    businessId,
+    rackId,
+    {
+      collection: "upcs",
+      zoneId: rack.zoneId,
+      warehouseId: rack.warehouseId,
+    },
+    upcsQuery,
     rack.locationVersion,
   );
 }
@@ -743,6 +776,21 @@ export async function propagateZoneLocationChange(businessId: string, zoneId: st
       warehouseId: zone.warehouseId,
     },
     placementsQuery,
+    zone.locationVersion,
+  );
+
+  // Create tasks for upcs
+  const upcsQuery = db.collection(`users/${businessId}/upcs`).where("zoneId", "==", zoneId);
+
+  await createPropagationTasks(
+    "zone-location",
+    businessId,
+    zoneId,
+    {
+      collection: "upcs",
+      warehouseId: zone.warehouseId,
+    },
+    upcsQuery,
     zone.locationVersion,
   );
 }
