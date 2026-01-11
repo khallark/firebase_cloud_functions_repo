@@ -73,14 +73,6 @@ export const PROPAGATION_QUEUE = "propagation-queue";
 export const PROJECT_ID = process.env.GCLOUD_PROJECT || process.env.GCP_PROJECT;
 export const LOCATION = process.env.CLOUD_TASKS_LOCATION || "asia-south1";
 
-/**
- * Sanitizes a string to be used as a Cloud Tasks task ID
- * Cloud Tasks only allows: alphanumeric, hyphens, and underscores
- */
-function sanitizeTaskId(id: string): string {
-  return id.replace(/[^a-zA-Z0-9_-]/g, "-");
-}
-
 export async function enqueuePropagationTask(task: any, taskId?: string): Promise<void> {
   if (!PROJECT_ID) {
     throw new Error("PROJECT_ID not set");
@@ -103,8 +95,7 @@ export async function enqueuePropagationTask(task: any, taskId?: string): Promis
 
   // Add task name for deduplication if provided
   if (taskId) {
-    const sanitizedTaskId = sanitizeTaskId(taskId);
-    taskPayload.name = client.taskPath(PROJECT_ID, LOCATION, PROPAGATION_QUEUE, sanitizedTaskId);
+    taskPayload.name = client.taskPath(PROJECT_ID, LOCATION, PROPAGATION_QUEUE, taskId);
   }
 
   try {

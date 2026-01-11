@@ -22,7 +22,6 @@ import {
 import { db } from "../../firebaseAdmin";
 import { chunkArray } from "../../helpers";
 import { enqueuePropagationTask } from "../../services";
-import { customAlphabet } from "nanoid";
 
 const increment = FieldValue.increment;
 
@@ -216,7 +215,7 @@ async function createPropagationTasks(
   const totalDocs = snapshot.size;
 
   if (totalDocs === 0) {
-    console.log(`No documents to propagate for ${type} ${entityId}`);
+    console.log(`No documents to propagate for ${type} ${entityId} ${data.collection}`);
     return;
   }
 
@@ -309,30 +308,30 @@ export async function createMovement(
     type,
     from: from
       ? {
-          shelfId: from.shelfId,
-          rackId: from.rackId,
-          zoneId: from.zoneId,
-          warehouseId: from.warehouseId,
-        }
+        shelfId: from.shelfId,
+        rackId: from.rackId,
+        zoneId: from.zoneId,
+        warehouseId: from.warehouseId,
+      }
       : {
-          shelfId: null,
-          rackId: null,
-          zoneId: null,
-          warehouseId: null,
-        },
+        shelfId: null,
+        rackId: null,
+        zoneId: null,
+        warehouseId: null,
+      },
     to: to
       ? {
-          shelfId: to.shelfId,
-          rackId: to.rackId,
-          zoneId: to.zoneId,
-          warehouseId: to.warehouseId,
-        }
+        shelfId: to.shelfId,
+        rackId: to.rackId,
+        zoneId: to.zoneId,
+        warehouseId: to.warehouseId,
+      }
       : {
-          shelfId: null,
-          rackId: null,
-          zoneId: null,
-          warehouseId: null,
-        },
+        shelfId: null,
+        rackId: null,
+        zoneId: null,
+        warehouseId: null,
+      },
     quantity,
     reason: source!.lastMovementReason ?? "",
     reference: source!.lastMovementReference ?? "",
@@ -399,14 +398,12 @@ export async function createUPCsForPlacement(
       updatedBy: userId,
       orderName: null,
       putAway: null,
-      location: {
-        productId: placement.productId,
-        warehouseId: placement.warehouseId,
-        zoneId: placement.zoneId,
-        rackId: placement.rackId,
-        shelfId: placement.shelfId,
-        placementId: placement.id,
-      },
+      productId: placement.productId,
+      warehouseId: placement.warehouseId,
+      zoneId: placement.zoneId,
+      rackId: placement.rackId,
+      shelfId: placement.shelfId,
+      placementId: placement.id,
     };
 
     batch.set(upcRef, upc);
@@ -498,18 +495,21 @@ export async function propagateShelfLocationChange(
   shelfId: string,
   shelf: Shelf,
 ) {
-  const query = db.collection(`users/${businessId}/placements`).where("shelfId", "==", shelfId);
+  const placementsQuery = db
+    .collection(`users/${businessId}/placements`)
+    .where("shelfId", "==", shelfId);
 
   await createPropagationTasks(
     "shelf-location",
     businessId,
     shelfId,
     {
+      collection: "placements",
       rackId: shelf.rackId,
       zoneId: shelf.zoneId,
       warehouseId: shelf.warehouseId,
     },
-    query,
+    placementsQuery,
     shelf.locationVersion,
   );
 }
