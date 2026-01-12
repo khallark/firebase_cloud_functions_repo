@@ -7,7 +7,7 @@ import {
 } from "../../helpers";
 import { sendDispatchedOrderWhatsAppMessage } from "../../services";
 import { db } from "../../firebaseAdmin";
-import { FieldValue, Timestamp, WriteBatch } from "firebase-admin/firestore";
+import { FieldValue, Timestamp } from "firebase-admin/firestore";
 
 export const processFulfillmentTask = onRequest(
   { cors: true, timeoutSeconds: 60, secrets: [TASKS_SECRET] },
