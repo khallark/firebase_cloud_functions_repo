@@ -12,6 +12,7 @@ import type {
   ShelfLog,
   RackLog,
   ZoneLog,
+  UPC,
 } from "../../config/types";
 import {
   createMovement,
@@ -34,6 +35,36 @@ import {
 import { db } from "../../firebaseAdmin";
 import { FieldValue, Timestamp } from "firebase-admin/firestore";
 import { TASKS_SECRET } from "../../config";
+
+export const onUpcWritten = onDocumentWritten(
+  {
+    document: "users/{businessId}/upcs/{upcId}",
+    secrets: [TASKS_SECRET],
+    memory: "256MiB",
+    timeoutSeconds: 30,
+  },
+  async (event) => {
+    const before = event.data?.before?.data() as UPC | undefined;
+    const after = event.data?.after?.data() as UPC | undefined;
+    const { businessId } = event.params;
+
+    if (before && after) {
+      if (before.putAway === after.putAway) return;
+      await db.runTransaction(async (transaction) => {
+        if (before.putAway === "none") {
+          transaction.update(db.doc(`users/${businessId}/placements/${before.placementId}`), {
+            quantity: FieldValue.increment(-1),
+          });
+        }
+        if (after.putAway === "none") {
+          transaction.update(db.doc(`users/${businessId}/placements/${after.placementId}`), {
+            quantity: FieldValue.increment(1),
+          });
+        }
+      });
+    }
+  },
+);
 
 // ============================================================================
 // PLACEMENT TRIGGERS → Update Location Stats + Create Logs + Create UPCs
@@ -715,7 +746,7 @@ export const onWarehouseWritten = onDocumentWritten(
   {
     document: "users/{businessId}/warehouses/{warehouseId}",
     secrets: [TASKS_SECRET],
-    memory: "128MiB", // Light - minimal operations
+    memory: "256MiB", // Light - minimal operations
     timeoutSeconds: 30, // 30 seconds
   },
   async (event) => {

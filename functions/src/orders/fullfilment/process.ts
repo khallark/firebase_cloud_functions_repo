@@ -1,5 +1,5 @@
 import { onRequest } from "firebase-functions/v2/https";
-import { SHARED_STORE_ID, TASKS_SECRET } from "../../config";
+import { SHARED_STORE_ID, TASKS_SECRET, UPC } from "../../config";
 import {
   BusinessIsAuthorisedToProcessThisOrder,
   maybeCompleteSummary,
@@ -7,7 +7,7 @@ import {
 } from "../../helpers";
 import { sendDispatchedOrderWhatsAppMessage } from "../../services";
 import { db } from "../../firebaseAdmin";
-import { FieldValue, Timestamp } from "firebase-admin/firestore";
+import { FieldValue, Timestamp, WriteBatch } from "firebase-admin/firestore";
 
 export const processFulfillmentTask = onRequest(
   { cors: true, timeoutSeconds: 60, secrets: [TASKS_SECRET] },
@@ -39,11 +39,10 @@ export const processFulfillmentTask = onRequest(
         .doc(summaryId);
       const jobRef = summaryRef.collection("jobs").doc(jobId);
 
-      // ✅ Get job first to see if we need cleanup
+      // Get job first to see if we need cleanup
       const jobSnap = await jobRef.get();
 
       if (!jobSnap.exists) {
-        // Idempotency: job was deleted or never created
         res.json({ noop: true });
         return;
       }
@@ -59,27 +58,30 @@ export const processFulfillmentTask = onRequest(
         return status === 408 || status === 429 || (status >= 500 && status <= 599);
       }
 
-      // ✅ Helper function to mark job as failed and update summary
+      // ✅ Helper function to mark job as failed (uses batch for atomicity)
       const markJobFailed = async (errorCode: string, errorMessage: string) => {
-        await Promise.all([
-          jobRef.set(
-            {
-              status: "failed",
-              errorCode,
-              errorMessage: errorMessage.slice(0, 400),
-              updatedAt: FieldValue.serverTimestamp(),
-            },
-            { merge: true },
-          ),
-          summaryRef.update({
-            processing: FieldValue.increment(-1),
-            failed: FieldValue.increment(1),
-          }),
-        ]);
+        const batch = db.batch();
+
+        batch.set(
+          jobRef,
+          {
+            status: "failed",
+            errorCode,
+            errorMessage: errorMessage.slice(0, 400),
+            updatedAt: FieldValue.serverTimestamp(),
+          },
+          { merge: true },
+        );
+
+        batch.update(summaryRef, {
+          processing: FieldValue.increment(-1),
+          failed: FieldValue.increment(1),
+        });
+
+        await batch.commit();
         await maybeCompleteSummary(summaryRef);
       };
 
-      // ✅ Now wrap all validation in try-catch
       try {
         const shopRef = db.collection("accounts").doc(shop);
         const orderRef = shopRef.collection("orders").doc(String(jobId));
@@ -109,40 +111,50 @@ export const processFulfillmentTask = onRequest(
 
         const orderData = order.data() as any;
 
-        // ✅ NEW: Check if order is already fulfilled
+        // Check if order is already fulfilled
         const fulfillmentStatus =
           orderData?.raw?.fulfillment_status || orderData?.fulfillmentStatus;
+
         if (fulfillmentStatus === "fulfilled" || fulfillmentStatus === "partial") {
-          // Order already fulfilled - mark job as success with nothingToDo flag
-          await Promise.all([
-            jobRef.set(
-              {
-                status: "success",
-                fulfillmentId: null,
-                nothingToDo: true,
-                skipReason: "already_fulfilled",
-                errorCode: FieldValue.delete(),
-                errorMessage: FieldValue.delete(),
-                updatedAt: FieldValue.serverTimestamp(),
-              },
-              { merge: true },
-            ),
-            summaryRef.update({
-              success: FieldValue.increment(1),
-            }),
-            orderRef.set(
-              {
-                customStatus: "Dispatched",
-                lastStatusUpdate: FieldValue.serverTimestamp(),
-                customStatusesLogs: FieldValue.arrayUnion({
-                  status: "Dispatched",
-                  createdAt: Timestamp.now(),
-                  remarks: `The order's shipment was dispatched from the warehouse.`,
-                }),
-              },
-              { merge: true },
-            ),
-          ]);
+          // Use batch for atomic updates
+          const batch = db.batch();
+
+          batch.set(
+            jobRef,
+            {
+              status: "success",
+              fulfillmentId: null,
+              nothingToDo: true,
+              skipReason: "already_fulfilled",
+              errorCode: FieldValue.delete(),
+              errorMessage: FieldValue.delete(),
+              updatedAt: FieldValue.serverTimestamp(),
+            },
+            { merge: true },
+          );
+
+          batch.update(summaryRef, {
+            success: FieldValue.increment(1),
+          });
+
+          batch.set(
+            orderRef,
+            {
+              customStatus: "Dispatched",
+              lastStatusUpdate: FieldValue.serverTimestamp(),
+              customStatusesLogs: FieldValue.arrayUnion({
+                status: "Dispatched",
+                createdAt: Timestamp.now(),
+                remarks: `The order's shipment was dispatched from the warehouse.`,
+              }),
+            },
+            { merge: true },
+          );
+
+          await batch.commit();
+
+          // Clean up UPCs after successful batch commit
+          await cleanupOrderUPCs(businessId, orderId);
 
           await maybeCompleteSummary(summaryRef);
 
@@ -154,7 +166,7 @@ export const processFulfillmentTask = onRequest(
           return;
         }
 
-        // Check if the shop is exceptional one
+        // Check authorization for shared store
         if (shop === SHARED_STORE_ID) {
           const businessData = businessDoc.data();
           const vendorName = businessData?.vendorName;
@@ -183,52 +195,65 @@ export const processFulfillmentTask = onRequest(
 
         const MAX_ATTEMPTS = Number(process.env.FULFILLMENT_QUEUE_MAX_ATTEMPTS || 3);
 
-        // ✅ Mark processing + attempt++
-        await Promise.all([
-          jobRef.set(
-            {
-              status: "processing",
-              attempts: FieldValue.increment(1),
-              updatedAt: FieldValue.serverTimestamp(),
-            },
-            { merge: true },
-          ),
-          summaryRef.update({ processing: FieldValue.increment(1) }),
-        ]);
+        // Mark processing (atomic batch)
+        const processingBatch = db.batch();
+        processingBatch.set(
+          jobRef,
+          {
+            status: "processing",
+            attempts: FieldValue.increment(1),
+            updatedAt: FieldValue.serverTimestamp(),
+          },
+          { merge: true },
+        );
+        processingBatch.update(summaryRef, {
+          processing: FieldValue.increment(1),
+        });
+        await processingBatch.commit();
 
-        // ✅ Try fulfillment
+        // Try fulfillment
         try {
           const result = await fulfillOrderOnShopify(shop, accessToken, orderId, awb, courier);
 
-          await Promise.all([
-            jobRef.set(
-              {
-                status: "success",
-                fulfillmentId: result.fulfillmentId ?? null,
-                nothingToDo: !!result.nothingToDo,
-                errorCode: FieldValue.delete(),
-                errorMessage: FieldValue.delete(),
-                updatedAt: FieldValue.serverTimestamp(),
-              },
-              { merge: true },
-            ),
-            summaryRef.update({
-              processing: FieldValue.increment(-1),
-              success: FieldValue.increment(1),
-            }),
-            orderRef.set(
-              {
-                customStatus: "Dispatched",
-                lastStatusUpdate: FieldValue.serverTimestamp(),
-                customStatusesLogs: FieldValue.arrayUnion({
-                  status: "Dispatched",
-                  createdAt: Timestamp.now(),
-                  remarks: `The order's shipment was dispatched from the warehouse.`,
-                }),
-              },
-              { merge: true },
-            ),
-          ]);
+          // Success: atomic batch for all updates
+          const successBatch = db.batch();
+
+          successBatch.set(
+            jobRef,
+            {
+              status: "success",
+              fulfillmentId: result.fulfillmentId ?? null,
+              nothingToDo: !!result.nothingToDo,
+              errorCode: FieldValue.delete(),
+              errorMessage: FieldValue.delete(),
+              updatedAt: FieldValue.serverTimestamp(),
+            },
+            { merge: true },
+          );
+
+          successBatch.update(summaryRef, {
+            processing: FieldValue.increment(-1),
+            success: FieldValue.increment(1),
+          });
+
+          successBatch.set(
+            orderRef,
+            {
+              customStatus: "Dispatched",
+              lastStatusUpdate: FieldValue.serverTimestamp(),
+              customStatusesLogs: FieldValue.arrayUnion({
+                status: "Dispatched",
+                createdAt: Timestamp.now(),
+                remarks: `The order's shipment was dispatched from the warehouse.`,
+              }),
+            },
+            { merge: true },
+          );
+
+          await successBatch.commit();
+
+          // Clean up UPCs after successful dispatch
+          await cleanupOrderUPCs(businessId, orderId);
 
           await maybeCompleteSummary(summaryRef);
           await sendDispatchedOrderWhatsAppMessage(shopData, orderData);
@@ -236,7 +261,7 @@ export const processFulfillmentTask = onRequest(
           res.json({ ok: true });
           return;
         } catch (err: any) {
-          // ✅ Fulfillment failure handling
+          // Fulfillment failure handling
           const attempts = (job.attempts ?? 0) + 1;
           const codeStr: string = err?.code || "UNKNOWN";
           const httpCode = /^HTTP_(\d+)$/.exec(codeStr)?.[1];
@@ -244,50 +269,61 @@ export const processFulfillmentTask = onRequest(
 
           if (retryable) {
             const areAttempsExhausted = attempts >= Number(MAX_ATTEMPTS);
-            await Promise.all([
-              jobRef.set(
-                {
-                  status: areAttempsExhausted ? "failed" : "retrying",
-                  errorCode: codeStr,
-                  errorMessage: (err?.detail || err?.message || "").slice(0, 400),
-                  updatedAt: FieldValue.serverTimestamp(),
-                },
-                { merge: true },
-              ),
-              summaryRef.update(
-                areAttempsExhausted
-                  ? { processing: FieldValue.increment(-1), failed: FieldValue.increment(1) }
-                  : { processing: FieldValue.increment(-1) },
-              ),
-            ]);
 
+            // Retry/failure: atomic batch
+            const retryBatch = db.batch();
+
+            retryBatch.set(
+              jobRef,
+              {
+                status: areAttempsExhausted ? "failed" : "retrying",
+                errorCode: codeStr,
+                errorMessage: (err?.detail || err?.message || "").slice(0, 400),
+                updatedAt: FieldValue.serverTimestamp(),
+              },
+              { merge: true },
+            );
+
+            retryBatch.update(
+              summaryRef,
+              areAttempsExhausted
+                ? { processing: FieldValue.increment(-1), failed: FieldValue.increment(1) }
+                : { processing: FieldValue.increment(-1) },
+            );
+
+            await retryBatch.commit();
             await maybeCompleteSummary(summaryRef);
+
             res.status(503).json({ retry: true, reason: codeStr });
             return;
           } else {
-            await Promise.all([
-              jobRef.set(
-                {
-                  status: "failed",
-                  errorCode: codeStr,
-                  errorMessage: (err?.detail || err?.message || "").slice(0, 400),
-                  updatedAt: FieldValue.serverTimestamp(),
-                },
-                { merge: true },
-              ),
-              summaryRef.update({
-                processing: FieldValue.increment(-1),
-                failed: FieldValue.increment(1),
-              }),
-            ]);
+            // Non-retryable failure: atomic batch
+            const failBatch = db.batch();
 
+            failBatch.set(
+              jobRef,
+              {
+                status: "failed",
+                errorCode: codeStr,
+                errorMessage: (err?.detail || err?.message || "").slice(0, 400),
+                updatedAt: FieldValue.serverTimestamp(),
+              },
+              { merge: true },
+            );
+
+            failBatch.update(summaryRef, {
+              processing: FieldValue.increment(-1),
+              failed: FieldValue.increment(1),
+            });
+
+            await failBatch.commit();
             await maybeCompleteSummary(summaryRef);
+
             res.json({ failed: true, reason: codeStr });
             return;
           }
         }
       } catch (validationError: any) {
-        // ✅ Catch any unexpected validation errors
         console.error("Validation error:", validationError);
         await markJobFailed("validation_error", validationError.message || "Validation failed");
         res.status(500).json({ error: "validation_failed", details: validationError.message });
@@ -300,6 +336,54 @@ export const processFulfillmentTask = onRequest(
     }
   },
 );
+
+/**
+ * Clean up UPCs associated with a dispatched order
+ * Sets putAway back to "none" and clears order/shop associations
+ */
+async function cleanupOrderUPCs(businessId: string, orderId: string): Promise<void> {
+  try {
+    // Query all UPCs associated with this order
+    const upcsSnapshot = await db
+      .collection(`users/${businessId}/upcs`)
+      .where("orderId", "==", orderId)
+      .where("putAway", "==", "outbound")
+      .get();
+
+    if (upcsSnapshot.empty) {
+      console.log(`No UPCs found for order ${orderId}`);
+      return;
+    }
+
+    console.log(`Found ${upcsSnapshot.size} UPCs to clean up for order ${orderId}`);
+
+    // Firestore batch limit is 500, so handle in chunks
+    const BATCH_SIZE = 500;
+    const docs = upcsSnapshot.docs;
+
+    for (let i = 0; i < docs.length; i += BATCH_SIZE) {
+      const batch = db.batch();
+      const chunk = docs.slice(i, i + BATCH_SIZE);
+
+      for (const doc of chunk) {
+        const updateData: Partial<UPC> = {
+          putAway: null,
+          updatedAt: Timestamp.now(),
+        };
+        batch.update(doc.ref, updateData);
+      }
+
+      await batch.commit();
+      console.log(`Cleaned up batch ${Math.floor(i / BATCH_SIZE) + 1} of UPCs`);
+    }
+
+    console.log(`Successfully cleaned up ${docs.length} UPCs from put-away, for order ${orderId}`);
+  } catch (error) {
+    console.error(`Error cleaning up UPCs for order ${orderId}:`, error);
+    // Don't throw - we don't want UPC cleanup failure to fail the entire dispatch
+    // The order is already dispatched on Shopify at this point
+  }
+}
 
 async function fulfillOrderOnShopify(
   shop: string,
@@ -314,7 +398,7 @@ async function fulfillOrderOnShopify(
     "Content-Type": "application/json",
   };
 
-  // 1) Get Fulfillment Orders (requires merchant-managed FO scopes if it's your own location)
+  // 1) Get Fulfillment Orders
   const foUrl = `https://${shop}/admin/api/${V}/orders/${orderId}/fulfillment_orders.json`;
   const foResp = await fetch(foUrl, { headers });
   if (!foResp.ok) {
@@ -326,9 +410,8 @@ async function fulfillOrderOnShopify(
   }
   let { fulfillment_orders: fos } = (await foResp.json()) as any;
 
-  // If no FOs are visible, it's almost always a scope issue
   if (!Array.isArray(fos) || fos.length === 0) {
-    return { nothingToDo: true }; // caller can treat this as "check app scopes"
+    return { nothingToDo: true };
   }
 
   // Helpers
@@ -393,7 +476,7 @@ async function fulfillOrderOnShopify(
     const lineItemsByFO = locationFOs.map((fo: any) => ({
       fulfillment_order_id: fo.id,
       fulfillment_order_line_items: fo.line_items
-        .filter((li: any) => li.fulfillable_quantity > 0) // Only unfulfilled items
+        .filter((li: any) => li.fulfillable_quantity > 0)
         .map((li: any) => ({
           id: li.id,
           quantity: li.fulfillable_quantity,
@@ -409,7 +492,6 @@ async function fulfillOrderOnShopify(
           line_items_by_fulfillment_order: lineItemsByFO,
           tracking_info: {
             number: String(awb) || "",
-            // Optionally set company/url so the link is clickable in Admin:
             company: courier,
             url:
               String(courier) === "Delhivery"
@@ -426,23 +508,20 @@ async function fulfillOrderOnShopify(
     if (!resp.ok) {
       const text = await resp.text();
       console.error(`Fulfillment create failed for location ${locationId}:`, text);
-      // Continue with other locations instead of throwing
       continue;
     }
 
     const json: any = await resp.json();
-    console.log(`Fulfillment response for location ${locationId}:`, JSON.stringify(json)); // 👈 ADD THIS
+    console.log(`Fulfillment response for location ${locationId}:`, JSON.stringify(json));
 
     if (json?.fulfillment?.id) {
       fulfillmentIds.push(json.fulfillment.id);
     } else {
-      console.error(`No fulfillment ID in response for location ${locationId}`, json); // 👈 ADD THIS
+      console.error(`No fulfillment ID in response for location ${locationId}`, json);
     }
   }
 
-  // Return the first fulfillment ID (or undefined if all failed)
   return {
     fulfillmentId: fulfillmentIds[0],
-    // You could also return all IDs if needed: fulfillmentIds
   };
 }

@@ -366,6 +366,10 @@ export function updateLocationStatsInTransaction(
   transaction.update(db.doc(`users/${businessId}/warehouses/${placement.warehouseId}`), {
     "stats.totalProducts": increment(quantityDelta),
   });
+
+  transaction.update(db.doc(`users/${businessId}/products/${placement.productId}`), {
+    inShelfQuantity: increment(quantityDelta),
+  });
 }
 
 /**
@@ -396,8 +400,9 @@ export async function createUPCsForPlacement(
       updatedAt: timestamp,
       createdBy: userId,
       updatedBy: userId,
-      orderName: null,
-      putAway: null,
+      storeId: null,
+      orderId: null,
+      putAway: "none",
       productId: placement.productId,
       warehouseId: placement.warehouseId,
       zoneId: placement.zoneId,

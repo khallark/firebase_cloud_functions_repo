@@ -28,11 +28,6 @@ export function buildShiprocketPayload(params: ShiprocketShipmentParams) {
     `${ship?.last_name ?? ship?.lastName ?? ""}`.trim() ||
     `${order?.customer?.last_name ?? ""}`.trim();
 
-  const pinCandidate =
-    ship?.zip ?? ship?.postal_code ?? ship?.postalCode ?? ship?.pincode ?? ship?.pin;
-  const pinMatch = String(pinCandidate ?? "").match(/\d{6}/);
-  const pincode = pinMatch ? pinMatch[0] : "";
-
   const itemsSrc: any[] = Array.isArray(order?.raw?.line_items) ? order?.raw?.line_items : [];
   const order_items =
     itemsSrc.length > 0
@@ -69,7 +64,8 @@ export function buildShiprocketPayload(params: ShiprocketShipmentParams) {
 
   const payment_method = !Number(order.raw.total_outstanding) ? "Prepaid" : "COD";
 
-  const weightingms = order?.raw?.total_weight ? Number(order?.raw.total_weight) : 250;
+  const weightingms = 250;
+  // order?.raw?.total_weight ? Number(order?.raw.total_weight) :
   const weight = weightingms / 1000;
 
   return {
@@ -82,7 +78,7 @@ export function buildShiprocketPayload(params: ShiprocketShipmentParams) {
     billing_address: ship?.address1 ?? ship?.address ?? "",
     billing_address_2: ship?.address2 ?? "",
     billing_city: ship?.city ?? "",
-    billing_pincode: pincode,
+    billing_pincode: ship?.zip,
     billing_state: ship?.province ?? ship?.state ?? "",
     billing_country: ship?.country ?? "India",
     billing_email:

@@ -175,9 +175,10 @@ export interface UPC {
   createdBy: string;
   updatedBy: string;
 
-  orderName: null;
+  storeId: string | null;
+  orderId: string | null;
 
-  putAway: null | "inbound" | "outbound";
+  putAway: "none" | "inbound" | "outbound" | null;
 
   productId: string;
   warehouseId: string;
