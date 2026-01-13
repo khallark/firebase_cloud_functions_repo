@@ -1,6 +1,6 @@
 import { onRequest } from "firebase-functions/v2/https";
 import { requireHeaderSecret } from "../../helpers";
-import { ENQUEUE_FUNCTION_SECRET, SHARED_STORE_ID, TASKS_SECRET } from "../../config";
+import { ENQUEUE_FUNCTION_SECRET, SHARED_STORE_IDS, TASKS_SECRET } from "../../config";
 import { createTask } from "../../services";
 import { db } from "../../firebaseAdmin";
 import { FieldValue } from "firebase-admin/firestore";
@@ -41,7 +41,7 @@ export const enqueueOrderSplitBatch = onRequest(
         return;
       }
 
-      if (shop !== SHARED_STORE_ID) {
+      if (SHARED_STORE_IDS.includes(shop)) {
         console.error("invalid_shop_order_for_splitting");
         res.status(403).json({ error: "invalid_shop_order_for_splitting" });
         return;

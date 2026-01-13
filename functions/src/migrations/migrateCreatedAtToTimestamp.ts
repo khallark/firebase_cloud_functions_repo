@@ -3,8 +3,10 @@
 import { onRequest } from "firebase-functions/v2/https";
 import { db } from "../firebaseAdmin";
 import { Timestamp } from "firebase-admin/firestore";
-import { ENQUEUE_FUNCTION_SECRET, SHARED_STORE_ID } from "../config";
+import { ENQUEUE_FUNCTION_SECRET } from "../config";
 import { requireHeaderSecret } from "../helpers";
+
+const SHARED_STORE_ID = "nfkjgp-sv.myshopify.com";
 
 /**
  * Migrates createdAt field from ISO string to Firestore Timestamp

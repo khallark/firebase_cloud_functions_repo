@@ -1,7 +1,7 @@
 // functions/src/generateTableData.ts
 import { onRequest } from "firebase-functions/v2/https";
 import { Timestamp } from "firebase-admin/firestore";
-import { ENQUEUE_FUNCTION_SECRET, SHARED_STORE_ID, SUPER_ADMIN_ID } from "../../config";
+import { ENQUEUE_FUNCTION_SECRET, SHARED_STORE_IDS, SUPER_ADMIN_ID } from "../../config";
 import { requireHeaderSecret } from "../../helpers";
 import { db } from "../../firebaseAdmin";
 
@@ -269,7 +269,7 @@ export const generateTableData = onRequest(
         // Query orders within date range
         // Using createdAt field for date filtering
         let ordersQuery = null;
-        if (storeId === SHARED_STORE_ID) {
+        if (SHARED_STORE_IDS.includes(storeId)) {
           if (businessId == SUPER_ADMIN_ID) {
             ordersQuery = ordersRef
               .where("createdAt", ">=", startTime)

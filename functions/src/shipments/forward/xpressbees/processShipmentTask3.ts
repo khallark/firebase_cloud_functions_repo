@@ -10,7 +10,7 @@ import {
   selectCourier,
 } from "../../../couriers";
 import { NON_RETRYABLE } from "../../helpers";
-import { SHARED_STORE_ID, TASKS_SECRET } from "../../../config";
+import { SHARED_STORE_IDS, TASKS_SECRET } from "../../../config";
 import {
   BusinessIsAuthorisedToProcessThisOrder,
   handleJobFailure,
@@ -119,7 +119,7 @@ export const processShipmentTask3 = onRequest(
       const businessData = businessDoc.data();
 
       // Check if the shop is exceptional one, if yes, then check if the given business is authorised to process this order or not
-      if (shop === SHARED_STORE_ID) {
+      if (SHARED_STORE_IDS.includes(shop)) {
         const vendorName = businessData?.vendorName;
         const vendors = order?.vendors;
         const canProcess = BusinessIsAuthorisedToProcessThisOrder(businessId, vendorName, vendors);

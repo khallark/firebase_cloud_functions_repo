@@ -1,9 +1,11 @@
 import { onRequest } from "firebase-functions/v2/https";
-import { ENQUEUE_FUNCTION_SECRET, SHARED_STORE_ID } from "../../config";
+import { ENQUEUE_FUNCTION_SECRET } from "../../config";
 import { requireHeaderSecret } from "../../helpers";
 import { sendSharedStoreOrdersExcelWhatsAppMessage } from "../../services";
 import ExcelJS from "exceljs";
 import { db, storage } from "../../firebaseAdmin";
+
+const SHARED_STORE_ID = "nfkjgp-sv.myshopify.com";
 
 interface GenerateExcelPayload {
   phoneNumbers?: string[];

@@ -8,7 +8,7 @@ import { FieldValue, Transaction, Timestamp } from "firebase-admin/firestore";
 import { buildShiprocketPayload, evaluateShiprocketResponse } from "../../../couriers";
 import { NON_RETRYABLE } from "../../helpers";
 import { requestShiprocketPickup } from "../../../couriers";
-import { TASKS_SECRET, SHARED_STORE_ID } from "../../../config";
+import { TASKS_SECRET, SHARED_STORE_IDS } from "../../../config";
 import {
   BusinessIsAuthorisedToProcessThisOrder,
   handleJobFailure,
@@ -116,7 +116,7 @@ export const processShipmentTask2 = onRequest(
       const businessData = businessDoc.data();
 
       // Check if the shop is exceptional one, if yes, then check if the given business is authorised to process this order or not
-      if (shop === SHARED_STORE_ID) {
+      if (SHARED_STORE_IDS.includes(shop)) {
         const vendorName = businessData?.vendorName;
         const vendors = order?.vendors;
         const canProcess = BusinessIsAuthorisedToProcessThisOrder(businessId, vendorName, vendors);

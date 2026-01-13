@@ -1,5 +1,5 @@
 import { onRequest } from "firebase-functions/v2/https";
-import { SHARED_STORE_ID, TASKS_SECRET, UPC } from "../../config";
+import { SHARED_STORE_IDS, TASKS_SECRET, UPC } from "../../config";
 import {
   BusinessIsAuthorisedToProcessThisOrder,
   maybeCompleteSummary,
@@ -167,7 +167,7 @@ export const processFulfillmentTask = onRequest(
         }
 
         // Check authorization for shared store
-        if (shop === SHARED_STORE_ID) {
+        if (SHARED_STORE_IDS.includes(shop)) {
           const businessData = businessDoc.data();
           const vendorName = businessData?.vendorName;
           const vendors = orderData?.vendors;
@@ -266,7 +266,7 @@ export const processFulfillmentTask = onRequest(
           const codeStr: string = err?.code || "UNKNOWN";
           const httpCode = /^HTTP_(\d+)$/.exec(codeStr)?.[1];
           const retryable = httpCode ? httpRetryable(Number(httpCode)) : true;
-          console.log('Fulfillment error');
+          console.log("Fulfillment error");
           console.log(err);
 
           if (retryable) {

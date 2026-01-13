@@ -5,7 +5,7 @@
 import { DocumentSnapshot, FieldValue } from "firebase-admin/firestore";
 import { onDocumentWritten } from "firebase-functions/firestore";
 import { db } from "../../firebaseAdmin";
-import { SHARED_STORE_ID } from "../../config";
+import { SHARED_STORE_IDS } from "../../config";
 
 type InventoryStatus = "NotExists" | "Start" | "Dispatched" | "End" | "Exception";
 
@@ -308,7 +308,7 @@ export const updateOrderCounts = onDocumentWritten(
           { merge: true },
         );
 
-        if (storeId === SHARED_STORE_ID && newOrder.vendors && Array.isArray(newOrder.vendors)) {
+        if (SHARED_STORE_IDS.includes(storeId) && newOrder.vendors && Array.isArray(newOrder.vendors)) {
           console.log(
             "Shared Store detected, incrementing the 'All Orders' count of vendors too...",
           );
@@ -376,7 +376,7 @@ export const updateOrderCounts = onDocumentWritten(
 
         await metadataRef.update(updates);
 
-        if (storeId === SHARED_STORE_ID && newOrder.vendors && Array.isArray(newOrder.vendors)) {
+        if (SHARED_STORE_IDS.includes(storeId) && newOrder.vendors && Array.isArray(newOrder.vendors)) {
           console.log("Shared Store detected, updating count of vendors too...");
           for (const vendor of newOrder.vendors) {
             const memberDocQuery = await db

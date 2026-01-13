@@ -4,13 +4,14 @@ import { db, storage } from "../../firebaseAdmin";
 import {
   ENQUEUE_FUNCTION_SECRET,
   REPORT_PHONE_NUMBER,
-  SHARED_STORE_ID,
   TASKS_SECRET,
 } from "../../config";
 import { createTask, sendTaxReportWhatsAppMessage } from "../../services";
 import { onRequest } from "firebase-functions/v2/https";
 import { generateTaxReport } from "./helpers";
 import { requireHeaderSecret } from "../../helpers";
+
+const SHARED_STORE_ID = "nfkjgp-sv.myshopify.com";
 
 /**
  * Scheduled function - runs daily at 12:00 AM

@@ -5,3 +5,4 @@ export * from "./syncSharedStoreProductsBasic";
 export * from "./migrateCreatedAtToTimestamp";
 export * from "./migrateReturnStatusLogs";
 export * from "./migrateRefundedAmounts";
+export * from "./migrateProductsOnShopify";

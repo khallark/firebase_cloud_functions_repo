@@ -18,7 +18,7 @@
 /**
  * Shared store ID used for multi-vendor authorization
  */
-export const SHARED_STORE_ID = "nfkjgp-sv.myshopify.com";
+export const SHARED_STORE_IDS = ["nfkjgp-sv.myshopify.com", "gj9ejg-cu.myshopify.com"];
 
 /**
  * Super admin ID that bypasses all authorization checks

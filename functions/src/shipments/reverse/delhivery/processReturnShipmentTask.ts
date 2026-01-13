@@ -1,5 +1,5 @@
 import { onRequest } from "firebase-functions/v2/https";
-import { NON_RETRYABLE_ERROR_CODES, SHARED_STORE_ID, TASKS_SECRET } from "../../../config";
+import { NON_RETRYABLE_ERROR_CODES, SHARED_STORE_IDS, TASKS_SECRET } from "../../../config";
 import {
   BusinessIsAuthorisedToProcessThisOrder,
   maybeCompleteBatch,
@@ -226,8 +226,8 @@ export const processReturnShipmentTask = onRequest(
       if (!ordSnap.exists) throw new Error("ORDER_NOT_FOUND");
       const order = ordSnap.data();
 
-      // Check if the shop is exceptional one, if yes, then chekc if the given business is authorised to process this order or not
-      if (shop === SHARED_STORE_ID) {
+      // Check if the shop is exceptional one, if yes, then check if the given business is authorised to process this order or not
+      if (SHARED_STORE_IDS.includes(shop)) {
         const vendorName = businessData?.vendorName;
         const vendors = order?.vendors;
         const canProcess = BusinessIsAuthorisedToProcessThisOrder(businessId, vendorName, vendors);
