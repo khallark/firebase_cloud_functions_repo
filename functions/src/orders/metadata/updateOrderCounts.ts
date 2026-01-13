@@ -308,7 +308,11 @@ export const updateOrderCounts = onDocumentWritten(
           { merge: true },
         );
 
-        if (SHARED_STORE_IDS.includes(storeId) && newOrder.vendors && Array.isArray(newOrder.vendors)) {
+        if (
+          SHARED_STORE_IDS.includes(storeId) &&
+          newOrder.vendors &&
+          Array.isArray(newOrder.vendors)
+        ) {
           console.log(
             "Shared Store detected, incrementing the 'All Orders' count of vendors too...",
           );
@@ -376,7 +380,11 @@ export const updateOrderCounts = onDocumentWritten(
 
         await metadataRef.update(updates);
 
-        if (SHARED_STORE_IDS.includes(storeId) && newOrder.vendors && Array.isArray(newOrder.vendors)) {
+        if (
+          SHARED_STORE_IDS.includes(storeId) &&
+          newOrder.vendors &&
+          Array.isArray(newOrder.vendors)
+        ) {
           console.log("Shared Store detected, updating count of vendors too...");
           for (const vendor of newOrder.vendors) {
             const memberDocQuery = await db

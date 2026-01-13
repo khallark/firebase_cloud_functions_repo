@@ -1,11 +1,7 @@
 // Daily Tax Report Generation Function
 import { onSchedule } from "firebase-functions/v2/scheduler";
 import { db, storage } from "../../firebaseAdmin";
-import {
-  ENQUEUE_FUNCTION_SECRET,
-  REPORT_PHONE_NUMBER,
-  TASKS_SECRET,
-} from "../../config";
+import { ENQUEUE_FUNCTION_SECRET, REPORT_PHONE_NUMBER, TASKS_SECRET } from "../../config";
 import { createTask, sendTaxReportWhatsAppMessage } from "../../services";
 import { onRequest } from "firebase-functions/v2/https";
 import { generateTaxReport } from "./helpers";

@@ -1,5 +1,5 @@
 import { onRequest } from "firebase-functions/v2/https";
-import { SHARED_STORE_IDS, TASKS_SECRET, UPC } from "../../config";
+import { SHARED_STORE_ID, SHARED_STORE_IDS, TASKS_SECRET, UPC } from "../../config";
 import {
   BusinessIsAuthorisedToProcessThisOrder,
   maybeCompleteSummary,
@@ -394,6 +394,10 @@ async function fulfillOrderOnShopify(
   awb: string | number,
   courier: string,
 ): Promise<{ fulfillmentId?: string; nothingToDo?: boolean }> {
+  if (shop === SHARED_STORE_ID) {
+    return { nothingToDo: true };
+  }
+
   const V = "2025-07";
   const headers = {
     "X-Shopify-Access-Token": accessToken,

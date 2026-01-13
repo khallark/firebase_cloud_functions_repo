@@ -4,7 +4,7 @@ import { chunkArray, requireHeaderSecret, sleep } from "../helpers";
 import { db } from "../firebaseAdmin";
 import { FieldValue } from "firebase-admin/firestore";
 
-const SHARED_STORE_ID = "nfkjgp-sv.myshopify.com"
+const SHARED_STORE_ID = "nfkjgp-sv.myshopify.com";
 
 /**
  * Fetches all products with basic info and metafields only
