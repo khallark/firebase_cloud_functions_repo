@@ -266,6 +266,8 @@ export const processFulfillmentTask = onRequest(
           const codeStr: string = err?.code || "UNKNOWN";
           const httpCode = /^HTTP_(\d+)$/.exec(codeStr)?.[1];
           const retryable = httpCode ? httpRetryable(Number(httpCode)) : true;
+          console.log('Fulfillment error');
+          console.log(err);
 
           if (retryable) {
             const areAttempsExhausted = attempts >= Number(MAX_ATTEMPTS);
