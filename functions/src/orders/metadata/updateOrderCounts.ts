@@ -1,8 +1,13 @@
 // ============================================================================
-// BACKGROUND FUNCTION: Auto-Update Order Counts
+// BACKGROUND FUNCTION: Auto-Update Order Counts (Optimized with Transactions)
 // ============================================================================
 
-import { DocumentData, DocumentSnapshot, FieldValue } from "firebase-admin/firestore";
+import {
+  DocumentData,
+  DocumentReference,
+  DocumentSnapshot,
+  FieldValue,
+} from "firebase-admin/firestore";
 import { onDocumentWritten } from "firebase-functions/firestore";
 import { db } from "../../firebaseAdmin";
 import { SHARED_STORE_IDS } from "../../config";
@@ -100,11 +105,10 @@ const DISPATCHED_STATUSES = [
   "DTO In Transit",
   "DTO Delivered",
 ];
-const END_STATUSES = ["RTO Closed", "Pending Refunds", "DTO Refunded"];
+const END_STATUSES = ["RTO Processed", "RTO Closed", "Pending Refunds", "DTO Refunded"];
 
-// Helper function to map customStatus to InventoryStatus
 const mapToInventoryStatus = (customStatus: string | undefined): InventoryStatus => {
-  if (!customStatus) return "Exception"; // Fallback for undefined status
+  if (!customStatus) return "Exception";
 
   if (START_STATUES.includes(customStatus)) {
     return "Start";
@@ -121,22 +125,14 @@ const getInventoryChangeStatus = (
   before: DocumentSnapshot,
   after: DocumentSnapshot,
 ): [InventoryStatus, InventoryStatus] => {
-  // -------------------------
-  // BEFORE
-  // -------------------------
   let beforeStatus: InventoryStatus;
-
   if (!before.exists) {
     beforeStatus = "NotExists";
   } else {
     beforeStatus = mapToInventoryStatus(before.data()?.customStatus);
   }
 
-  // -------------------------
-  // AFTER
-  // -------------------------
   let afterStatus: InventoryStatus;
-
   if (!after.exists) {
     afterStatus = "NotExists";
   } else {
@@ -146,7 +142,7 @@ const getInventoryChangeStatus = (
   return [beforeStatus, afterStatus];
 };
 
-// Extracted inventory update logic with its own error handling
+// Batch inventory updates for better performance
 const updateInventory = async (
   storeId: string,
   orderId: string,
@@ -155,13 +151,19 @@ const updateInventory = async (
   afterStatus: InventoryStatus,
   line_items: any[],
 ) => {
-  // Skip if no actual transition
   if (beforeStatus === afterStatus) {
     console.log(`⏭️ No inventory status change (${beforeStatus}), skipping inventory update`);
     return;
   }
 
   console.log(`📦 Updating inventory: ${beforeStatus} → ${afterStatus}`);
+
+  // Collect all inventory updates first
+  const inventoryUpdates: Array<{
+    ref: DocumentReference;
+    updates: Record<string, FieldValue>;
+    productSku: string;
+  }> = [];
 
   for (const item of line_items) {
     const product_id = String(item.product_id);
@@ -202,61 +204,179 @@ const updateInventory = async (
         continue;
       }
 
-      const businessProductDoc = await db
+      const businessProductRef = db
         .collection("users")
         .doc(businessId)
         .collection("products")
-        .doc(businessProductSku)
-        .get();
+        .doc(businessProductSku);
+
+      const businessProductDoc = await businessProductRef.get();
 
       if (!businessProductDoc.exists) {
         console.warn(`⚠️ Business product ${businessProductSku} not found, skipping`);
         continue;
       }
 
-      const BPMappedVariants = businessProductDoc.data()?.mappedVariants as {
-        mappedAt: string;
-        productId: string;
-        productTitle: string;
-        storeId: string;
-        variantId: number;
-        variantSku: string;
-        variantTitle: string;
-      }[] | undefined;
-      const productMappedAt = BPMappedVariants?.filter(el => el.variantId !== item.variant_id)?.[0].mappedAt;
+      const BPMappedVariants = businessProductDoc.data()?.mappedVariants as
+        | {
+            mappedAt: string;
+            productId: string;
+            productTitle: string;
+            storeId: string;
+            variantId: number;
+            variantSku: string;
+            variantTitle: string;
+          }[]
+        | undefined;
+
+      const productMappedAt = BPMappedVariants?.filter(
+        (el) => el.variantId !== item.variant_id,
+      )?.[0]?.mappedAt;
       const orderCreatedAt = orderData.createdAt as string;
 
-      if(!productMappedAt) {
-        console.warn(`⚠️ Mapping details not found in the Business product ${businessProductSku}, skipping`);
+      if (!productMappedAt) {
+        console.warn(
+          `⚠️ Mapping details not found in the Business product ${businessProductSku}, skipping`,
+        );
         continue;
       }
 
       const prodMappedDate = new Date(productMappedAt);
       const orderCreatedDate = new Date(orderCreatedAt);
 
-      if(prodMappedDate > orderCreatedDate) {
-        console.warn(`⚠️ The mapping between business product "${businessProductSku}" and store product variant "${variant_id} was created after the existence of this order. The inventory will be tracked for only those orders which were created after the mapping creation, skipping.`);
+      if (prodMappedDate > orderCreatedDate) {
+        console.warn(
+          `⚠️ The mapping between business product "${businessProductSku}" and store product variant "${variant_id}" was created after the existence of this order. The inventory will be tracked for only those orders which were created after the mapping creation, skipping.`,
+        );
         continue;
       }
 
-      const inventoryUpdates: Record<string, FieldValue> = {};
+      const inventoryUpdates_inner: Record<string, FieldValue> = {};
       for (const [key, value] of Object.entries(changes)) {
-        inventoryUpdates[`inventory.${key}`] = value;
+        inventoryUpdates_inner[`inventory.${key}`] = value;
       }
 
-      await businessProductDoc.ref.update(inventoryUpdates);
-
-      console.log(`✅ Updated inventory for business product ${businessProductSku}`);
+      inventoryUpdates.push({
+        ref: businessProductRef,
+        updates: inventoryUpdates_inner,
+        productSku: businessProductSku,
+      });
     } catch (error) {
-      // Log but don't throw - continue processing other items
       console.error(
-        `❌ Failed to update inventory for product ${product_id}, variant ${variant_id}:`,
+        `❌ Failed to prepare inventory update for product ${product_id}, variant ${variant_id}:`,
         error,
       );
     }
   }
 
+  // Execute all inventory updates in batches
+  if (inventoryUpdates.length > 0) {
+    const BATCH_SIZE = 500; // Firestore batch limit
+
+    for (let i = 0; i < inventoryUpdates.length; i += BATCH_SIZE) {
+      const batch = db.batch();
+      const batchItems = inventoryUpdates.slice(i, i + BATCH_SIZE);
+
+      for (const item of batchItems) {
+        batch.update(item.ref, item.updates);
+      }
+
+      try {
+        await batch.commit();
+        console.log(`✅ Batch committed: Updated inventory for ${batchItems.length} products`);
+      } catch (error) {
+        console.error(`❌ Failed to commit inventory batch:`, error);
+        // Log which products failed
+        batchItems.forEach((item) => {
+          console.error(`   - Failed product: ${item.productSku}`);
+        });
+      }
+    }
+  }
+
   console.log(`📦 Inventory update complete for order ${orderId}`);
+};
+
+// Update order counts - using set with merge to handle missing documents
+const updateOrderCountsWithTransaction = async (
+  storeId: string,
+  statusUpdates: Record<string, FieldValue>,
+  vendors?: string[],
+) => {
+  const metadataRef = db
+    .collection("accounts")
+    .doc(storeId)
+    .collection("metadata")
+    .doc("orderCounts");
+
+  // Use set with merge instead of update to auto-create if needed
+  // This prevents "document not found" errors
+  await metadataRef.set(
+    {
+      ...statusUpdates,
+      lastUpdated: FieldValue.serverTimestamp(),
+    },
+    { merge: true },
+  );
+
+  // Update vendor counts with batch if needed
+  if (SHARED_STORE_IDS.includes(storeId) && vendors && vendors.length > 0) {
+    console.log("Shared Store detected, updating vendor counts...");
+
+    const uniqueVendors = [
+      ...new Set(vendors.map((v) => (["ghamand", "bbb"].includes(v.toLowerCase()) ? "OWR" : v))),
+    ];
+
+    const batch = db.batch();
+    let batchCount = 0;
+
+    for (const vendor of uniqueVendors) {
+      try {
+        const memberDocQuery = await db
+          .collection("accounts")
+          .doc(storeId)
+          .collection("members")
+          .where("vendorName", "==", vendor)
+          .limit(1)
+          .get();
+
+        if (!memberDocQuery.empty) {
+          const vendorRef = memberDocQuery.docs[0].ref;
+          const vendorDoc = await vendorRef.get();
+
+          const vendorUpdates = {
+            ...statusUpdates,
+            lastUpdated: FieldValue.serverTimestamp(),
+          };
+
+          if (vendorDoc.exists) {
+            batch.update(vendorRef, vendorUpdates);
+          } else {
+            batch.set(
+              vendorRef,
+              { counts: statusUpdates, lastUpdated: FieldValue.serverTimestamp() },
+              { merge: true },
+            );
+          }
+
+          batchCount++;
+          console.log(`Added vendor ${vendor} to batch`);
+        }
+      } catch (error) {
+        console.error(`❌ Failed to prepare vendor ${vendor} update:`, error);
+      }
+    }
+
+    // Commit vendor updates batch
+    if (batchCount > 0) {
+      try {
+        await batch.commit();
+        console.log(`✅ Vendor batch committed: Updated ${batchCount} vendors`);
+      } catch (error) {
+        console.error(`❌ Failed to commit vendor batch:`, error);
+      }
+    }
+  }
 };
 
 export const updateOrderCounts = onDocumentWritten(
@@ -270,16 +390,9 @@ export const updateOrderCounts = onDocumentWritten(
 
     console.log(`📝 Order ${orderId} changed in store ${storeId}`);
 
-    const metadataRef = db
-      .collection("accounts")
-      .doc(storeId)
-      .collection("metadata")
-      .doc("orderCounts");
-
     const change = event.data;
     if (!change) return;
 
-    // Get inventory status transition for all cases
     const [beforeStatus, afterStatus] = getInventoryChangeStatus(change.before, change.after);
 
     // ============================================================
@@ -292,22 +405,19 @@ export const updateOrderCounts = onDocumentWritten(
       const oldStatus = oldOrder.customStatus || "New";
 
       try {
-        await metadataRef.set(
+        await updateOrderCountsWithTransaction(
+          storeId,
           {
-            counts: {
-              "All Orders": FieldValue.increment(-1),
-              [oldStatus]: FieldValue.increment(-1),
-            },
-            lastUpdated: FieldValue.serverTimestamp(),
+            "counts.All Orders": FieldValue.increment(-1),
+            [`counts.${oldStatus}`]: FieldValue.increment(-1),
           },
-          { merge: true },
+          oldOrder.vendors,
         );
         console.log(`✅ Decremented count for deleted order (${oldStatus})`);
       } catch (error) {
         console.error(`❌ Failed to update counts for deleted order:`, error);
       }
 
-      // Update inventory for deletion (has its own error handling)
       const line_items = oldOrder?.raw?.line_items || [];
       await updateInventory(storeId, orderId, oldOrder, beforeStatus, afterStatus, line_items);
       return;
@@ -323,62 +433,19 @@ export const updateOrderCounts = onDocumentWritten(
       const newStatus = newOrder.customStatus || "New";
 
       try {
-        await metadataRef.set(
+        await updateOrderCountsWithTransaction(
+          storeId,
           {
-            counts: {
-              "All Orders": FieldValue.increment(1),
-              [newStatus]: FieldValue.increment(1),
-            },
-            lastUpdated: FieldValue.serverTimestamp(),
+            "counts.All Orders": FieldValue.increment(1),
+            [`counts.${newStatus}`]: FieldValue.increment(1),
           },
-          { merge: true },
+          newOrder.vendors,
         );
-
-        if (
-          SHARED_STORE_IDS.includes(storeId) &&
-          newOrder.vendors &&
-          Array.isArray(newOrder.vendors)
-        ) {
-          console.log(
-            "Shared Store detected, incrementing the 'All Orders' count of vendors too...",
-          );
-          const vendors = [
-            ...new Set(
-              newOrder.vendors.map((v) =>
-                ["ghamand", "bbb"].includes(v.toLowerCase()) ? "OWR" : v,
-              ),
-            ),
-          ];
-          for (const vendor of vendors) {
-            const memberDocQuery = await db
-              .collection("accounts")
-              .doc(storeId)
-              .collection("members")
-              .where("vendorName", "==", vendor)
-              .get();
-
-            if (!memberDocQuery.empty) {
-              await memberDocQuery.docs[0].ref.set(
-                {
-                  counts: {
-                    "All Orders": FieldValue.increment(1),
-                    [newStatus]: FieldValue.increment(1),
-                  },
-                  lastUpdated: FieldValue.serverTimestamp(),
-                },
-                { merge: true },
-              );
-              console.log(`Vendor ${vendor} Counts updated!`);
-            }
-          }
-        }
-
         console.log(`✅ Incremented count for new order (${newStatus})`);
       } catch (error) {
         console.error(`❌ Failed to update counts for new order:`, error);
       }
 
-      // Update inventory for new order
       const line_items = newOrder?.raw?.line_items || [];
       await updateInventory(storeId, orderId, newOrder, beforeStatus, afterStatus, line_items);
       return;
@@ -395,38 +462,16 @@ export const updateOrderCounts = onDocumentWritten(
     const oldStatus = oldOrder.customStatus || "New";
     const newStatus = newOrder.customStatus || "New";
 
-    // Update counts only if customStatus changed
     if (oldStatus !== newStatus) {
       try {
-        const updates: any = {
-          lastUpdated: FieldValue.serverTimestamp(),
-          [`counts.${oldStatus}`]: FieldValue.increment(-1),
-          [`counts.${newStatus}`]: FieldValue.increment(1),
-        };
-
-        await metadataRef.update(updates);
-
-        if (
-          SHARED_STORE_IDS.includes(storeId) &&
-          newOrder.vendors &&
-          Array.isArray(newOrder.vendors)
-        ) {
-          console.log("Shared Store detected, updating count of vendors too...");
-          for (const vendor of newOrder.vendors) {
-            const memberDocQuery = await db
-              .collection("accounts")
-              .doc(storeId)
-              .collection("members")
-              .where("vendorName", "==", vendor)
-              .get();
-
-            if (!memberDocQuery.empty) {
-              await memberDocQuery.docs[0].ref.update(updates);
-              console.log(`Vendor ${vendor} Counts updated!`);
-            }
-          }
-        }
-
+        await updateOrderCountsWithTransaction(
+          storeId,
+          {
+            [`counts.${oldStatus}`]: FieldValue.increment(-1),
+            [`counts.${newStatus}`]: FieldValue.increment(1),
+          },
+          newOrder.vendors,
+        );
         console.log(`✅ Updated counts: ${oldStatus} → ${newStatus}`);
       } catch (error) {
         console.error(`❌ Failed to update counts:`, error);
@@ -440,7 +485,6 @@ export const updateOrderCounts = onDocumentWritten(
       console.log(`⏭️ No status change for order ${orderId}`);
     }
 
-    // Always attempt inventory update
     const line_items = newOrder?.raw?.line_items || [];
     await updateInventory(storeId, orderId, oldOrder, beforeStatus, afterStatus, line_items);
   },

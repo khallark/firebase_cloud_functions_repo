@@ -56,6 +56,7 @@ export const ORDER_STATUSES = {
   DTO_REFUNDED: "DTO Refunded",
   LOST: "Lost",
   CLOSED: "Closed",
+  RTO_PROCESSED: "RTO Processed",
   RTO_CLOSED: "RTO Closed",
   CANCELLATION_REQUESTED: "Cancellation Requested",
   CANCELLED: "Cancelled",

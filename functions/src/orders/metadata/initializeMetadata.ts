@@ -134,6 +134,7 @@ async function initializeAccountMetadata(accountId: string): Promise<{
     "DTO Refunded": 0,
     Lost: 0,
     Closed: 0,
+    "RTO Processed": 0,
     "RTO Closed": 0,
     "Cancellation Requested": 0,
     Cancelled: 0,

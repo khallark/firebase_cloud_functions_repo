@@ -205,6 +205,21 @@ function prepareXpressbeesOrderUpdates(orders: any[], trackingDataArray: any[]):
     const newStatus = determineNewXpressbeesStatus(currentStatus);
     if (!newStatus) continue;
     if (newStatus === order.customStatus) continue;
+    if (newStatus === "RTO Delivered" && order.customStatus === "RTO Processed") {
+      updates.push({
+        ref: order.ref,
+        data: {
+          customStatus: "RTO Closed",
+          lastStatusUpdate: FieldValue.serverTimestamp(),
+          customStatusesLogs: FieldValue.arrayUnion({
+            status: "RTO Closed",
+            createdAt: Timestamp.now(),
+            remarks:
+              "This order was finally updated by the courier to 'RTO Delivered', and was shifted from 'RTO Processed' to 'RTO Closed'.",
+          }),
+        },
+      });
+    }
 
     updates.push({
       ref: order.ref,
