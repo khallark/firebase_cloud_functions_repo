@@ -1,5 +1,7 @@
 import { onDocumentWritten } from "firebase-functions/firestore";
 import { db } from "../firebaseAdmin";
+import { SHARED_STORE_ID } from "../config";
+import { sleep } from "../helpers";
 
 interface Inventory {
   autoAddition: number;
@@ -118,7 +120,7 @@ function calculateAvailableStock(physicalStock: number, blockedStock: number): n
   return physicalStock - blockedStock;
 }
 
-export const onPlacementWritten = onDocumentWritten(
+export const onInventoryWritten = onDocumentWritten(
   {
     document: "users/{businessId}/products/{placementId}",
     memory: "256MiB",
@@ -153,6 +155,8 @@ export const onPlacementWritten = onDocumentWritten(
     for (const mapping of after.mappedVariants ?? []) {
       const { storeId, productId, variantId } = mapping;
 
+      if (storeId === SHARED_STORE_ID) continue;
+
       try {
         const storeSnap = await db.doc(`accounts/${storeId}`).get();
         const { accessToken, locationId } = storeSnap.data()!;
@@ -172,8 +176,13 @@ export const onPlacementWritten = onDocumentWritten(
           continue;
         }
 
+        // 1️⃣ Ensure tracking
         await ensureTracking(storeId, accessToken, String(variant.inventoryItemId));
 
+        // ⏱ deliberate pause (tracking mutation is expensive)
+        await sleep(150);
+
+        // 2️⃣ Set inventory (absolute overwrite)
         await setInventory(
           storeId,
           accessToken,
@@ -181,6 +190,9 @@ export const onPlacementWritten = onDocumentWritten(
           locationId,
           availableStock,
         );
+
+        // ⏱ pause before next variant
+        await sleep(200);
       } catch (err) {
         console.error("Failed to sync inventory", {
           storeId,

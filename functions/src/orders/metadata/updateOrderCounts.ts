@@ -2,7 +2,7 @@
 // BACKGROUND FUNCTION: Auto-Update Order Counts
 // ============================================================================
 
-import { DocumentSnapshot, FieldValue } from "firebase-admin/firestore";
+import { DocumentData, DocumentSnapshot, FieldValue } from "firebase-admin/firestore";
 import { onDocumentWritten } from "firebase-functions/firestore";
 import { db } from "../../firebaseAdmin";
 import { SHARED_STORE_IDS } from "../../config";
@@ -150,6 +150,7 @@ const getInventoryChangeStatus = (
 const updateInventory = async (
   storeId: string,
   orderId: string,
+  orderData: DocumentData,
   beforeStatus: InventoryStatus,
   afterStatus: InventoryStatus,
   line_items: any[],
@@ -210,6 +211,31 @@ const updateInventory = async (
 
       if (!businessProductDoc.exists) {
         console.warn(`⚠️ Business product ${businessProductSku} not found, skipping`);
+        continue;
+      }
+
+      const BPMappedVariants = businessProductDoc.data()?.mappedVariants as {
+        mappedAt: string;
+        productId: string;
+        productTitle: string;
+        storeId: string;
+        variantId: number;
+        variantSku: string;
+        variantTitle: string;
+      }[] | undefined;
+      const productMappedAt = BPMappedVariants?.filter(el => el.variantId !== item.variant_id)?.[0].mappedAt;
+      const orderCreatedAt = orderData.createdAt as string;
+
+      if(!productMappedAt) {
+        console.warn(`⚠️ Mapping details not found in the Business product ${businessProductSku}, skipping`);
+        continue;
+      }
+
+      const prodMappedDate = new Date(productMappedAt);
+      const orderCreatedDate = new Date(orderCreatedAt);
+
+      if(prodMappedDate > orderCreatedDate) {
+        console.warn(`⚠️ The mapping between business product "${businessProductSku}" and store product variant "${variant_id} was created after the existence of this order. The inventory will be tracked for only those orders which were created after the mapping creation, skipping.`);
         continue;
       }
 
@@ -283,7 +309,7 @@ export const updateOrderCounts = onDocumentWritten(
 
       // Update inventory for deletion (has its own error handling)
       const line_items = oldOrder?.raw?.line_items || [];
-      await updateInventory(storeId, orderId, beforeStatus, afterStatus, line_items);
+      await updateInventory(storeId, orderId, oldOrder, beforeStatus, afterStatus, line_items);
       return;
     }
 
@@ -354,7 +380,7 @@ export const updateOrderCounts = onDocumentWritten(
 
       // Update inventory for new order
       const line_items = newOrder?.raw?.line_items || [];
-      await updateInventory(storeId, orderId, beforeStatus, afterStatus, line_items);
+      await updateInventory(storeId, orderId, newOrder, beforeStatus, afterStatus, line_items);
       return;
     }
 
@@ -416,6 +442,6 @@ export const updateOrderCounts = onDocumentWritten(
 
     // Always attempt inventory update
     const line_items = newOrder?.raw?.line_items || [];
-    await updateInventory(storeId, orderId, beforeStatus, afterStatus, line_items);
+    await updateInventory(storeId, orderId, oldOrder, beforeStatus, afterStatus, line_items);
   },
 );
