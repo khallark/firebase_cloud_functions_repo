@@ -316,7 +316,6 @@ export const onProductWritten = onDocumentWritten(
       }
 
       const mappedVariantData = afterMappedVariants[afterMappedVariants.length - 1];
-      mappedVariantData
       const businessDoc = await db.doc(`users/${businessId}`).get();
 
       if (!businessDoc.exists) {
@@ -325,77 +324,63 @@ export const onProductWritten = onDocumentWritten(
       }
 
       const businessData = businessDoc.data();
-      const linkedStores: string[] = businessData?.stores || [];
 
-      if (!businessData?.vendorName || linkedStores.length === 0) {
+      if (!businessData?.vendorName) {
         return null;
       }
 
-      // Parallelize store queries - track which stores are shared
-      const storeQueries = linkedStores.map((store) => {
-        const baseQuery = db
-          .collection("accounts")
-          .doc(store)
-          .collection("orders")
-          .where("customStatus", "in", ["New", "Confirm", "Ready To Dispatch"]);
+      // Query only the specific store where this variant exists
+      const storeId = mappedVariantData.storeId;
+      const isSharedStore = SHARED_STORE_IDS.includes(storeId);
 
-        const isSharedStore = SHARED_STORE_IDS.includes(store);
+      let ordersQuery = db
+        .collection("accounts")
+        .doc(storeId)
+        .collection("orders")
+        .where("customStatus", "in", ["New", "Confirm", "Ready To Dispatch"]);
 
-        if (isSharedStore) {
-          if (businessData.vendorName === "OWR") {
-            return {
-              query: baseQuery
-                .where("vendor", "array-contains-any", ["OWR", "BBB", "Ghamand"])
-                .get(),
-              isSharedStore,
-              isOWR: true,
-            };
-          }
-          return {
-            query: baseQuery.where("vendor", "array-contains", businessData.vendorName).get(),
-            isSharedStore,
-            isOWR: false,
-          };
+      const isOWR = businessData.vendorName === "OWR";
+
+      // Apply vendor filtering for shared stores
+      if (isSharedStore) {
+        if (isOWR) {
+          ordersQuery = ordersQuery.where("vendor", "array-contains-any", [
+            "OWR",
+            "BBB",
+            "Ghamand",
+          ]);
+        } else {
+          ordersQuery = ordersQuery.where("vendor", "array-contains", businessData.vendorName);
         }
-        return {
-          query: baseQuery.get(),
-          isSharedStore: false,
-          isOWR: false,
-        };
-      });
+      }
 
-      const allResults = await Promise.all(storeQueries.map((sq) => sq.query));
+      const ordersSnapshot = await ordersQuery.get();
 
-      // Calculate blocked stock across all stores
+      // Calculate blocked stock for this specific variant
       let blockedItemsCount = 0;
 
-      for (let i = 0; i < allResults.length; i++) {
-        const snapshot = allResults[i];
-        const { isSharedStore, isOWR } = storeQueries[i];
+      for (const doc of ordersSnapshot.docs) {
+        if (!doc.exists) continue;
 
-        for (const doc of snapshot.docs) {
-          if (!doc.exists) continue;
+        const orderData = doc.data();
+        const vendorArray: string[] = orderData?.vendor || [];
 
-          const orderData = doc.data();
-          const vendorArray: string[] = orderData?.vendor || [];
+        // Filter out orders for OWR in shared stores if they contain ENDORA or STYLE 05
+        if (isSharedStore && isOWR) {
+          const hasExcludedVendor = vendorArray.some((v) => v === "ENDORA" || v === "STYLE 05");
 
-          // Filter out orders for OWR in shared stores if they contain ENDORA or STYLE 05
-          if (isSharedStore && isOWR) {
-            const hasExcludedVendor = vendorArray.some((v) => v === "ENDORA" || v === "STYLE 05");
-
-            if (hasExcludedVendor) {
-              continue; // Skip this order
-            }
+          if (hasExcludedVendor) {
+            continue; // Skip this order
           }
-
-          const line_items: any[] = orderData?.line_items || [];
-
-          const totalQuantity = line_items
-            .filter((item) => item.variant_id === mappedVariantData.variantId)
-            .reduce((sum, item) => sum + (Number(item.quantity) || 0), 0);
-
-          blockedItemsCount += totalQuantity;
         }
+
+        const line_items: any[] = orderData?.line_items || [];
+
+        const totalQuantity = line_items
+          .filter((item) => item.variant_id === mappedVariantData.variantId)
+          .reduce((sum, item) => sum + (Number(item.quantity) || 0), 0);
+
+        blockedItemsCount += totalQuantity;
       }
 
       // Update inventory in a transaction to prevent race conditions
@@ -427,12 +412,14 @@ export const onProductWritten = onDocumentWritten(
         });
       });
 
-      console.log(`✅ Updated blocked stock for ${productId}: +${blockedItemsCount}`);
+      console.log(
+        `✅ Updated blocked stock for ${productId} (store: ${storeId}): +${blockedItemsCount}`
+      );
       return null;
     } catch (error) {
       console.error("❌ Error in onProductWritten:", error);
       // Don't throw - let the function complete gracefully
       return null;
     }
-  },
+  }
 );
