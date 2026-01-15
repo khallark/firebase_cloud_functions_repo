@@ -48,6 +48,14 @@ export const onUpcWritten = onDocumentWritten(
     const after = event.data?.after?.data() as UPC | undefined;
     const { businessId } = event.params;
 
+    if (before && !after) {
+      await db.runTransaction(async (transaction) => {
+        transaction.update(db.doc(`users/${businessId}/placements/${before.placementId}`), {
+          quantity: FieldValue.increment(-1),
+        });
+      });
+    }
+
     if (before && after) {
       if (before.putAway === after.putAway) return;
       await db.runTransaction(async (transaction) => {

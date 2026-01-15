@@ -309,15 +309,15 @@ const updateOrderCountsWithTransaction = async (
     .collection("metadata")
     .doc("orderCounts");
 
-  // Use set with merge instead of update to auto-create if needed
-  // This prevents "document not found" errors
-  await metadataRef.set(
-    {
-      ...statusUpdates,
-      lastUpdated: FieldValue.serverTimestamp(),
-    },
-    { merge: true },
-  );
+  // Build updates with proper dot notation for nested fields
+  const updates: Record<string, FieldValue | any> = {};
+  Object.entries(statusUpdates).forEach(([key, value]) => {
+    updates[`counts.${key}`] = value;
+  });
+  updates["lastUpdated"] = FieldValue.serverTimestamp();
+
+  // Use set with merge - dot notation will update nested fields properly
+  await metadataRef.set(updates, { merge: true });
 
   // Update vendor counts with batch if needed
   if (SHARED_STORE_IDS.includes(storeId) && vendors && vendors.length > 0) {
@@ -344,19 +344,17 @@ const updateOrderCountsWithTransaction = async (
           const vendorRef = memberDocQuery.docs[0].ref;
           const vendorDoc = await vendorRef.get();
 
-          const vendorUpdates = {
-            ...statusUpdates,
-            lastUpdated: FieldValue.serverTimestamp(),
-          };
+          // Build vendor updates with proper dot notation
+          const vendorUpdates: Record<string, FieldValue | any> = {};
+          Object.entries(statusUpdates).forEach(([key, value]) => {
+            vendorUpdates[`counts.${key}`] = value;
+          });
+          vendorUpdates["lastUpdated"] = FieldValue.serverTimestamp();
 
           if (vendorDoc.exists) {
             batch.update(vendorRef, vendorUpdates);
           } else {
-            batch.set(
-              vendorRef,
-              { counts: statusUpdates, lastUpdated: FieldValue.serverTimestamp() },
-              { merge: true },
-            );
+            batch.set(vendorRef, vendorUpdates, { merge: true });
           }
 
           batchCount++;
@@ -408,8 +406,8 @@ export const updateOrderCounts = onDocumentWritten(
         await updateOrderCountsWithTransaction(
           storeId,
           {
-            "counts.All Orders": FieldValue.increment(-1),
-            [`counts.${oldStatus}`]: FieldValue.increment(-1),
+            "All Orders": FieldValue.increment(-1),
+            [oldStatus]: FieldValue.increment(-1),
           },
           oldOrder.vendors,
         );
@@ -436,8 +434,8 @@ export const updateOrderCounts = onDocumentWritten(
         await updateOrderCountsWithTransaction(
           storeId,
           {
-            "counts.All Orders": FieldValue.increment(1),
-            [`counts.${newStatus}`]: FieldValue.increment(1),
+            "All Orders": FieldValue.increment(1),
+            [newStatus]: FieldValue.increment(1),
           },
           newOrder.vendors,
         );
@@ -467,8 +465,8 @@ export const updateOrderCounts = onDocumentWritten(
         await updateOrderCountsWithTransaction(
           storeId,
           {
-            [`counts.${oldStatus}`]: FieldValue.increment(-1),
-            [`counts.${newStatus}`]: FieldValue.increment(1),
+            [oldStatus]: FieldValue.increment(-1),
+            [newStatus]: FieldValue.increment(1),
           },
           newOrder.vendors,
         );
