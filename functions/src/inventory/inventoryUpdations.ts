@@ -1,302 +1,141 @@
 import { onDocumentWritten } from "firebase-functions/firestore";
 import { db } from "../firebaseAdmin";
-import { SHARED_STORE_IDS } from "../config";
-// import { sleep } from "../helpers";
+import { SHARED_STORE_ID, SHARED_STORE_IDS } from "../config";
+import { sleep } from "../helpers";
 
-// interface Inventory {
-//   autoAddition: number;
-//   autoDeduction: number;
-//   blockedStock: number;
-//   deduction: number;
-//   inwardAddition: number;
-//   openingStock: number;
-// }
+interface Inventory {
+  autoAddition: number;
+  autoDeduction: number;
+  blockedStock: number;
+  deduction: number;
+  inwardAddition: number;
+  openingStock: number;
+}
 
-// function getInventoryValues(inventory?: Inventory): Inventory {
-//   return {
-//     openingStock: inventory?.openingStock ?? 0,
-//     inwardAddition: inventory?.inwardAddition ?? 0,
-//     deduction: inventory?.deduction ?? 0,
-//     autoAddition: inventory?.autoAddition ?? 0,
-//     autoDeduction: inventory?.autoDeduction ?? 0,
-//     blockedStock: inventory?.blockedStock ?? 0,
-//   };
-// }
+function getInventoryValues(inventory?: Inventory): Inventory {
+  return {
+    openingStock: inventory?.openingStock ?? 0,
+    inwardAddition: inventory?.inwardAddition ?? 0,
+    deduction: inventory?.deduction ?? 0,
+    autoAddition: inventory?.autoAddition ?? 0,
+    autoDeduction: inventory?.autoDeduction ?? 0,
+    blockedStock: inventory?.blockedStock ?? 0,
+  };
+}
 
-// async function shopifyGraphQL(
-//   storeId: string,
-//   accessToken: string,
-//   query: string,
-//   variables?: any,
-// ) {
-//   const res = await fetch(`https://${storeId}/admin/api/2025-07/graphql.json`, {
-//     method: "POST",
-//     headers: {
-//       "Content-Type": "application/json",
-//       "X-Shopify-Access-Token": accessToken,
-//     },
-//     body: JSON.stringify({ query, variables }),
-//   });
+function calculatePhysicalStock(inv: Inventory): number {
+  return (
+    inv.openingStock + inv.inwardAddition - inv.deduction + inv.autoAddition - inv.autoDeduction
+  );
+}
 
-//   const json = (await res.json()) as any;
-//   if (json.errors) {
-//     throw new Error(JSON.stringify(json.errors));
-//   }
-//   return json.data;
-// }
+function calculateAvailableStock(physicalStock: number, blockedStock: number): number {
+  return physicalStock - blockedStock;
+}
 
-// async function ensureTracking(storeId: string, accessToken: string, inventoryItemId: string) {
-//   const data = await shopifyGraphQL(
-//     storeId,
-//     accessToken,
-//     `
-//     query ($id: ID!) {
-//       inventoryItem(id: $id) {
-//         id
-//         tracked
-//       }
-//     }
-//     `,
-//     { id: `gid://shopify/InventoryItem/${inventoryItemId}` },
-//   );
+async function shopifyGraphQL(
+  storeId: string,
+  accessToken: string,
+  query: string,
+  variables?: any,
+) {
+  const res = await fetch(`https://${storeId}/admin/api/2025-07/graphql.json`, {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      "X-Shopify-Access-Token": accessToken,
+    },
+    body: JSON.stringify({ query, variables }),
+  });
 
-//   if (!data.inventoryItem.tracked) {
-//     await shopifyGraphQL(
-//       storeId,
-//       accessToken,
-//       `
-//       mutation ($id: ID!) {
-//         inventoryItemUpdate(
-//           id: $id,
-//           input: { tracked: true }
-//         ) {
-//           inventoryItem { tracked }
-//           userErrors { message }
-//         }
-//       }
-//       `,
-//       { id: `gid://shopify/InventoryItem/${inventoryItemId}` },
-//     );
-//   }
-// }
+  const json = (await res.json()) as any;
+  if (json.errors) {
+    throw new Error(JSON.stringify(json.errors));
+  }
+  return json.data;
+}
 
-// async function setInventory(
-//   storeId: string,
-//   accessToken: string,
-//   inventoryItemId: string,
-//   locationId: string,
-//   quantity: number,
-// ) {
-//   await shopifyGraphQL(
-//     storeId,
-//     accessToken,
-//     `
-//     mutation ($input: [InventorySetQuantityInput!]!) {
-//       inventorySetQuantities(input: $input) {
-//         inventoryLevels { available }
-//         userErrors { message }
-//       }
-//     }
-//     `,
-//     {
-//       input: [
-//         {
-//           inventoryItemId: `gid://shopify/InventoryItem/${inventoryItemId}`,
-//           locationId: `gid://shopify/Location/${locationId}`,
-//           availableQuantity: quantity,
-//         },
-//       ],
-//     },
-//   );
-// }
+async function ensureTracking(storeId: string, accessToken: string, inventoryItemId: string) {
+  const data = await shopifyGraphQL(
+    storeId,
+    accessToken,
+    `
+    query ($id: ID!) {
+      inventoryItem(id: $id) {
+        id
+        tracked
+      }
+    }
+    `,
+    { id: `gid://shopify/InventoryItem/${inventoryItemId}` },
+  );
 
-// function calculatePhysicalStock(inv: Inventory): number {
-//   return (
-//     inv.openingStock + inv.inwardAddition - inv.deduction + inv.autoAddition - inv.autoDeduction
-//   );
-// }
+  if (!data.inventoryItem.tracked) {
+    await shopifyGraphQL(
+      storeId,
+      accessToken,
+      `
+      mutation ($id: ID!) {
+        inventoryItemUpdate(
+          id: $id,
+          input: { tracked: true }
+        ) {
+          inventoryItem { tracked }
+          userErrors { message }
+        }
+      }
+      `,
+      { id: `gid://shopify/InventoryItem/${inventoryItemId}` },
+    );
+  }
+}
 
-// function calculateAvailableStock(physicalStock: number, blockedStock: number): number {
-//   return physicalStock - blockedStock;
-// }
-// export const onProductWritten = onDocumentWritten(
-//   {
-//     document: "users/{businessId}/products/{productId}",
-//     memory: "256MiB",
-//     timeoutSeconds: 300,
-//   },
-//   async (event) => {
-//     const before = event.data?.before?.data();
-//     const after = event.data?.after?.data();
-//     const { businessId, productId } = event.params;
-
-//     if (!before || !after) return null;
-
-//     const beforeMappedVariants: {
-//       mappedAt: string;
-//       productId: string;
-//       productTitle: string;
-//       storeId: string;
-//       variantId: number;
-//       variantSku: string;
-//       variantTitle: string;
-//     }[] = before.mappedVariants || [];
-
-//     const afterMappedVariants: {
-//       mappedAt: string;
-//       productId: string;
-//       productTitle: string;
-//       storeId: string;
-//       variantId: number;
-//       variantSku: string;
-//       variantTitle: string;
-//     }[] = after.mappedVariants || [];
-
-//     if (afterMappedVariants.length - beforeMappedVariants.length === 1) {
-//       const mappedVariantData = afterMappedVariants[afterMappedVariants.length - 1];
-//       const businessDoc = await db.doc(`users/${businessId}`).get();
-//       const businessData = businessDoc.data();
-//       const linkedStores: string[] = businessData?.stores || [];
-//       let blockedItemsCount = 0;
-//       if (businessData?.vendorName) {
-//         for (const store of linkedStores) {
-//           let perStoreBlockedOrdersCount = 0;
-//           let blockedOrdersSnapshot;
-//           if (SHARED_STORE_IDS.includes(store)) {
-//             blockedOrdersSnapshot = await db
-//               .collection('accounts')
-//               .doc(store)
-//               .collection('orders')
-//               .where('vendor', 'array-contains', businessData.vendorName)
-//               .where('customStatus', 'in', ['New', 'Confirm', 'Ready To Dispatch'])
-//               .get();
-//           } else {
-//             blockedOrdersSnapshot = await db
-//               .collection('accounts')
-//               .doc(store)
-//               .collection('orders')
-//               .where('customStatus', 'in', ['New', 'Confirm', 'Ready To Dispatch'])
-//               .get();
-//           }
-
-//           if (!blockedOrdersSnapshot.docs.length) continue;
-//           for (const doc of blockedOrdersSnapshot.docs) {
-//             if (!doc.exists) continue;
-//             const line_items: any[] = doc.data()?.line_items;
-//             if (!line_items.some(item => item.variant_id === mappedVariantData.variantId)) continue;
-//             const matchingItems = line_items.filter(item => item.variant_id === mappedVariantData.variantId);
-//             perStoreBlockedOrdersCount += matchingItems.reduce((sum, item) => sum + item.quantity, 0);
-//           }
-//           blockedItemsCount += perStoreBlockedOrdersCount;
-//         }
-
-//         const productRef = db.doc(`users/${businessId}/products/${productId}`);
-//         await db.runTransaction(async (tx) => {
-//           const currentDoc = await tx.get(productRef);
-//           const currentInventory = currentDoc.data()?.inventory;
-
-//           tx.update(productRef, {
-//             inventory: {
-//               ...(currentInventory || {
-//                 autoAddition: 0,
-//                 autoDeduction: 0,
-//                 blockedStock: 0,
-//                 deduction: 0,
-//                 inwardAddition: 0,
-//                 openingStock: 0,
-//               }),
-//               blockedStock: (currentInventory?.blockedStock || 0) + blockedItemsCount,
-//             }
-//           });
-//         });
-//       }
-//     }
-
-//     return null;
-
-//     // const beforeInv = getInventoryValues(before.inventory);
-//     // const afterInv = getInventoryValues(after.inventory);
-
-//     // const beforeAvailable = calculateAvailableStock(
-//     //   calculatePhysicalStock(beforeInv),
-//     //   beforeInv.blockedStock,
-//     // );
-
-//     // const availableStock = calculateAvailableStock(
-//     //   calculatePhysicalStock(afterInv),
-//     //   afterInv.blockedStock,
-//     // );
-
-//     // if (beforeAvailable === availableStock) {
-//     //   console.log("No effective inventory change");
-//     //   return null;
-//     // }
-
-//     // console.log("Inventory changed", { beforeAvailable, availableStock });
-
-//     // for (const mapping of after.mappedVariants ?? []) {
-//     //   const { storeId, productId, variantId } = mapping;
-
-//     //   if (storeId === SHARED_STORE_ID) continue;
-
-//     //   try {
-//     //     const storeSnap = await db.doc(`accounts/${storeId}`).get();
-//     //     const { accessToken, locationId } = storeSnap.data()!;
-
-//     //     if (!accessToken || !locationId) {
-//     //       console.error("Missing Shopify credentials", storeId);
-//     //       continue;
-//     //     }
-
-//     //     const productSnap = await db.doc(`accounts/${storeId}/products/${productId}`).get();
-
-//     //     const product = productSnap.data();
-//     //     const variant = product?.variants?.find((v: any) => v.id === variantId);
-
-//     //     if (!variant?.inventoryItemId) {
-//     //       console.warn("Missing inventoryItemId", variantId);
-//     //       continue;
-//     //     }
-
-//     //     // 1️⃣ Ensure tracking
-//     //     await ensureTracking(storeId, accessToken, String(variant.inventoryItemId));
-
-//     //     // ⏱ deliberate pause (tracking mutation is expensive)
-//     //     await sleep(150);
-
-//     //     // 2️⃣ Set inventory (absolute overwrite)
-//     //     await setInventory(
-//     //       storeId,
-//     //       accessToken,
-//     //       String(variant.inventoryItemId),
-//     //       locationId,
-//     //       availableStock,
-//     //     );
-
-//     //     // ⏱ pause before next variant
-//     //     await sleep(200);
-//     //   } catch (err) {
-//     //     console.error("Failed to sync inventory", {
-//     //       storeId,
-//     //       variantId,
-//     //       error: err,
-//     //     });
-//     //   }
-//     // }
-
-//     // if (availableStock <= 0) {
-//     //   console.warn(`Placement ${event.params.placementId} out of stock`);
-//     // }
-
-//     // return null;
-//   },
-// );
+async function setInventory(
+  storeId: string,
+  accessToken: string,
+  inventoryItemId: string,
+  locationId: string,
+  quantity: number,
+) {
+  await shopifyGraphQL(
+    storeId,
+    accessToken,
+    `
+    mutation ($input: InventorySetQuantitiesInput!) {
+      inventorySetQuantities(input: $input) {
+        inventorySetQuantities {  // Correct response field
+          inventoryItemId
+          available
+        }
+        userErrors {
+          field
+          message
+        }
+      }
+    }
+    `,
+    {
+      input: {
+        reason: "correction",
+        name: "available",
+        setQuantities: [
+          {
+            // Array inside object
+            inventoryItemId: `gid://shopify/InventoryItem/${inventoryItemId}`,
+            locationId: `gid://shopify/Location/${locationId}`,
+            quantity: quantity, // Correct field name
+          },
+        ],
+      },
+    },
+  );
+}
 
 export const onProductWritten = onDocumentWritten(
   {
     document: "users/{businessId}/products/{productId}",
-    memory: "512MiB",
-    timeoutSeconds: 300,
+    memory: "1GiB",
+    timeoutSeconds: 540,
     maxInstances: 10,
   },
   async (event) => {
@@ -310,133 +149,186 @@ export const onProductWritten = onDocumentWritten(
       const beforeMappedVariants = before.mappedVariants || [];
       const afterMappedVariants = after.mappedVariants || [];
 
-      // Only process when exactly 1 new variant is added
-      if (afterMappedVariants.length - beforeMappedVariants.length !== 1) {
-        return null;
-      }
+      // ============================================================
+      // SCENARIO 1: New variant mapping added
+      // Calculate and add blocked stock for the new variant
+      // ============================================================
+      if (afterMappedVariants.length - beforeMappedVariants.length === 1) {
+        console.log(`📍 New variant mapping detected for product ${productId}`);
 
-      const mappedVariantData = afterMappedVariants[afterMappedVariants.length - 1];
-      const businessDoc = await db.doc(`users/${businessId}`).get();
+        const mappedVariantData = afterMappedVariants[afterMappedVariants.length - 1];
+        const businessDoc = await db.doc(`users/${businessId}`).get();
 
-      if (!businessDoc.exists) {
-        console.error(`Business ${businessId} not found`);
-        return null;
-      }
-
-      const businessData = businessDoc.data();
-
-      if (!businessData?.vendorName) {
-        return null;
-      }
-
-      // Query only the specific store where this variant exists
-      const storeId = mappedVariantData.storeId;
-      const isSharedStore = SHARED_STORE_IDS.includes(storeId);
-
-      let ordersQuery = db
-        .collection("accounts")
-        .doc(storeId)
-        .collection("orders")
-        .where("customStatus", "in", ["New", "Confirmed", "Ready To Dispatch"]);
-
-      const isOWR = businessData.vendorName === "OWR";
-
-      // Apply vendor filtering for shared stores
-      if (isSharedStore) {
-        if (isOWR) {
-          ordersQuery = ordersQuery.where("vendors", "array-contains-any", [
-            "OWR",
-            "BBB",
-            "Ghamand",
-          ]);
+        if (!businessDoc.exists) {
+          console.error(`Business ${businessId} not found`);
+          // Continue to check inventory changes
         } else {
-          ordersQuery = ordersQuery.where("vendors", "array-contains", businessData.vendorName);
-        }
-      }
+          const businessData = businessDoc.data();
 
-      const ordersSnapshot = await ordersQuery.get();
+          if (businessData?.vendorName) {
+            const storeId = mappedVariantData.storeId;
+            const isSharedStore = SHARED_STORE_IDS.includes(storeId);
 
-      // console.log(1, ordersSnapshot.docs.length);
+            let ordersQuery = db
+              .collection("accounts")
+              .doc(storeId)
+              .collection("orders")
+              .where("customStatus", "in", ["New", "Confirmed", "Ready To Dispatch"]);
 
-      // Calculate blocked stock for this specific variant
-      let blockedItemsCount = 0;
+            const isOWR = businessData.vendorName === "OWR";
 
-      for (const doc of ordersSnapshot.docs) {
-        if (!doc.exists) continue;
+            // Apply vendor filtering for shared stores
+            if (isSharedStore) {
+              if (isOWR) {
+                ordersQuery = ordersQuery.where("vendors", "array-contains-any", [
+                  "OWR",
+                  "BBB",
+                  "Ghamand",
+                ]);
+              } else {
+                ordersQuery = ordersQuery.where(
+                  "vendors",
+                  "array-contains",
+                  businessData.vendorName,
+                );
+              }
+            }
 
-        const orderData = doc.data();
-        const vendorArray: string[] = orderData?.vendors || [];
+            const ordersSnapshot = await ordersQuery.get();
 
-        // Filter out orders for OWR in shared stores if they contain ENDORA or STYLE 05
-        if (isSharedStore && isOWR) {
-          const hasExcludedVendor = vendorArray.some((v) => v === "ENDORA" || v === "STYLE 05");
+            // Calculate blocked stock for this specific variant
+            let blockedItemsCount = 0;
 
-          if (hasExcludedVendor) {
-            continue; // Skip this order
+            for (const doc of ordersSnapshot.docs) {
+              if (!doc.exists) continue;
+
+              const orderData = doc.data();
+              const line_items: any[] = orderData?.raw?.line_items || [];
+
+              const totalQuantity = line_items
+                .filter((item) => item.variant_id === mappedVariantData.variantId)
+                .reduce((sum, item) => sum + (Number(item.quantity) || 0), 0);
+
+              blockedItemsCount += totalQuantity;
+            }
+
+            // Update blocked stock in transaction
+            const productRef = db.doc(`users/${businessId}/products/${productId}`);
+
+            await db.runTransaction(async (tx) => {
+              const currentDoc = await tx.get(productRef);
+
+              if (!currentDoc.exists) {
+                console.warn(`Product ${productId} no longer exists`);
+                return;
+              }
+
+              const currentInventory = currentDoc.data()?.inventory;
+              const currentBlockedStock = currentInventory?.blockedStock || 0;
+
+              tx.update(productRef, {
+                inventory: {
+                  ...(currentInventory || {
+                    autoAddition: 0,
+                    autoDeduction: 0,
+                    blockedStock: 0,
+                    deduction: 0,
+                    inwardAddition: 0,
+                    openingStock: 0,
+                  }),
+                  blockedStock: currentBlockedStock + blockedItemsCount,
+                },
+              });
+            });
+
+            console.log(
+              `✅ Updated blocked stock for ${productId} (store: ${storeId}): +${blockedItemsCount}`,
+            );
           }
         }
-
-        const line_items: any[] = orderData?.raw?.line_items || [];
-
-        // console.log(
-        //   2.0,
-        //   orderData?.name,
-        //   line_items.filter((item) => {
-        //     console.log(
-        //       2.1,
-        //       item.variant_id,
-        //       mappedVariantData.variantId,
-        //       typeof item.variant_id,
-        //       typeof mappedVariantData.variantId,
-        //       item.variant_id === mappedVariantData.variantId,
-        //     );
-        //     return item.variant_id === mappedVariantData.variantId;
-        //   }),
-        // );
-
-        const totalQuantity = line_items
-          .filter((item) => item.variant_id === mappedVariantData.variantId)
-          .reduce((sum, item) => sum + (Number(item.quantity) || 0), 0);
-
-        // console.log(3, totalQuantity);
-
-        blockedItemsCount += totalQuantity;
       }
 
-      // Update inventory in a transaction to prevent race conditions
-      const productRef = db.doc(`users/${businessId}/products/${productId}`);
+      // ============================================================
+      // SCENARIO 2: Inventory changed
+      // Sync available stock to Shopify
+      // ============================================================
+      const beforeInv = getInventoryValues(before.inventory);
+      const afterInv = getInventoryValues(after.inventory);
 
-      await db.runTransaction(async (tx) => {
-        const currentDoc = await tx.get(productRef);
-
-        if (!currentDoc.exists) {
-          console.warn(`Product ${productId} no longer exists`);
-          return;
-        }
-
-        // console.log(4, currentDoc.exists);
-
-        const currentInventory = currentDoc.data()?.inventory;
-        const currentBlockedStock = currentInventory?.blockedStock || 0;
-
-        tx.update(productRef, {
-          inventory: {
-            ...(currentInventory || {
-              autoAddition: 0,
-              autoDeduction: 0,
-              blockedStock: 0,
-              deduction: 0,
-              inwardAddition: 0,
-              openingStock: 0,
-            }),
-            blockedStock: currentBlockedStock + blockedItemsCount,
-          },
-        });
-      });
-
-      console.log(
-        `✅ Updated blocked stock for ${productId} (store: ${storeId}): +${blockedItemsCount}`,
+      const beforeAvailable = calculateAvailableStock(
+        calculatePhysicalStock(beforeInv),
+        beforeInv.blockedStock,
       );
+
+      const availableStock = calculateAvailableStock(
+        calculatePhysicalStock(afterInv),
+        afterInv.blockedStock,
+      );
+
+      if (beforeAvailable !== availableStock) {
+        console.log(`📦 Inventory changed for ${productId}`, { beforeAvailable, availableStock });
+
+        // Sync to Shopify for all mapped variants
+        for (const mapping of after.mappedVariants ?? []) {
+          const { storeId, productId: mappedProductId, variantId } = mapping;
+
+          if (storeId === SHARED_STORE_ID) continue;
+
+          try {
+            const storeSnap = await db.doc(`accounts/${storeId}`).get();
+            const storeData = storeSnap.data();
+            const accessToken = storeData?.accessToken;
+            const locationId = storeData?.locationId;
+
+            if (!accessToken || !locationId) {
+              console.error(`Missing Shopify credentials for store ${storeId}`);
+              continue;
+            }
+
+            const productSnap = await db
+              .doc(`accounts/${storeId}/products/${mappedProductId}`)
+              .get();
+            const product = productSnap.data();
+            const variant = product?.variants?.find((v: any) => v.id === variantId);
+
+            if (!variant?.inventoryItemId) {
+              console.warn(`Missing inventoryItemId for variant ${variantId}`);
+              continue;
+            }
+
+            // 1️⃣ Ensure tracking
+            await ensureTracking(storeId, accessToken, String(variant.inventoryItemId));
+
+            // ⏱ Deliberate pause (tracking mutation is expensive)
+            await sleep(150);
+
+            // 2️⃣ Set inventory (absolute overwrite)
+            await setInventory(
+              storeId,
+              accessToken,
+              String(variant.inventoryItemId),
+              locationId,
+              availableStock,
+            );
+
+            console.log(
+              `✅ Synced inventory to Shopify: ${storeId}/${variantId} = ${availableStock}`,
+            );
+
+            // ⏱ Pause before next variant
+            await sleep(200);
+          } catch (err) {
+            console.error(`Failed to sync inventory to Shopify`, {
+              storeId,
+              variantId,
+              error: err,
+            });
+          }
+        }
+      } else {
+        console.log(`⏭️ No effective inventory change for ${productId}`);
+      }
+
       return null;
     } catch (error) {
       console.error("❌ Error in onProductWritten:", error);

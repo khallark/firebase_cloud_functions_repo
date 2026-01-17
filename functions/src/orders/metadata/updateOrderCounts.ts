@@ -1,5 +1,5 @@
 // ============================================================================
-// BACKGROUND FUNCTION: Auto-Update Order Counts & Blocked Stock
+// BACKGROUND FUNCTION: Auto-Update Order Counts & Blocked Stock (With Transactions)
 // ============================================================================
 
 import {
@@ -29,43 +29,43 @@ const POSSIBLE_INVENTORY_CHANGES = (quantity: number): InventoryChangeMatrix => 
 
   return {
     NotExists: {
-      Start: { blockedStock: incr }, // New order created - block stock
-      Dispatched: {}, // Should not happen, but no blocking needed
-      End: {}, // Should not happen, but no blocking needed
+      Start: { blockedStock: incr },
+      Dispatched: {},
+      End: {},
       Exception: {},
     },
 
     Start: {
       Dispatched: {
-        blockedStock: decr, // Order dispatched - unblock stock
+        blockedStock: decr,
       },
       End: {
-        blockedStock: decr, // Order cancelled/RTO - unblock stock
+        blockedStock: decr,
       },
       Exception: {
-        blockedStock: decr, // Order exception - unblock stock
+        blockedStock: decr,
       },
     },
 
     Dispatched: {
       Start: {
-        blockedStock: incr, // Re-dispatching - block stock again
+        blockedStock: incr,
       },
-      End: {}, // Dispatched to End - no blocking change
-      Exception: {}, // Dispatched to Exception - no blocking change
+      End: {},
+      Exception: {},
     },
 
     End: {
       Start: {
-        blockedStock: incr, // Reorder from End - block stock
+        blockedStock: incr,
       },
-      Dispatched: {}, // End to Dispatched - no blocking change
+      Dispatched: {},
       Exception: {},
     },
 
     Exception: {
-      Start: { blockedStock: incr }, // Exception to Start - block stock
-      Dispatched: {}, // Should not happen
+      Start: { blockedStock: incr },
+      Dispatched: {},
       End: {},
     },
   };
@@ -123,7 +123,7 @@ const getInventoryChangeStatus = (
   return [beforeStatus, afterStatus];
 };
 
-// Update blocked stock only - autoDeduction/autoAddition handled by UPC trigger
+// Update blocked stock using transactions for consistency
 const updateBlockedStock = async (
   storeId: string,
   orderId: string,
@@ -139,8 +139,8 @@ const updateBlockedStock = async (
 
   console.log(`📦 Updating blocked stock: ${beforeStatus} → ${afterStatus}`);
 
-  // Collect all inventory updates first
-  const inventoryUpdates: Array<{
+  // Collect all product refs and updates first
+  const productUpdates: Array<{
     ref: DocumentReference;
     updates: Record<string, FieldValue>;
     productSku: string;
@@ -191,19 +191,12 @@ const updateBlockedStock = async (
         .collection("products")
         .doc(businessProductSku);
 
-      const businessProductDoc = await businessProductRef.get();
-
-      if (!businessProductDoc.exists) {
-        console.warn(`⚠️ Business product ${businessProductSku} not found, skipping`);
-        continue;
-      }
-
       const inventoryUpdates_inner: Record<string, FieldValue> = {};
       for (const [key, value] of Object.entries(changes)) {
         inventoryUpdates_inner[`inventory.${key}`] = value;
       }
 
-      inventoryUpdates.push({
+      productUpdates.push({
         ref: businessProductRef,
         updates: inventoryUpdates_inner,
         productSku: businessProductSku,
@@ -216,41 +209,58 @@ const updateBlockedStock = async (
     }
   }
 
-  // Execute all inventory updates in batches
-  if (inventoryUpdates.length > 0) {
-    console.log(
-      `🔄 Prepared ${inventoryUpdates.length} blocked stock updates for order ${orderId}`,
-    );
-    const BATCH_SIZE = 500; // Firestore batch limit
-
-    for (let i = 0; i < inventoryUpdates.length; i += BATCH_SIZE) {
-      const batch = db.batch();
-      const batchItems = inventoryUpdates.slice(i, i + BATCH_SIZE);
-
-      for (const item of batchItems) {
-        console.log(`📝 Adding to batch - SKU: ${item.productSku}, Updates:`, item.updates);
-        batch.update(item.ref, item.updates);
-      }
-
-      try {
-        await batch.commit();
-        console.log(`✅ Batch committed: Updated blocked stock for ${batchItems.length} products`);
-      } catch (error) {
-        console.error(`❌ Failed to commit blocked stock batch:`, error);
-        // Log which products failed
-        batchItems.forEach((item) => {
-          console.error(`   - Failed product: ${item.productSku}`);
-        });
-      }
-    }
-  } else {
+  if (productUpdates.length === 0) {
     console.log(`⚠️ No blocked stock updates prepared for order ${orderId}`);
+    return;
+  }
+
+  console.log(`🔄 Prepared ${productUpdates.length} blocked stock updates for order ${orderId}`);
+
+  // Execute updates in transactions (max 500 docs per transaction)
+  const TRANSACTION_LIMIT = 500;
+
+  for (let i = 0; i < productUpdates.length; i += TRANSACTION_LIMIT) {
+    const chunk = productUpdates.slice(i, i + TRANSACTION_LIMIT);
+
+    try {
+      await db.runTransaction(async (transaction) => {
+        // Read all products first (transaction requirement)
+        const productDocs = await Promise.all(chunk.map((item) => transaction.get(item.ref)));
+
+        // Verify all products exist
+        const missingProducts: string[] = [];
+        productDocs.forEach((doc, index) => {
+          if (!doc.exists) {
+            missingProducts.push(chunk[index].productSku);
+          }
+        });
+
+        if (missingProducts.length > 0) {
+          console.warn(`⚠️ Products not found: ${missingProducts.join(", ")}`);
+        }
+
+        // Apply updates
+        chunk.forEach((item, index) => {
+          if (productDocs[index].exists) {
+            console.log(`📝 Updating product ${item.productSku}:`, item.updates);
+            transaction.update(item.ref, item.updates);
+          }
+        });
+      });
+
+      console.log(`✅ Transaction committed: Updated blocked stock for ${chunk.length} products`);
+    } catch (error) {
+      console.error(`❌ Failed to commit transaction for products:`, error);
+      chunk.forEach((item) => {
+        console.error(`   - Failed product: ${item.productSku}`);
+      });
+    }
   }
 
   console.log(`📦 Blocked stock update complete for order ${orderId}`);
 };
 
-// Update order counts - using set with merge to handle missing documents
+// Update order counts using a proper transaction
 const updateOrderCountsWithTransaction = async (
   storeId: string,
   statusUpdates: Record<string, FieldValue>,
@@ -263,25 +273,21 @@ const updateOrderCountsWithTransaction = async (
     .doc("orderCounts");
 
   // Build updates with proper dot notation for nested fields
-  const updates: Record<string, FieldValue | any> = {};
+  const countUpdates: Record<string, FieldValue | any> = {};
   Object.entries(statusUpdates).forEach(([key, value]) => {
-    updates[`counts.${key}`] = value;
+    countUpdates[`counts.${key}`] = value;
   });
-  updates["lastUpdated"] = FieldValue.serverTimestamp();
+  countUpdates["lastUpdated"] = FieldValue.serverTimestamp();
 
-  // Use set with merge - dot notation will update nested fields properly
-  await metadataRef.set(updates, { merge: true });
+  // Get vendor refs if needed
+  const vendorRefs: DocumentReference[] = [];
 
-  // Update vendor counts with batch if needed
   if (SHARED_STORE_IDS.includes(storeId) && vendors && vendors.length > 0) {
-    console.log("Shared Store detected, updating vendor counts...");
+    console.log("Shared Store detected, preparing vendor count updates...");
 
     const uniqueVendors = [
       ...new Set(vendors.map((v) => (["ghamand", "bbb"].includes(v.toLowerCase()) ? "OWR" : v))),
     ];
-
-    const batch = db.batch();
-    let batchCount = 0;
 
     for (const vendor of uniqueVendors) {
       try {
@@ -294,39 +300,59 @@ const updateOrderCountsWithTransaction = async (
           .get();
 
         if (!memberDocQuery.empty) {
-          const vendorRef = memberDocQuery.docs[0].ref;
-          const vendorDoc = await vendorRef.get();
-
-          // Build vendor updates with proper dot notation
-          const vendorUpdates: Record<string, FieldValue | any> = {};
-          Object.entries(statusUpdates).forEach(([key, value]) => {
-            vendorUpdates[`counts.${key}`] = value;
-          });
-          vendorUpdates["lastUpdated"] = FieldValue.serverTimestamp();
-
-          if (vendorDoc.exists) {
-            batch.update(vendorRef, vendorUpdates);
-          } else {
-            batch.set(vendorRef, vendorUpdates, { merge: true });
-          }
-
-          batchCount++;
-          console.log(`Added vendor ${vendor} to batch`);
+          vendorRefs.push(memberDocQuery.docs[0].ref);
+          console.log(`Added vendor ${vendor} to transaction`);
         }
       } catch (error) {
-        console.error(`❌ Failed to prepare vendor ${vendor} update:`, error);
+        console.error(`❌ Failed to prepare vendor ${vendor}:`, error);
       }
     }
+  }
 
-    // Commit vendor updates batch
-    if (batchCount > 0) {
-      try {
-        await batch.commit();
-        console.log(`✅ Vendor batch committed: Updated ${batchCount} vendors`);
-      } catch (error) {
-        console.error(`❌ Failed to commit vendor batch:`, error);
+  // Execute everything in a single transaction for consistency
+  try {
+    await db.runTransaction(async (transaction) => {
+      // Read all documents first (transaction requirement)
+      const metadataDoc = await transaction.get(metadataRef);
+      const vendorDocs = await Promise.all(vendorRefs.map((ref) => transaction.get(ref)));
+
+      // Update order counts metadata
+      if (metadataDoc.exists) {
+        transaction.update(metadataRef, countUpdates);
+      } else {
+        // Initialize if doesn't exist
+        transaction.set(metadataRef, {
+          counts: {},
+          lastUpdated: FieldValue.serverTimestamp(),
+        });
+        transaction.update(metadataRef, countUpdates);
       }
-    }
+
+      // Update vendor counts
+      const vendorUpdates: Record<string, FieldValue | any> = {};
+      Object.entries(statusUpdates).forEach(([key, value]) => {
+        vendorUpdates[`counts.${key}`] = value;
+      });
+      vendorUpdates["lastUpdated"] = FieldValue.serverTimestamp();
+
+      vendorDocs.forEach((vendorDoc, index) => {
+        if (vendorDoc.exists) {
+          transaction.update(vendorRefs[index], vendorUpdates);
+        } else {
+          // Initialize if doesn't exist
+          transaction.set(vendorRefs[index], {
+            counts: {},
+            lastUpdated: FieldValue.serverTimestamp(),
+          });
+          transaction.update(vendorRefs[index], vendorUpdates);
+        }
+      });
+    });
+
+    console.log(`✅ Order counts transaction committed (${vendorRefs.length} vendors updated)`);
+  } catch (error) {
+    console.error(`❌ Failed to update order counts:`, error);
+    throw error; // Re-throw to handle at caller level
   }
 };
 
@@ -426,11 +452,6 @@ export const updateOrderCounts = onDocumentWritten(
         console.log(`✅ Updated counts: ${oldStatus} → ${newStatus}`);
       } catch (error) {
         console.error(`❌ Failed to update counts:`, error);
-        if ((error as any).code === "not-found") {
-          console.error(
-            `⚠️ Metadata not found for ${storeId}. Please run initializeMetadata function first.`,
-          );
-        }
       }
     } else {
       console.log(`⏭️ No status change for order ${orderId}`);
