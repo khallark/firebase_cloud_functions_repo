@@ -337,24 +337,26 @@ export const onProductWritten = onDocumentWritten(
         .collection("accounts")
         .doc(storeId)
         .collection("orders")
-        .where("customStatus", "in", ["New", "Confirm", "Ready To Dispatch"]);
+        .where("customStatus", "in", ["New", "Confirmed", "Ready To Dispatch"]);
 
       const isOWR = businessData.vendorName === "OWR";
 
       // Apply vendor filtering for shared stores
       if (isSharedStore) {
         if (isOWR) {
-          ordersQuery = ordersQuery.where("vendor", "array-contains-any", [
+          ordersQuery = ordersQuery.where("vendors", "array-contains-any", [
             "OWR",
             "BBB",
             "Ghamand",
           ]);
         } else {
-          ordersQuery = ordersQuery.where("vendor", "array-contains", businessData.vendorName);
+          ordersQuery = ordersQuery.where("vendors", "array-contains", businessData.vendorName);
         }
       }
 
       const ordersSnapshot = await ordersQuery.get();
+
+      // console.log(1, ordersSnapshot.docs.length);
 
       // Calculate blocked stock for this specific variant
       let blockedItemsCount = 0;
@@ -363,7 +365,7 @@ export const onProductWritten = onDocumentWritten(
         if (!doc.exists) continue;
 
         const orderData = doc.data();
-        const vendorArray: string[] = orderData?.vendor || [];
+        const vendorArray: string[] = orderData?.vendors || [];
 
         // Filter out orders for OWR in shared stores if they contain ENDORA or STYLE 05
         if (isSharedStore && isOWR) {
@@ -374,11 +376,29 @@ export const onProductWritten = onDocumentWritten(
           }
         }
 
-        const line_items: any[] = orderData?.line_items || [];
+        const line_items: any[] = orderData?.raw?.line_items || [];
+
+        // console.log(
+        //   2.0,
+        //   orderData?.name,
+        //   line_items.filter((item) => {
+        //     console.log(
+        //       2.1,
+        //       item.variant_id,
+        //       mappedVariantData.variantId,
+        //       typeof item.variant_id,
+        //       typeof mappedVariantData.variantId,
+        //       item.variant_id === mappedVariantData.variantId,
+        //     );
+        //     return item.variant_id === mappedVariantData.variantId;
+        //   }),
+        // );
 
         const totalQuantity = line_items
           .filter((item) => item.variant_id === mappedVariantData.variantId)
           .reduce((sum, item) => sum + (Number(item.quantity) || 0), 0);
+
+        // console.log(3, totalQuantity);
 
         blockedItemsCount += totalQuantity;
       }
@@ -393,6 +413,8 @@ export const onProductWritten = onDocumentWritten(
           console.warn(`Product ${productId} no longer exists`);
           return;
         }
+
+        // console.log(4, currentDoc.exists);
 
         const currentInventory = currentDoc.data()?.inventory;
         const currentBlockedStock = currentInventory?.blockedStock || 0;
@@ -413,7 +435,7 @@ export const onProductWritten = onDocumentWritten(
       });
 
       console.log(
-        `✅ Updated blocked stock for ${productId} (store: ${storeId}): +${blockedItemsCount}`
+        `✅ Updated blocked stock for ${productId} (store: ${storeId}): +${blockedItemsCount}`,
       );
       return null;
     } catch (error) {
@@ -421,5 +443,5 @@ export const onProductWritten = onDocumentWritten(
       // Don't throw - let the function complete gracefully
       return null;
     }
-  }
+  },
 );

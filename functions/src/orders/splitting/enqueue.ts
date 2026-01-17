@@ -41,7 +41,7 @@ export const enqueueOrderSplitBatch = onRequest(
         return;
       }
 
-      if (SHARED_STORE_IDS.includes(shop)) {
+      if (!SHARED_STORE_IDS.includes(shop)) {
         console.error("invalid_shop_order_for_splitting");
         res.status(403).json({ error: "invalid_shop_order_for_splitting" });
         return;

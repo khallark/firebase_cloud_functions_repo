@@ -1,5 +1,5 @@
 // ============================================================================
-// BACKGROUND FUNCTION: Auto-Update Order Counts (Optimized with Transactions)
+// BACKGROUND FUNCTION: Auto-Update Order Counts & Blocked Stock
 // ============================================================================
 
 import {
@@ -16,8 +16,6 @@ type InventoryStatus = "NotExists" | "Start" | "Dispatched" | "End" | "Exception
 
 type InventoryDelta = Partial<{
   blockedStock: FieldValue;
-  autoDeduction: FieldValue;
-  autoAddition: FieldValue;
 }>;
 
 type InventoryChangeMatrix = Record<
@@ -28,64 +26,47 @@ type InventoryChangeMatrix = Record<
 const POSSIBLE_INVENTORY_CHANGES = (quantity: number): InventoryChangeMatrix => {
   const incr = FieldValue.increment(quantity);
   const decr = FieldValue.increment(-quantity);
-  const same = FieldValue.increment(0);
 
   return {
     NotExists: {
-      Start: { blockedStock: incr },
-      Dispatched: { autoDeduction: incr },
-      End: { autoAddition: incr },
+      Start: { blockedStock: incr }, // New order created - block stock
+      Dispatched: {}, // Should not happen, but no blocking needed
+      End: {}, // Should not happen, but no blocking needed
       Exception: {},
     },
 
     Start: {
       Dispatched: {
-        blockedStock: decr,
-        autoDeduction: incr,
+        blockedStock: decr, // Order dispatched - unblock stock
       },
       End: {
-        blockedStock: decr,
-        autoAddition: incr,
+        blockedStock: decr, // Order cancelled/RTO - unblock stock
       },
       Exception: {
-        blockedStock: decr,
+        blockedStock: decr, // Order exception - unblock stock
       },
     },
 
     Dispatched: {
       Start: {
-        blockedStock: incr,
-        autoDeduction: decr,
+        blockedStock: incr, // Re-dispatching - block stock again
       },
-      End: {
-        autoDeduction: same,
-        autoAddition: incr,
-      },
-      Exception: {
-        // Not sure yet
-        autoDeduction: same,
-      },
+      End: {}, // Dispatched to End - no blocking change
+      Exception: {}, // Dispatched to Exception - no blocking change
     },
 
     End: {
       Start: {
-        // Not sure yet
-        blockedStock: incr,
-        autoAddition: same,
+        blockedStock: incr, // Reorder from End - block stock
       },
-      Dispatched: {
-        autoDeduction: same,
-        autoAddition: decr,
-      },
-      Exception: {
-        autoAddition: same,
-      },
+      Dispatched: {}, // End to Dispatched - no blocking change
+      Exception: {},
     },
 
     Exception: {
-      Start: { blockedStock: incr },
-      Dispatched: { autoDeduction: same }, // This is not likely to happen
-      End: { autoAddition: same }, // This is not likely to happen
+      Start: { blockedStock: incr }, // Exception to Start - block stock
+      Dispatched: {}, // Should not happen
+      End: {},
     },
   };
 };
@@ -142,8 +123,8 @@ const getInventoryChangeStatus = (
   return [beforeStatus, afterStatus];
 };
 
-// Batch inventory updates for better performance
-const updateInventory = async (
+// Update blocked stock only - autoDeduction/autoAddition handled by UPC trigger
+const updateBlockedStock = async (
   storeId: string,
   orderId: string,
   orderData: DocumentData,
@@ -152,11 +133,11 @@ const updateInventory = async (
   line_items: any[],
 ) => {
   if (beforeStatus === afterStatus) {
-    console.log(`⏭️ No inventory status change (${beforeStatus}), skipping inventory update`);
+    console.log(`⏭️ No inventory status change (${beforeStatus}), skipping blocked stock update`);
     return;
   }
 
-  console.log(`📦 Updating inventory: ${beforeStatus} → ${afterStatus}`);
+  console.log(`📦 Updating blocked stock: ${beforeStatus} → ${afterStatus}`);
 
   // Collect all inventory updates first
   const inventoryUpdates: Array<{
@@ -217,40 +198,6 @@ const updateInventory = async (
         continue;
       }
 
-      const BPMappedVariants = businessProductDoc.data()?.mappedVariants as
-        | {
-            mappedAt: string;
-            productId: string;
-            productTitle: string;
-            storeId: string;
-            variantId: number;
-            variantSku: string;
-            variantTitle: string;
-          }[]
-        | undefined;
-
-      const productMappedAt = BPMappedVariants?.filter(
-        (el) => el.variantId !== item.variant_id,
-      )?.[0]?.mappedAt;
-      const orderCreatedAt = orderData.createdAt as string;
-
-      if (!productMappedAt) {
-        console.warn(
-          `⚠️ Mapping details not found in the Business product ${businessProductSku}, skipping`,
-        );
-        continue;
-      }
-
-      const prodMappedDate = new Date(productMappedAt);
-      const orderCreatedDate = new Date(orderCreatedAt);
-
-      if (prodMappedDate > orderCreatedDate) {
-        console.warn(
-          `⚠️ The mapping between business product "${businessProductSku}" and store product variant "${variant_id}" was created after the existence of this order. The inventory will be tracked for only those orders which were created after the mapping creation, skipping.`,
-        );
-        continue;
-      }
-
       const inventoryUpdates_inner: Record<string, FieldValue> = {};
       for (const [key, value] of Object.entries(changes)) {
         inventoryUpdates_inner[`inventory.${key}`] = value;
@@ -263,7 +210,7 @@ const updateInventory = async (
       });
     } catch (error) {
       console.error(
-        `❌ Failed to prepare inventory update for product ${product_id}, variant ${variant_id}:`,
+        `❌ Failed to prepare blocked stock update for product ${product_id}, variant ${variant_id}:`,
         error,
       );
     }
@@ -271,6 +218,9 @@ const updateInventory = async (
 
   // Execute all inventory updates in batches
   if (inventoryUpdates.length > 0) {
+    console.log(
+      `🔄 Prepared ${inventoryUpdates.length} blocked stock updates for order ${orderId}`,
+    );
     const BATCH_SIZE = 500; // Firestore batch limit
 
     for (let i = 0; i < inventoryUpdates.length; i += BATCH_SIZE) {
@@ -278,23 +228,26 @@ const updateInventory = async (
       const batchItems = inventoryUpdates.slice(i, i + BATCH_SIZE);
 
       for (const item of batchItems) {
+        console.log(`📝 Adding to batch - SKU: ${item.productSku}, Updates:`, item.updates);
         batch.update(item.ref, item.updates);
       }
 
       try {
         await batch.commit();
-        console.log(`✅ Batch committed: Updated inventory for ${batchItems.length} products`);
+        console.log(`✅ Batch committed: Updated blocked stock for ${batchItems.length} products`);
       } catch (error) {
-        console.error(`❌ Failed to commit inventory batch:`, error);
+        console.error(`❌ Failed to commit blocked stock batch:`, error);
         // Log which products failed
         batchItems.forEach((item) => {
           console.error(`   - Failed product: ${item.productSku}`);
         });
       }
     }
+  } else {
+    console.log(`⚠️ No blocked stock updates prepared for order ${orderId}`);
   }
 
-  console.log(`📦 Inventory update complete for order ${orderId}`);
+  console.log(`📦 Blocked stock update complete for order ${orderId}`);
 };
 
 // Update order counts - using set with merge to handle missing documents
@@ -380,7 +333,7 @@ const updateOrderCountsWithTransaction = async (
 export const updateOrderCounts = onDocumentWritten(
   {
     document: "accounts/{storeId}/orders/{orderId}",
-    memory: "256MiB",
+    memory: "512MiB",
   },
   async (event) => {
     const storeId = event.params.storeId;
@@ -417,7 +370,7 @@ export const updateOrderCounts = onDocumentWritten(
       }
 
       const line_items = oldOrder?.raw?.line_items || [];
-      await updateInventory(storeId, orderId, oldOrder, beforeStatus, afterStatus, line_items);
+      await updateBlockedStock(storeId, orderId, oldOrder, beforeStatus, afterStatus, line_items);
       return;
     }
 
@@ -445,7 +398,7 @@ export const updateOrderCounts = onDocumentWritten(
       }
 
       const line_items = newOrder?.raw?.line_items || [];
-      await updateInventory(storeId, orderId, newOrder, beforeStatus, afterStatus, line_items);
+      await updateBlockedStock(storeId, orderId, newOrder, beforeStatus, afterStatus, line_items);
       return;
     }
 
@@ -484,6 +437,6 @@ export const updateOrderCounts = onDocumentWritten(
     }
 
     const line_items = newOrder?.raw?.line_items || [];
-    await updateInventory(storeId, orderId, oldOrder, beforeStatus, afterStatus, line_items);
+    await updateBlockedStock(storeId, orderId, oldOrder, beforeStatus, afterStatus, line_items);
   },
 );

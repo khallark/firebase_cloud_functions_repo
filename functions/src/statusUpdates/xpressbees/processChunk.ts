@@ -219,6 +219,7 @@ function prepareXpressbeesOrderUpdates(orders: any[], trackingDataArray: any[]):
           }),
         },
       });
+      continue;
     }
 
     updates.push({

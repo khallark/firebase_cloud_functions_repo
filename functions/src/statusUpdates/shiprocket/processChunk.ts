@@ -219,6 +219,7 @@ function prepareShiprocketOrderUpdates(orders: any[], trackingData: any): OrderU
           }),
         },
       });
+      continue;
     }
 
     updates.push({

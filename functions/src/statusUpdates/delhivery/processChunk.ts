@@ -198,6 +198,7 @@ function prepareDelhiveryOrderUpdates(orders: any[], shipments: any[]): OrderUpd
           }),
         },
       });
+      continue;
     }
     if (newStatus === "Closed/Cancelled Conditional") {
       if (order.customStatus === "DTO Booked") {

@@ -181,11 +181,11 @@ export interface UPC {
   putAway: "none" | "inbound" | "outbound" | null;
 
   productId: string;
-  warehouseId: string;
-  zoneId: string;
-  rackId: string;
-  shelfId: string;
-  placementId: string;
+  warehouseId: string | null;
+  zoneId: string | null;
+  rackId: string | null;
+  shelfId: string | null;
+  placementId: string | null;
 }
 
 // users/{businessId}/placements/{placementId}/logs/{logId}

@@ -46,28 +46,127 @@ export const onUpcWritten = onDocumentWritten(
   async (event) => {
     const before = event.data?.before?.data() as UPC | undefined;
     const after = event.data?.after?.data() as UPC | undefined;
-    const { businessId } = event.params;
+    const { businessId, upcId } = event.params;
 
+    // ============================================================
+    // CASE 1: UPC Created With putAway as 'inbound'
+    // ============================================================
+    if (!before && after) {
+      if (after.putAway === "inbound") {
+        console.log(`UPC ${upcId} created with 'inbound' putAway - incrementing autoAddition`);
+        await db.runTransaction(async (transaction) => {
+          const productRef = db.doc(`users/${businessId}/products/${after.productId}`);
+          const productDoc = await transaction.get(productRef);
+
+          if (!productDoc.exists) {
+            console.warn(`⚠️ Product ${after.productId} not found for UPC ${upcId}`);
+            return;
+          }
+
+          transaction.update(productRef, {
+            "inventory.autoAddition": FieldValue.increment(1),
+          });
+        });
+      }
+      return;
+    }
+
+    // ============================================================
+    // CASE 2: UPC Deleted
+    // ============================================================
     if (before && !after) {
+      console.log(`🗑️ UPC ${upcId} deleted - decrementing placement quantity`);
+
       await db.runTransaction(async (transaction) => {
-        transaction.update(db.doc(`users/${businessId}/placements/${before.placementId}`), {
+        const placementRef = db.doc(`users/${businessId}/placements/${before.placementId}`);
+        transaction.update(placementRef, {
           quantity: FieldValue.increment(-1),
         });
       });
+
+      return;
     }
 
+    // ============================================================
+    // CASE 3: UPC Updated
+    // ============================================================
     if (before && after) {
-      if (before.putAway === after.putAway) return;
+      // Skip if putAway hasn't changed
+      if (before.putAway === after.putAway) {
+        console.log(`⏭️ UPC ${upcId} - no putAway change, skipping`);
+        return;
+      }
+
+      console.log(`📦 UPC ${upcId} putAway changed: ${before.putAway} → ${after.putAway}`);
+
       await db.runTransaction(async (transaction) => {
-        if (before.putAway === "none") {
-          transaction.update(db.doc(`users/${businessId}/placements/${before.placementId}`), {
-            quantity: FieldValue.increment(-1),
-          });
-        }
-        if (after.putAway === "none") {
-          transaction.update(db.doc(`users/${businessId}/placements/${after.placementId}`), {
+        // --------------------------------------------------------
+        // Handle placement quantity changes
+        // --------------------------------------------------------
+        if (after.putAway === "none" && before.putAway !== "none") {
+          // UPC returned to placement - increment placement quantity
+          const placementRef = db.doc(`users/${businessId}/placements/${after.placementId}`);
+          transaction.update(placementRef, {
             quantity: FieldValue.increment(1),
           });
+          console.log(`  ✓ Incremented placement quantity for ${after.placementId}`);
+        }
+
+        if (after.putAway === "outbound" && before.putAway === "none") {
+          // UPC moved from placement to outbound - decrement placement quantity
+          const placementRef = db.doc(`users/${businessId}/placements/${before.placementId}`);
+          transaction.update(placementRef, {
+            quantity: FieldValue.increment(-1),
+          });
+          console.log(`  ✓ Decremented placement quantity for ${before.placementId}`);
+        }
+
+        // --------------------------------------------------------
+        // Handle inventory auto deduction/addition
+        // --------------------------------------------------------
+
+        // CASE A: putAway becomes null → Order dispatched → autoDeduction++
+        if (after.putAway === null && before.putAway !== null) {
+          if (!after.productId) {
+            console.warn(`⚠️ UPC ${upcId} has no productId, skipping autoDeduction`);
+            return;
+          }
+
+          const productRef = db.doc(`users/${businessId}/products/${after.productId}`);
+          const productDoc = await transaction.get(productRef);
+
+          if (!productDoc.exists) {
+            console.warn(`⚠️ Product ${after.productId} not found for UPC ${upcId}`);
+            return;
+          }
+
+          transaction.update(productRef, {
+            "inventory.autoDeduction": FieldValue.increment(1),
+          });
+
+          console.log(`  ✅ Incremented autoDeduction for product ${after.productId}`);
+        }
+
+        // CASE B: putAway becomes "inbound" → Product returned → autoAddition++
+        if (after.putAway === "inbound" && before.putAway !== "inbound") {
+          if (!after.productId) {
+            console.warn(`⚠️ UPC ${upcId} has no productId, skipping autoAddition`);
+            return;
+          }
+
+          const productRef = db.doc(`users/${businessId}/products/${after.productId}`);
+          const productDoc = await transaction.get(productRef);
+
+          if (!productDoc.exists) {
+            console.warn(`⚠️ Product ${after.productId} not found for UPC ${upcId}`);
+            return;
+          }
+
+          transaction.update(productRef, {
+            "inventory.autoAddition": FieldValue.increment(1),
+          });
+
+          console.log(`  ✅ Incremented autoAddition for product ${after.productId}`);
         }
       });
     }
