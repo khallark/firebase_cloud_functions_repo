@@ -7,3 +7,4 @@ export * from "./migrateReturnStatusLogs";
 export * from "./migrateRefundedAmounts";
 export * from "./migrateProductsOnShopify";
 export * from "./migrateBlockedStock";
+export * from "./migrateInventorySync";

@@ -75,6 +75,10 @@ export const onUpcWritten = onDocumentWritten(
     // CASE 2: UPC Deleted
     // ============================================================
     if (before && !after) {
+      if (before.putAway !== "none") {
+        console.log(`🗑️ UPC ${upcId} deleted but not in the warehouse:`, before);
+        return;
+      }
       console.log(`🗑️ UPC ${upcId} deleted - decrementing placement quantity`);
 
       await db.runTransaction(async (transaction) => {
@@ -104,12 +108,55 @@ export const onUpcWritten = onDocumentWritten(
         // Handle placement quantity changes
         // --------------------------------------------------------
         if (after.putAway === "none" && before.putAway !== "none") {
-          // UPC returned to placement - increment placement quantity
           const placementRef = db.doc(`users/${businessId}/placements/${after.placementId}`);
-          transaction.update(placementRef, {
-            quantity: FieldValue.increment(1),
-          });
-          console.log(`  ✓ Incremented placement quantity for ${after.placementId}`);
+
+          const placementSnap = await transaction.get(placementRef);
+
+          if (!placementSnap.exists) {
+            console.log(
+              `🆕 The placement ${after.placementId} for this upc doesn't exists which means that it is definitely being put away from 'inbound' to 'none', Creating placement ${after.placementId}`,
+            );
+
+            const newPlacement: Placement = {
+              id: after.placementId,
+              productId: after.productId,
+
+              warehouseId: after.warehouseId!,
+              zoneId: after.zoneId!,
+              rackId: after.rackId!,
+              shelfId: after.shelfId,
+
+              quantity: 1,
+
+              createUPCs: false,
+
+              createdAt: Timestamp.now(),
+              updatedAt: Timestamp.now(),
+
+              createdBy: after.updatedBy,
+              updatedBy: after.updatedBy,
+
+              lastMovementReason: null,
+              lastMovementReference: null,
+            };
+
+            transaction.set(placementRef, newPlacement);
+
+            console.log(`  ✓ Put-away handled for ${after.placementId}`);
+          } else {
+            console.log(
+              `🆕 The placement ${after.placementId} for this upc exists, incrementing the quantity`,
+            );
+
+            // UPC returned to placement - increment placement quantity
+            transaction.update(placementRef, {
+              quantity: FieldValue.increment(1),
+              updatedAt: Timestamp.now(),
+              updatedBy: after.updatedBy,
+            });
+
+            console.log(`  ✓ Incremented placement quantity for ${after.placementId}`);
+          }
         }
 
         if (after.putAway === "outbound" && before.putAway === "none") {

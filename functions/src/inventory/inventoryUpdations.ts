@@ -52,7 +52,18 @@ async function shopifyGraphQL(
   if (json.errors) {
     throw new Error(JSON.stringify(json.errors));
   }
-  return json.data;
+
+  // Check for userErrors in mutations
+  const data = json.data;
+  if (data) {
+    const mutationKey = Object.keys(data)[0];
+    if (data[mutationKey]?.userErrors?.length > 0) {
+      console.error("Shopify userErrors:", JSON.stringify(data[mutationKey].userErrors, null, 2));
+      throw new Error(`Shopify userErrors: ${JSON.stringify(data[mutationKey].userErrors)}`);
+    }
+  }
+
+  return data;
 }
 
 async function ensureTracking(storeId: string, accessToken: string, inventoryItemId: string) {
@@ -97,19 +108,26 @@ async function setInventory(
   locationId: string,
   quantity: number,
 ) {
-  await shopifyGraphQL(
+  const result = await shopifyGraphQL(
     storeId,
     accessToken,
     `
     mutation ($input: InventorySetQuantitiesInput!) {
       inventorySetQuantities(input: $input) {
-        inventorySetQuantities {  // Correct response field
-          inventoryItemId
-          available
-        }
         userErrors {
           field
           message
+        }
+        inventoryAdjustmentGroup {
+          reason
+          changes {
+            name
+            delta
+            quantityAfterChange
+            item {
+              id
+            }
+          }
         }
       }
     }
@@ -118,17 +136,18 @@ async function setInventory(
       input: {
         reason: "correction",
         name: "available",
-        setQuantities: [
+        ignoreCompareQuantity: true,
+        quantities: [
           {
-            // Array inside object
             inventoryItemId: `gid://shopify/InventoryItem/${inventoryItemId}`,
             locationId: `gid://shopify/Location/${locationId}`,
-            quantity: quantity, // Correct field name
+            quantity: quantity,
           },
         ],
       },
     },
   );
+  return result;
 }
 
 export const onProductWritten = onDocumentWritten(
@@ -244,6 +263,66 @@ export const onProductWritten = onDocumentWritten(
             console.log(
               `✅ Updated blocked stock for ${productId} (store: ${storeId}): +${blockedItemsCount}`,
             );
+
+            // 🆕 Sync the new available stock to Shopify for this newly mapped variant
+            try {
+              const storeSnap = await db.doc(`accounts/${storeId}`).get();
+              const storeData = storeSnap.data();
+              const accessToken = storeData?.accessToken;
+              const locationId = storeData?.locationId;
+
+              if (!accessToken || !locationId) {
+                console.error(`Missing Shopify credentials for store ${storeId}`);
+              } else {
+                const productSnap = await db
+                  .doc(`accounts/${storeId}/products/${mappedVariantData.productId}`)
+                  .get();
+                const product = productSnap.data();
+                const variant = product?.variants?.find(
+                  (v: any) => v.id === mappedVariantData.variantId,
+                );
+
+                if (!variant?.inventoryItemId) {
+                  console.warn(
+                    `Missing inventoryItemId for variant ${mappedVariantData.variantId}`,
+                  );
+                } else {
+                  // Get the updated product data after transaction
+                  const updatedProductSnap = await db
+                    .doc(`users/${businessId}/products/${productId}`)
+                    .get();
+                  const updatedProduct = updatedProductSnap.data();
+                  const updatedInv = getInventoryValues(updatedProduct?.inventory);
+                  const updatedAvailableStock = calculateAvailableStock(
+                    calculatePhysicalStock(updatedInv),
+                    updatedInv.blockedStock,
+                  );
+
+                  // Ensure tracking
+                  await ensureTracking(storeId, accessToken, String(variant.inventoryItemId));
+                  await sleep(150);
+
+                  // Set inventory
+                  await setInventory(
+                    storeId,
+                    accessToken,
+                    String(variant.inventoryItemId),
+                    locationId,
+                    updatedAvailableStock,
+                  );
+
+                  console.log(
+                    `✅ Synced new mapping to Shopify: ${storeId}/${mappedVariantData.variantId} = ${updatedAvailableStock}`,
+                  );
+                }
+              }
+            } catch (err) {
+              console.error(`Failed to sync new mapping to Shopify`, {
+                storeId,
+                variantId: mappedVariantData.variantId,
+                error: err,
+              });
+            }
           }
         }
       }

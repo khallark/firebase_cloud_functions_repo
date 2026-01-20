@@ -168,25 +168,45 @@ export interface Placement {
 }
 
 // users/{businessId}/upcs/{upcId}
-export interface UPC {
-  id: string;
-  createdAt: Timestamp;
-  updatedAt: Timestamp;
-  createdBy: string;
-  updatedBy: string;
+export type UPC =
+  | {
+      id: string;
+      createdAt: Timestamp;
+      updatedAt: Timestamp;
+      createdBy: string;
+      updatedBy: string;
 
-  storeId: string | null;
-  orderId: string | null;
+      storeId: string | null;
+      orderId: string | null;
 
-  putAway: "none" | "inbound" | "outbound" | null;
+      putAway: "none" | "outbound" | null;
 
-  productId: string;
-  warehouseId: string | null;
-  zoneId: string | null;
-  rackId: string | null;
-  shelfId: string | null;
-  placementId: string | null;
-}
+      productId: string;
+      warehouseId: string;
+      zoneId: string;
+      rackId: string;
+      shelfId: string;
+      placementId: string;
+    }
+  | {
+      id: string;
+      createdAt: Timestamp;
+      updatedAt: Timestamp;
+      createdBy: string;
+      updatedBy: string;
+
+      storeId: string | null;
+      orderId: string | null;
+
+      putAway: "inbound";
+
+      productId: string;
+      warehouseId: string | null;
+      zoneId: string | null;
+      rackId: string | null;
+      shelfId: string | null;
+      placementId: string | null;
+    };
 
 // users/{businessId}/placements/{placementId}/logs/{logId}
 export interface PlacementLog {
