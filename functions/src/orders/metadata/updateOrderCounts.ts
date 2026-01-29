@@ -260,10 +260,36 @@ const updateBlockedStock = async (
   console.log(`📦 Blocked stock update complete for order ${orderId}`);
 };
 
+// Define the complete order counts schema
+const ORDER_COUNTS_SCHEMA: Record<string, number> = {
+  "All Orders": 0,
+  New: 0,
+  Confirmed: 0,
+  "Ready To Dispatch": 0,
+  Dispatched: 0,
+  "In Transit": 0,
+  "Out For Delivery": 0,
+  Delivered: 0,
+  "RTO In Transit": 0,
+  "RTO Delivered": 0,
+  "DTO Requested": 0,
+  "DTO Booked": 0,
+  "DTO In Transit": 0,
+  "DTO Delivered": 0,
+  "Pending Refunds": 0,
+  "DTO Refunded": 0,
+  Lost: 0,
+  Closed: 0,
+  "RTO Processed": 0,
+  "RTO Closed": 0,
+  "Cancellation Requested": 0,
+  Cancelled: 0,
+};
+
 // Update order counts using a proper transaction
 const updateOrderCountsWithTransaction = async (
   storeId: string,
-  statusUpdates: Record<string, FieldValue>,
+  statusUpdates: Record<string, number>,
   vendors?: string[],
 ) => {
   const metadataRef = db
@@ -271,13 +297,6 @@ const updateOrderCountsWithTransaction = async (
     .doc(storeId)
     .collection("metadata")
     .doc("orderCounts");
-
-  // Build updates with proper dot notation for nested fields
-  const countUpdates: Record<string, FieldValue | any> = {};
-  Object.entries(statusUpdates).forEach(([key, value]) => {
-    countUpdates[`counts.${key}`] = value;
-  });
-  countUpdates["lastUpdated"] = FieldValue.serverTimestamp();
 
   // Get vendor refs if needed
   const vendorRefs: DocumentReference[] = [];
@@ -316,43 +335,59 @@ const updateOrderCountsWithTransaction = async (
       const metadataDoc = await transaction.get(metadataRef);
       const vendorDocs = await Promise.all(vendorRefs.map((ref) => transaction.get(ref)));
 
-      // Update order counts metadata
-      if (metadataDoc.exists) {
-        transaction.update(metadataRef, countUpdates);
-      } else {
-        // Initialize if doesn't exist
-        transaction.set(metadataRef, {
-          counts: {},
-          lastUpdated: FieldValue.serverTimestamp(),
-        });
-        transaction.update(metadataRef, countUpdates);
-      }
+      // Build the complete counts object for metadata
+      const currentCounts = metadataDoc.exists ? metadataDoc.data()?.counts || {} : {};
+      const updatedCounts: Record<string, number> = { ...ORDER_COUNTS_SCHEMA };
 
-      // Update vendor counts
-      const vendorUpdates: Record<string, FieldValue | any> = {};
-      Object.entries(statusUpdates).forEach(([key, value]) => {
-        vendorUpdates[`counts.${key}`] = value;
+      Object.keys(ORDER_COUNTS_SCHEMA).forEach((key) => {
+        updatedCounts[key] = currentCounts[key] ?? ORDER_COUNTS_SCHEMA[key];
       });
-      vendorUpdates["lastUpdated"] = FieldValue.serverTimestamp();
 
+      // Apply increments by extracting the numeric values
+      Object.entries(statusUpdates).forEach(([key, value]) => {
+        updatedCounts[key] = (updatedCounts[key] || 0) + value;
+      });
+
+      // Update order counts metadata with complete object
+      transaction.set(
+        metadataRef,
+        {
+          counts: updatedCounts,
+          lastUpdated: FieldValue.serverTimestamp(),
+        },
+        { merge: true },
+      );
+
+      // Update vendor counts with complete object
       vendorDocs.forEach((vendorDoc, index) => {
-        if (vendorDoc.exists) {
-          transaction.update(vendorRefs[index], vendorUpdates);
-        } else {
-          // Initialize if doesn't exist
-          transaction.set(vendorRefs[index], {
-            counts: {},
+        const vendorCurrentCounts = vendorDoc.exists ? vendorDoc.data()?.counts || {} : {};
+        const vendorUpdatedCounts: Record<string, number> = { ...ORDER_COUNTS_SCHEMA };
+
+        // Merge existing counts
+        Object.keys(ORDER_COUNTS_SCHEMA).forEach((key) => {
+          vendorUpdatedCounts[key] = vendorCurrentCounts[key] ?? ORDER_COUNTS_SCHEMA[key];
+        });
+
+        // Apply increments
+        Object.entries(statusUpdates).forEach(([key, delta]) => {
+          vendorUpdatedCounts[key] = (vendorUpdatedCounts[key] || 0) + delta;
+        });
+
+        transaction.set(
+          vendorRefs[index],
+          {
+            counts: vendorUpdatedCounts,
             lastUpdated: FieldValue.serverTimestamp(),
-          });
-          transaction.update(vendorRefs[index], vendorUpdates);
-        }
+          },
+          { merge: true },
+        );
       });
     });
 
     console.log(`✅ Order counts transaction committed (${vendorRefs.length} vendors updated)`);
   } catch (error) {
     console.error(`❌ Failed to update order counts:`, error);
-    throw error; // Re-throw to handle at caller level
+    throw error;
   }
 };
 
@@ -385,8 +420,8 @@ export const updateOrderCounts = onDocumentWritten(
         await updateOrderCountsWithTransaction(
           storeId,
           {
-            "All Orders": FieldValue.increment(-1),
-            [oldStatus]: FieldValue.increment(-1),
+            "All Orders": -1,
+            [oldStatus]: -1,
           },
           oldOrder.vendors,
         );
@@ -413,8 +448,8 @@ export const updateOrderCounts = onDocumentWritten(
         await updateOrderCountsWithTransaction(
           storeId,
           {
-            "All Orders": FieldValue.increment(1),
-            [newStatus]: FieldValue.increment(1),
+            "All Orders": 1,
+            [newStatus]: 1,
           },
           newOrder.vendors,
         );
@@ -444,8 +479,8 @@ export const updateOrderCounts = onDocumentWritten(
         await updateOrderCountsWithTransaction(
           storeId,
           {
-            [oldStatus]: FieldValue.increment(-1),
-            [newStatus]: FieldValue.increment(1),
+            [oldStatus]: -1,
+            [newStatus]: 1,
           },
           newOrder.vendors,
         );

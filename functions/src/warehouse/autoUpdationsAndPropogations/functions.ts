@@ -117,6 +117,11 @@ export const onUpcWritten = onDocumentWritten(
               `🆕 The placement ${after.placementId} for this upc doesn't exists which means that it is definitely being put away from 'inbound' to 'none', Creating placement ${after.placementId}`,
             );
 
+            if (!after.placementId || !after.shelfId) {
+              console.log(`🆕 The after.placementId or after.shelfId is null/undefined`);
+              return;
+            }
+
             const newPlacement: Placement = {
               id: after.placementId,
               productId: after.productId,

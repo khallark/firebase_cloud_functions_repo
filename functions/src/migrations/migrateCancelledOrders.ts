@@ -80,137 +80,137 @@ export const migrateCancelledOrdersStatus = onRequest(
     secrets: [ENQUEUE_FUNCTION_SECRET],
   },
   async (req, res) => {
-    try {
-      console.log(req);
-      console.log("Starting order status reset...");
-
-      const orders = [
-        6147352461451, 6239170429067, 6278792577163, 6280347877515, 6280350859403, 6280531804299,
-        6281932013707, 6285867548811, 6287443918987, 6289033658507, 6289723228299, 6290463195275,
-        6290724913291, 6290828230795, 6290900287627, 6291694387339,
-      ];
-
-      const orders2 = [
-        10620372713766, 10620394111270, 10620401844518, 10620404269350, 10620462727462,
-        10620464365862, 10620466987302, 10620467806502, 10620474065190, 10620478587174,
-        10620543369510, 10620553003302, 10620575744294, 10620580462886, 10620587376934,
-        10620589048102, 10620589801766, 10620609757478, 10620644917542, 10620650389798,
-        10620743450918, 10620754592038, 10620816621862, 10620816654630, 10620862464294,
-        10620872032550, 10620903981350, 10620904309030, 10620957229350, 10620979282214,
-        10620997992742, 10620998484262, 10621003268390, 10621023519014, 10621037773094,
-        10621083353382, 10621086564646, 10621099606310, 10621117038886, 10621119234342,
-        10621216588070, 10621508190502, 10621726130470, 10621921788198, 10621971726630,
-        10621985915174, 10621988012326, 10621989749030, 10621995122982, 10621998858534,
-        10621999087910, 10622037131558,
-      ];
-
-      // Helper function to chunk arrays
-      const chunkArray = (arr: number[], size: number) => {
-        const chunks = [];
-        for (let i = 0; i < arr.length; i += size) {
-          chunks.push(arr.slice(i, i + size));
-        }
-        return chunks;
-      };
-
-      const batch = db.batch();
-      let nfkjgpCount = 0;
-      let gj9ejgCount = 0;
-
-      // Process shop 1 in chunks of 10
-      console.log(`Processing ${orders.length} orders for nfkjgp-sv.myshopify.com...`);
-      const orders1Chunks = chunkArray(orders, 10);
-
-      for (const chunk of orders1Chunks) {
-        const snapshot = await db
-          .collection("accounts/nfkjgp-sv.myshopify.com/orders")
-          .where("orderId", "in", chunk)
-          .get();
-
-        console.log(`  Found ${snapshot.size}/${chunk.length} orders in chunk`);
-
-        snapshot.docs.forEach((doc) => {
-          batch.update(doc.ref, {
-            customStatus: "Dispatched",
-          });
-          nfkjgpCount++;
-        });
-      }
-
-      // Process shop 2 in chunks of 10
-      console.log(`Processing ${orders2.length} orders for gj9ejg-cu.myshopify.com...`);
-      const orders2Chunks = chunkArray(orders2, 10);
-
-      for (const chunk of orders2Chunks) {
-        const snapshot = await db
-          .collection("accounts/gj9ejg-cu.myshopify.com/orders")
-          .where("orderId", "in", chunk)
-          .get();
-
-        console.log(`  Found ${snapshot.size}/${chunk.length} orders in chunk`);
-
-        snapshot.docs.forEach((doc) => {
-          batch.update(doc.ref, {
-            customStatus: "Dispatched",
-          });
-          gj9ejgCount++;
-        });
-      }
-
-      const totalUpdates = nfkjgpCount + gj9ejgCount;
-
-      if (totalUpdates === 0) {
-        console.log("⚠️ No orders found to update");
-        res.status(200).json({
-          success: false,
-          message: "No orders found",
-        });
-        return;
-      }
-
-      console.log(`Committing batch with ${totalUpdates} updates...`);
-      await batch.commit();
-
-      console.log(`✅ Successfully updated ${totalUpdates} orders to "Dispatched"`);
-
-      res.status(200).json({
-        success: true,
-        updatedCount: totalUpdates,
-        nfkjgpCount: nfkjgpCount,
-        gj9ejgCount: gj9ejgCount,
-      });
-    } catch (error: any) {
-      console.error("Error updating orders:", error.message);
-      console.error(error);
-      res.status(200).json({
-        success: false,
-        error: error.message,
-      });
-    }
     // try {
     //   console.log(req);
-    //   const productsColl = await db.collection("users/2yEGCC8AffNxDoTZEqhAkCRgxNl2/products").get();
-    //   let resp: any;
-    //   for (const doc of productsColl.docs) {
-    //     const coll = await db
-    //       .collection("users/2yEGCC8AffNxDoTZEqhAkCRgxNl2/upcs")
-    //       .where("productId", "==", doc.data()?.sku)
-    //       .get();
-    //     if (Number(doc.data().inventory.inwardAddition) !== coll.docs.length) {
-    //       resp = {
-    //         ...resp,
-    //         [doc.data()?.sku]: Number(doc.data().inventory.inwardAddition) - coll.docs.length,
-    //       };
+    //   console.log("Starting order status reset...");
+
+    //   const orders = [
+    //     6147352461451, 6239170429067, 6278792577163, 6280347877515, 6280350859403, 6280531804299,
+    //     6281932013707, 6285867548811, 6287443918987, 6289033658507, 6289723228299, 6290463195275,
+    //     6290724913291, 6290828230795, 6290900287627, 6291694387339,
+    //   ];
+
+    //   const orders2 = [
+    //     10620372713766, 10620394111270, 10620401844518, 10620404269350, 10620462727462,
+    //     10620464365862, 10620466987302, 10620467806502, 10620474065190, 10620478587174,
+    //     10620543369510, 10620553003302, 10620575744294, 10620580462886, 10620587376934,
+    //     10620589048102, 10620589801766, 10620609757478, 10620644917542, 10620650389798,
+    //     10620743450918, 10620754592038, 10620816621862, 10620816654630, 10620862464294,
+    //     10620872032550, 10620903981350, 10620904309030, 10620957229350, 10620979282214,
+    //     10620997992742, 10620998484262, 10621003268390, 10621023519014, 10621037773094,
+    //     10621083353382, 10621086564646, 10621099606310, 10621117038886, 10621119234342,
+    //     10621216588070, 10621508190502, 10621726130470, 10621921788198, 10621971726630,
+    //     10621985915174, 10621988012326, 10621989749030, 10621995122982, 10621998858534,
+    //     10621999087910, 10622037131558,
+    //   ];
+
+    //   // Helper function to chunk arrays
+    //   const chunkArray = (arr: number[], size: number) => {
+    //     const chunks = [];
+    //     for (let i = 0; i < arr.length; i += size) {
+    //       chunks.push(arr.slice(i, i + size));
     //     }
+    //     return chunks;
+    //   };
+
+    //   const batch = db.batch();
+    //   let nfkjgpCount = 0;
+    //   let gj9ejgCount = 0;
+
+    //   // Process shop 1 in chunks of 10
+    //   console.log(`Processing ${orders.length} orders for nfkjgp-sv.myshopify.com...`);
+    //   const orders1Chunks = chunkArray(orders, 10);
+
+    //   for (const chunk of orders1Chunks) {
+    //     const snapshot = await db
+    //       .collection("accounts/nfkjgp-sv.myshopify.com/orders")
+    //       .where("orderId", "in", chunk)
+    //       .get();
+
+    //     console.log(`  Found ${snapshot.size}/${chunk.length} orders in chunk`);
+
+    //     snapshot.docs.forEach((doc) => {
+    //       batch.update(doc.ref, {
+    //         customStatus: "Dispatched",
+    //       });
+    //       nfkjgpCount++;
+    //     });
     //   }
-    //   // console.log(coll.docs.length);
-    //   res.status(200).json(resp);
+
+    //   // Process shop 2 in chunks of 10
+    //   console.log(`Processing ${orders2.length} orders for gj9ejg-cu.myshopify.com...`);
+    //   const orders2Chunks = chunkArray(orders2, 10);
+
+    //   for (const chunk of orders2Chunks) {
+    //     const snapshot = await db
+    //       .collection("accounts/gj9ejg-cu.myshopify.com/orders")
+    //       .where("orderId", "in", chunk)
+    //       .get();
+
+    //     console.log(`  Found ${snapshot.size}/${chunk.length} orders in chunk`);
+
+    //     snapshot.docs.forEach((doc) => {
+    //       batch.update(doc.ref, {
+    //         customStatus: "Dispatched",
+    //       });
+    //       gj9ejgCount++;
+    //     });
+    //   }
+
+    //   const totalUpdates = nfkjgpCount + gj9ejgCount;
+
+    //   if (totalUpdates === 0) {
+    //     console.log("⚠️ No orders found to update");
+    //     res.status(200).json({
+    //       success: false,
+    //       message: "No orders found",
+    //     });
+    //     return;
+    //   }
+
+    //   console.log(`Committing batch with ${totalUpdates} updates...`);
+    //   await batch.commit();
+
+    //   console.log(`✅ Successfully updated ${totalUpdates} orders to "Dispatched"`);
+
+    //   res.status(200).json({
+    //     success: true,
+    //     updatedCount: totalUpdates,
+    //     nfkjgpCount: nfkjgpCount,
+    //     gj9ejgCount: gj9ejgCount,
+    //   });
     // } catch (error: any) {
-    //   console.error(error.message);
+    //   console.error("Error updating orders:", error.message);
+    //   console.error(error);
     //   res.status(200).json({
     //     success: false,
+    //     error: error.message,
     //   });
     // }
+    try {
+      console.log(req);
+      const productsColl = await db.collection("users/2yEGCC8AffNxDoTZEqhAkCRgxNl2/products").get();
+      let resp: any;
+      for (const doc of productsColl.docs) {
+        const coll = await db
+          .collection("users/2yEGCC8AffNxDoTZEqhAkCRgxNl2/upcs")
+          .where("productId", "==", doc.data()?.sku)
+          .get();
+        if (Number(doc.data().inventory.inwardAddition) !== coll.docs.length) {
+          resp = {
+            ...resp,
+            [doc.data()?.sku]: Number(doc.data().inventory.inwardAddition) - coll.docs.length,
+          };
+        }
+      }
+      // console.log(coll.docs.length);
+      res.status(200).json(resp);
+    } catch (error: any) {
+      console.error(error.message);
+      res.status(200).json({
+        success: false,
+      });
+    }
     // try {
     //   // Add secret protection
     //   requireHeaderSecret(req, "x-api-key", ENQUEUE_FUNCTION_SECRET.value() || "");

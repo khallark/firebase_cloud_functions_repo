@@ -112,8 +112,71 @@ async function initializeAccountMetadata(accountId: string): Promise<{
 }> {
   console.log(`  📊 Counting orders for account: ${accountId}`);
 
-  const vendorsToMatch = ["OWR", "Ghamand", "BBB"];
-  const seenOrders = new Set<string>();
+  // const snapshot = await db.collection("accounts").doc(accountId).collection("orders").get();
+
+  // const counts: Record<string, number> = {
+  //   "All Orders": 0,
+  //   New: 0,
+  //   Confirmed: 0,
+  //   "Ready To Dispatch": 0,
+  //   Dispatched: 0,
+  //   "In Transit": 0,
+  //   "Out For Delivery": 0,
+  //   Delivered: 0,
+  //   "RTO In Transit": 0,
+  //   "RTO Delivered": 0,
+  //   "DTO Requested": 0,
+  //   "DTO Booked": 0,
+  //   "DTO In Transit": 0,
+  //   "DTO Delivered": 0,
+  //   "Pending Refunds": 0,
+  //   "DTO Refunded": 0,
+  //   Lost: 0,
+  //   Closed: 0,
+  //   "RTO Processed": 0,
+  //   "RTO Closed": 0,
+  //   "Cancellation Requested": 0,
+  //   Cancelled: 0,
+  // };
+
+  // snapshot.docs.forEach((doc) => {
+  //   const order = doc.data();
+  //   counts["All Orders"]++;
+
+  //   const isShopifyCancelled = !!order.raw?.cancelled_at && order?.customStatus === "Cancelled";
+
+  //   if (isShopifyCancelled) {
+  //     counts["Cancelled"]++;
+  //   } else {
+  //     const status = order.customStatus || "New";
+  //     if (counts[status] !== undefined) {
+  //       counts[status]++;
+  //     } else {
+  //       console.warn(`⚠️ Unknown status: ${status}`);
+  //     }
+  //   }
+  // });
+
+  // const adminRef = db
+  //   .collection("accounts")
+  //   .doc(accountId)
+  //   .collection("metadata")
+  //   .doc("orderCounts");
+
+  // await adminRef.set(
+  //   {
+  //     counts,
+  //     lastUpdated: FieldValue.serverTimestamp(),
+  //   },
+  //   { merge: true },
+  // );
+
+  // console.log(`  ✅ Metadata created: ${counts["All Orders"]} orders counted`);
+
+  // return {
+  //   totalOrders: counts["All Orders"],
+  //   counts,
+  // };
 
   const counts: Record<string, number> = {
     "All Orders": 0,
@@ -140,43 +203,37 @@ async function initializeAccountMetadata(accountId: string): Promise<{
     Cancelled: 0,
   };
 
-  // Run one query per vendor (stream + dedupe)
-  for (const vendor of vendorsToMatch) {
-    const snapshot = await db
-      .collection("accounts")
-      .doc(accountId)
-      .collection("orders")
-      .where("vendors", "array-contains", vendor)
-      .get();
+  const snapshot = await db
+    .collection("accounts")
+    .doc(accountId)
+    .collection("orders")
+    .where("vendors", "array-contains", "ENDORA")
+    .get();
 
-    snapshot.docs.forEach((doc) => {
-      if (seenOrders.has(doc.id)) return;
-      seenOrders.add(doc.id);
+  snapshot.docs.forEach((doc) => {
+    const order = doc.data();
+    counts["All Orders"]++;
 
-      const order = doc.data();
-      counts["All Orders"]++;
+    const isShopifyCancelled = !!order.raw?.cancelled_at && order?.customStatus === "Cancelled";
 
-      const isShopifyCancelled = !!order.raw?.cancelled_at && order?.customStatus === "Cancelled";
-
-      if (isShopifyCancelled) {
-        counts["Cancelled"]++;
+    if (isShopifyCancelled) {
+      counts["Cancelled"]++;
+    } else {
+      const status = order.customStatus || "New";
+      if (counts[status] !== undefined) {
+        counts[status]++;
       } else {
-        const status = order.customStatus || "New";
-        if (counts[status] !== undefined) {
-          counts[status]++;
-        } else {
-          console.warn(`⚠️ Unknown status: ${status}`);
-        }
+        console.warn(`⚠️ Unknown status: ${status}`);
       }
-    });
-  }
+    }
+  });
 
   // Save counts to the OWR member only
   const owrMemberSnapshot = await db
     .collection("accounts")
     .doc(accountId)
     .collection("members")
-    .where("vendorName", "==", "OWR")
+    .where("vendorName", "==", "ENDORA")
     .get();
 
   if (!owrMemberSnapshot.empty) {
@@ -198,12 +255,99 @@ async function initializeAccountMetadata(accountId: string): Promise<{
     totalOrders: counts["All Orders"],
     counts,
   };
+
+  // const vendorsToMatch = ["OWR", "Ghamand", "BBB"];
+  // const seenOrders = new Set<string>();
+
+  // const counts: Record<string, number> = {
+  //   "All Orders": 0,
+  //   New: 0,
+  //   Confirmed: 0,
+  //   "Ready To Dispatch": 0,
+  //   Dispatched: 0,
+  //   "In Transit": 0,
+  //   "Out For Delivery": 0,
+  //   Delivered: 0,
+  //   "RTO In Transit": 0,
+  //   "RTO Delivered": 0,
+  //   "DTO Requested": 0,
+  //   "DTO Booked": 0,
+  //   "DTO In Transit": 0,
+  //   "DTO Delivered": 0,
+  //   "Pending Refunds": 0,
+  //   "DTO Refunded": 0,
+  //   Lost: 0,
+  //   Closed: 0,
+  //   "RTO Processed": 0,
+  //   "RTO Closed": 0,
+  //   "Cancellation Requested": 0,
+  //   Cancelled: 0,
+  // };
+
+  // // Run one query per vendor (stream + dedupe)
+  // for (const vendor of vendorsToMatch) {
+  //   const snapshot = await db
+  //     .collection("accounts")
+  //     .doc(accountId)
+  //     .collection("orders")
+  //     .where("vendors", "array-contains", vendor)
+  //     .get();
+
+  //   snapshot.docs.forEach((doc) => {
+  //     if (seenOrders.has(doc.id)) return;
+  //     seenOrders.add(doc.id);
+
+  //     const order = doc.data();
+  //     counts["All Orders"]++;
+
+  //     const isShopifyCancelled = !!order.raw?.cancelled_at && order?.customStatus === "Cancelled";
+
+  //     if (isShopifyCancelled) {
+  //       counts["Cancelled"]++;
+  //     } else {
+  //       const status = order.customStatus || "New";
+  //       if (counts[status] !== undefined) {
+  //         counts[status]++;
+  //       } else {
+  //         console.warn(`⚠️ Unknown status: ${status}`);
+  //       }
+  //     }
+  //   });
+  // }
+
+  // // Save counts to the OWR member only
+  // const owrMemberSnapshot = await db
+  //   .collection("accounts")
+  //   .doc(accountId)
+  //   .collection("members")
+  //   // .where("vendorName", "==", "OWR")
+  //   .get();
+
+  // if (!owrMemberSnapshot.empty) {
+  //   await owrMemberSnapshot.docs[0].ref.set(
+  //     {
+  //       counts,
+  //       lastUpdated: FieldValue.serverTimestamp(),
+  //     },
+  //     { merge: true },
+  //   );
+  //   console.log(`  ✅ Metadata saved to OWR member`);
+  // } else {
+  //   console.warn(`  ⚠️ No OWR member found for account ${accountId}`);
+  // }
+
+  // console.log(`  ✅ Metadata created: ${counts["All Orders"]} orders counted`);
+
+  // return {
+  //   totalOrders: counts["All Orders"],
+  //   counts,
+  // };
 }
 
 export const initializeMetadata = onRequest(
   {
     cors: true,
-    timeoutSeconds: 540,
+    timeoutSeconds: 3600,
     memory: "1GiB",
     secrets: [ENQUEUE_FUNCTION_SECRET],
   },
