@@ -9,6 +9,18 @@ import ExcelJS from "exceljs";
 const businessId = "2yEGCC8AffNxDoTZEqhAkCRgxNl2";
 const AD_ACCOUNT_ID = "act_219302623";
 
+function getDateList(start: string, end: string): string[] {
+  const dates: string[] = [];
+  let d = new Date(start);
+  const last = new Date(end);
+
+  while (d <= last) {
+    dates.push(d.toISOString().slice(0, 10));
+    d.setDate(d.getDate() + 1);
+  }
+  return dates;
+}
+
 export const generateAdReportExcel = onRequest(
   {
     cors: true,
@@ -31,21 +43,21 @@ export const generateAdReportExcel = onRequest(
       if (!startDate || !endDate) {
         res.status(400).json({
           error: "missing_parameters",
-          message: "startDate and endDate are required in DD-MM-YYYY format"
+          message: "startDate and endDate are required in DD-MM-YYYY format",
         });
         return;
       }
 
       // Parse dates from DD-MM-YYYY format
       const parseDate = (dateStr: string): Date => {
-        const [day, month, year] = dateStr.split('-').map(Number);
+        const [day, month, year] = dateStr.split("-").map(Number);
         return new Date(year, month - 1, day);
       };
 
       // Convert DD-MM-YYYY to YYYY-MM-DD for Meta API
       const formatDateForMetaAPI = (dateStr: string): string => {
-        const [day, month, year] = dateStr.split('-');
-        return `${year}-${month.padStart(2, '0')}-${day.padStart(2, '0')}`;
+        const [day, month, year] = dateStr.split("-");
+        return `${year}-${month.padStart(2, "0")}-${day.padStart(2, "0")}`;
       };
 
       const startOfDateRange = parseDate(startDate);
@@ -58,6 +70,7 @@ export const generateAdReportExcel = onRequest(
       // Format dates for Meta API (YYYY-MM-DD)
       const metaSinceDate = formatDateForMetaAPI(startDate);
       const metaUntilDate = formatDateForMetaAPI(endDate);
+      const dateList = getDateList(metaSinceDate, metaUntilDate);
 
       console.log(`📊 Generating report for ${startDate} to ${endDate}`);
 
@@ -87,104 +100,137 @@ export const generateAdReportExcel = onRequest(
         .where("createdAt", "<=", endOfDateRange.toISOString())
         .get();
 
-      let saleAmount = 0;
-      let cancellation = 0;
+      const ordersByDate = new Map<string, { sale: number; cancellation: number }>();
 
       ordersSnapshot.forEach((doc) => {
-        const orderData = doc.data();
-        const totalPrice = parseFloat(orderData.raw?.total_price || 0);
-        const customStatus = orderData.customStatus;
+        const order = doc.data();
+        const date = new Date(order.createdAt).toISOString().slice(0, 10); // YYYY-MM-DD
+        const price = parseFloat(order.raw?.total_price || "0");
 
-        saleAmount += totalPrice;
+        if (!ordersByDate.has(date)) {
+          ordersByDate.set(date, { sale: 0, cancellation: 0 });
+        }
 
-        if (customStatus === "Cancelled" || customStatus === "Cancellation Requested") {
-          cancellation += totalPrice;
+        const day = ordersByDate.get(date)!;
+        day.sale += price;
+
+        if (order.customStatus === "Cancelled" || order.customStatus === "Cancellation Requested") {
+          day.cancellation += price;
         }
       });
 
-      const grossSale = saleAmount - cancellation;
-
-      console.log(`✅ Sale Amount: ${saleAmount}`);
-      console.log(`✅ Cancellation: ${cancellation}`);
-      console.log(`✅ Gross Sale: ${grossSale}`);
-
       // 3. Calculate Ad Spent and ROAS
+      // Replace the entire "3. Calculate Ad Spent and ROAS" block with this code
+      // (and remove the old metaAdsUrl / metaResponse code). Everything else in your function can remain.
+
       console.log("📱 Fetching Meta Ads data...");
 
-      // Construct Meta API URL with time range
-      const fieldsParam =
-        `id,name,status,effective_status,` +
-        `insights.time_range({'since':'${metaSinceDate}','until':'${metaUntilDate}'}){spend,purchase,purchase_roas}`;
-      const metaAdsUrl = `https://graph.facebook.com/v21.0/${AD_ACCOUNT_ID}/adsets?fields=${encodeURIComponent(fieldsParam)}&effective_status=['ACTIVE','PAUSED','ARCHIVED']&limit=500&access_token=${META_ADS_MANAGER_SECRET}`;
+      // Resolve access token (covers secret.value() shape or plain string)
+      const ACCESS_TOKEN = (META_ADS_MANAGER_SECRET as any)?.value?.() ?? META_ADS_MANAGER_SECRET;
 
-      console.log(`📅 Meta API Date Range: ${metaSinceDate} to ${metaUntilDate}`);
-
-      const metaResponse = await fetch(metaAdsUrl);
-
-      if (!metaResponse.ok) {
-        const errorText = await metaResponse.text();
-        throw new Error(`Meta API error: ${metaResponse.status} - ${errorText}`);
+      // ---------- Helper: follow paging.next and collect all items ----------
+      async function fetchAllFromUrl(initialUrl: string) {
+        const all: any[] = [];
+        let url: string | null = initialUrl;
+        while (url) {
+          const resp = await fetch(url);
+          if (!resp.ok) {
+            const text = await resp.text();
+            throw new Error(`Meta API error fetching ${url}: ${resp.status} - ${text}`);
+          }
+          const json = (await resp.json()) as any;
+          if (Array.isArray(json.data)) all.push(...json.data);
+          // follow paging.next if present
+          url = json.paging?.next ?? null;
+        }
+        return all;
       }
 
-      const metaData: any = await metaResponse.json();
+      // ---------- 1) Fetch adset metadata (id -> effective_status) ----------
+      console.log("🔎 Fetching adset metadata (to know effective_status)...");
+      const adsetsBase = `https://graph.facebook.com/v24.0/${AD_ACCOUNT_ID}/adsets`;
+      const adsetsParams = new URLSearchParams({
+        fields: "id,name,effective_status",
+        limit: "500",
+        access_token: String(ACCESS_TOKEN),
+      });
+      const adsetsUrl = `${adsetsBase}?${adsetsParams.toString()}`;
 
+      const adsetsData = await fetchAllFromUrl(adsetsUrl);
+      const adsetStatusMap = new Map<string, string>();
+      adsetsData.forEach((a: any) => {
+        if (a.id) adsetStatusMap.set(String(a.id), String(a.effective_status || ""));
+      });
+
+      // ---------- 2) Fetch insights at level=adset (reliable) ----------
+      console.log("🔎 Fetching insights (level=adset)...");
+      const insightsBase = `https://graph.facebook.com/v24.0/${AD_ACCOUNT_ID}/insights`;
+      const insightsParams = new URLSearchParams({
+        level: "adset",
+        action_attribution_windows: "['7d_click']",
+        // time_range must be a string like {'since':'YYYY-MM-DD','until':'YYYY-MM-DD'}
+        time_increment: "1",
+        time_range: `{'since':'${metaSinceDate}','until':'${metaUntilDate}'}`,
+        // request spend, all actions (counts), action_values (revenue), and purchase_roas (derived)
+        fields: "adset_id,adset_name,spend,actions,action_values,purchase_roas",
+        limit: "500",
+        access_token: String(ACCESS_TOKEN),
+      });
+      const insightsUrl = `${insightsBase}?${insightsParams.toString()}`;
+
+      const insightsRows = await fetchAllFromUrl(insightsUrl);
+
+      const metaByDate = new Map<string, any[]>();
+
+      insightsRows.forEach((row: any) => {
+        const date = row.date_start;
+        if (!metaByDate.has(date)) metaByDate.set(date, []);
+        metaByDate.get(date)!.push(row);
+      });
+
+      // ---------- 3) Aggregate metrics (only include ACTIVE adsets) ----------
       let totalAdSpent = 0;
       let totalPurchaseValue = 0;
 
       let avgRoasSum = 0;
       let avgRoasCount = 0;
 
-      if (metaData.data && Array.isArray(metaData.data)) {
-        metaData.data.forEach((adSet: any) => {
-          if (adSet.effective_status !== "ACTIVE") return;
+      insightsRows.forEach((row: any) => {
+        const adsetId = String(row.adset_id || row.id || "");
+        // If we don't know the adset's status from adsets endpoint, skip it.
+        // (Alternatively, include it — but you previously counted only ACTIVE)
+        const effStatus = adsetStatusMap.get(adsetId);
+        if (effStatus !== "ACTIVE") return;
 
-          const insight = adSet.insights?.data?.[0];
-          if (!insight) return;
+        const spend = parseFloat(row.spend ?? "0") || 0;
+        totalAdSpent += spend;
 
-          // --------------------
-          // Spend (used by both)
-          // --------------------
-          const spend = parseFloat(insight.spend || "0");
-          totalAdSpent += spend;
-
-          // --------------------
-          // Weighted ROAS inputs
-          // --------------------
-          if (Array.isArray(insight.purchase)) {
-            const purchase = insight.purchase.find(
-              (p: any) => p.action_type === "omni_purchase"
-            );
-
-            if (purchase) {
-              totalPurchaseValue += parseFloat(purchase.value || "0");
-            }
+        // Revenue: action_values -> omni_purchase (best source)
+        if (Array.isArray(row.action_values)) {
+          const purchaseVal = row.action_values.find(
+            (a: any) => a.action_type === "omni_purchase" || a.action_type === "purchase",
+          );
+          if (purchaseVal) {
+            totalPurchaseValue += parseFloat(purchaseVal.value ?? "0") || 0;
           }
+        }
 
-          // --------------------
-          // Average ROAS inputs
-          // --------------------
-          if (Array.isArray(insight.purchase_roas)) {
-            const roasItem = insight.purchase_roas.find(
-              (r: any) => r.action_type === "omni_purchase"
-            );
-
-            if (roasItem) {
-              avgRoasSum += parseFloat(roasItem.value || "0");
+        // Average ROAS inputs: purchase_roas -> omni_purchase
+        if (Array.isArray(row.purchase_roas)) {
+          const roasItem = row.purchase_roas.find((r: any) => r.action_type === "omni_purchase");
+          if (roasItem) {
+            const v = parseFloat(roasItem.value ?? "0");
+            if (!Number.isNaN(v)) {
+              avgRoasSum += v;
               avgRoasCount++;
             }
           }
-        });
-      }
+        }
+      });
 
-      // --------------------
       // Final metrics
-      // --------------------
-      const weightedROAS =
-        totalAdSpent > 0 ? totalPurchaseValue / totalAdSpent : 0;
-
-      const averageROAS =
-        avgRoasCount > 0 ? avgRoasSum / avgRoasCount : 0;
-
+      const weightedROAS = totalAdSpent > 0 ? totalPurchaseValue / totalAdSpent : 0;
+      const averageROAS = avgRoasCount > 0 ? avgRoasSum / avgRoasCount : 0;
 
       console.log(`✅ Total Ad Spent (ACTIVE): ${totalAdSpent}`);
       console.log(`✅ Total Purchase Value (ACTIVE): ${totalPurchaseValue}`);
@@ -217,15 +263,58 @@ export const generateAdReportExcel = onRequest(
       };
 
       // Add data row
-      worksheet.addRow({
-        date: `${startDate} to ${endDate}`,
-        openingStockCount,
-        adSpent: totalAdSpent.toFixed(2),
-        saleAmount: saleAmount.toFixed(2),
-        cancellation: cancellation.toFixed(2),
-        grossSale: grossSale.toFixed(2),
-        weightedRoas: weightedROAS.toFixed(2),
-        averageRoas: averageROAS.toFixed(2),
+      dateList.forEach((date) => {
+        // ---------------- Orders ----------------
+        const orderDay = ordersByDate.get(date) || { sale: 0, cancellation: 0 };
+        const saleAmount = orderDay.sale;
+        const cancellation = orderDay.cancellation;
+        const grossSale = saleAmount - cancellation;
+
+        // ---------------- Meta ----------------
+        let adSpent = 0;
+        let purchaseValue = 0;
+        let roasSum = 0;
+        let roasCount = 0;
+
+        const metaRows = metaByDate.get(date) || [];
+
+        metaRows.forEach((row: any) => {
+          const status = adsetStatusMap.get(row.adset_id);
+          if (status !== "ACTIVE") return;
+
+          adSpent += parseFloat(row.spend || "0");
+
+          const purchase = row.action_values?.find(
+            (a: any) =>
+              a.action_type === "omni_purchase" ||
+              a.action_type === "purchase" ||
+              a.action_type === "offsite_conversion.purchase",
+          );
+          if (purchase) {
+            purchaseValue += parseFloat(purchase.value || "0");
+          }
+
+          const roas = row.purchase_roas?.find((r: any) => r.action_type === "omni_purchase");
+          if (roas) {
+            roasSum += parseFloat(roas.value || "0");
+            roasCount++;
+          }
+        });
+
+        const weightedROAS = adSpent > 0 ? purchaseValue / adSpent : 0;
+        const averageROAS = roasCount > 0 ? roasSum / roasCount : 0;
+
+        // ---------------- Excel Row ----------------
+        worksheet.addRow({
+          date,
+          openingStockCount, // stays constant
+          adSpent: adSpent.toFixed(2),
+          saleAmount: saleAmount.toFixed(2),
+          cancellation: cancellation.toFixed(2),
+          grossSale: grossSale.toFixed(2),
+          weightedRoas: weightedROAS.toFixed(2),
+          averageRoas: averageROAS.toFixed(2),
+        });
       });
 
       // 5. Upload to Firebase Storage
@@ -253,6 +342,15 @@ export const generateAdReportExcel = onRequest(
 
       console.log("✅ Report generated successfully!");
 
+      let totalSale = 0;
+      let totalCancellation = 0;
+
+      ordersByDate.forEach((v) => {
+        totalSale += v.sale;
+        totalCancellation += v.cancellation;
+      });
+      const totalGrossSale = totalSale - totalCancellation;
+
       res.json({
         success: true,
         downloadUrl,
@@ -260,9 +358,9 @@ export const generateAdReportExcel = onRequest(
           dateRange: `${startDate} to ${endDate}`,
           openingStockCount,
           adSpent: totalAdSpent.toFixed(2),
-          saleAmount: saleAmount.toFixed(2),
-          cancellation: cancellation.toFixed(2),
-          grossSale: grossSale.toFixed(2),
+          saleAmount: totalSale.toFixed(2),
+          cancellation: totalCancellation.toFixed(2),
+          grossSale: totalGrossSale.toFixed(2),
           weightedROAS: weightedROAS.toFixed(2),
           averageROAS: averageROAS.toFixed(2),
         },

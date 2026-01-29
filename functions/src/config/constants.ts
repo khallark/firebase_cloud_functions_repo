@@ -21,7 +21,8 @@
 export const SHARED_STORE_ID = "nfkjgp-sv.myshopify.com";
 export const SHARED_STORE_ID_2 = "gj9ejg-cu.myshopify.com";
 export const SHARED_STORE_IDS = ["nfkjgp-sv.myshopify.com", "gj9ejg-cu.myshopify.com"];
-export const META_ADS_MANAGER_SECRET = "EAAZADNn6RfvwBQi9Q8BxPD93qvfIk7P9mdZCoX6JaJ2hk0ZCTyBDXxXJENwQsKPSwpTEkEZB7ze2Plj1DGYmUWwEjfDbQfrrNtn0Yp7xOkF5pj1ibSPCCvXMIZCdSVpLNxDKx4dvZAMS6eyMzuWQWoUPptFt28mQqIEdbkb1ZBP4zVfRTteYul7pIFgt2lApgZDZD";
+export const META_ADS_MANAGER_SECRET =
+  "EAAZADNn6RfvwBQi9Q8BxPD93qvfIk7P9mdZCoX6JaJ2hk0ZCTyBDXxXJENwQsKPSwpTEkEZB7ze2Plj1DGYmUWwEjfDbQfrrNtn0Yp7xOkF5pj1ibSPCCvXMIZCdSVpLNxDKx4dvZAMS6eyMzuWQWoUPptFt28mQqIEdbkb1ZBP4zVfRTteYul7pIFgt2lApgZDZD";
 
 /**
  * Super admin ID that bypasses all authorization checks

@@ -1,1 +1,1 @@
-export * from './generateAdReportExcel';
+export * from "./generateAdReportExcel";
