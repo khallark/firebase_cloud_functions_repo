@@ -8,8 +8,7 @@ interface BlueDartAuthResponse {
  * Fetches JWT token for Blue Dart API authentication
  * Token is required for all Blue Dart API calls
  */
-export async function getBlueDartToken(): Promise<string> {
-  const clientId = "S4Eg4rFTGy2oFMbfWr9tCt3eAGUqtqcq"; // Hardcoded as per requirement
+export async function getBlueDartToken(appApiKey: string): Promise<string> {
   
   try {
     const response = await fetch(
@@ -17,7 +16,7 @@ export async function getBlueDartToken(): Promise<string> {
       {
         method: "GET",
         headers: {
-          ClientID: clientId,
+          ClientID: appApiKey,
           Accept: "application/json",
         },
       }

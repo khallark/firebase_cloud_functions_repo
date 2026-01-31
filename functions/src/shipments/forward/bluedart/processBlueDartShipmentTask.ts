@@ -224,15 +224,17 @@ export const processBlueDartShipmentTask = onRequest(
       const customerCode = blueDartConfig?.customerCode as string | undefined;
       const loginId = blueDartConfig?.loginId as string | undefined;
       const licenceKey = blueDartConfig?.licenceKey as string | undefined;
+      const appApiKey = blueDartConfig?.appApiKey as string | undefined;
+      const appApiSecret = blueDartConfig?.appApiSecret as string | undefined;
 
-      if (!customerCode || !loginId || !licenceKey) {
+      if (!customerCode || !loginId || !licenceKey || !appApiKey || !appApiSecret) {
         throw new Error("BLUEDART_CONFIG_MISSING");
       }
 
       // Get JWT token for authentication
       let jwtToken: string;
       try {
-        jwtToken = await getBlueDartToken();
+        jwtToken = await getBlueDartToken(appApiKey);
       } catch (authError: any) {
         const failure = await handleJobFailure({
           businessId,

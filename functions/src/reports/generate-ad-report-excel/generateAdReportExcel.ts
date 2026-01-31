@@ -104,7 +104,7 @@ export const generateAdReportExcel = onRequest(
 
       ordersSnapshot.forEach((doc) => {
         const order = doc.data();
-        const date = new Date(order.createdAt).toISOString().slice(0, 10); // YYYY-MM-DD
+        const date = order.createdAt.slice(0, 10); // YYYY-MM-DD
         const price = parseFloat(order.raw?.total_price || "0");
 
         if (!ordersByDate.has(date)) {

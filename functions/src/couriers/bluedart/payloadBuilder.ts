@@ -25,7 +25,7 @@ export function buildBlueDartPayload(params: BlueDartShipmentParams) {
     {};
 
   const billing = order?.raw?.billing_address || ship;
-  
+
   const items =
     (Array.isArray(order?.raw?.line_items) && order.raw.line_items) || order?.lineItems || [];
 
@@ -85,7 +85,7 @@ export function buildBlueDartPayload(params: BlueDartShipmentParams) {
 
   const totalOutstanding = Number(order.raw?.total_outstanding || 0);
   const subtotalPrice = Number(order.raw?.subtotal_price || 0);
-  
+
   // Determine commodity details based on items
   const commodityDetail1 = "Apparel"; // Hardcoded for now
   const commodityDetail2 = items[0]?.title || "Product";
@@ -130,17 +130,17 @@ export function buildBlueDartPayload(params: BlueDartShipmentParams) {
       },
       Returnadds: {
         ManifestNumber: "",
-        ReturnAddress1: "Test RTO Addr1", // Hardcoded - to be replaced
-        ReturnAddress2: "Test RTO Addr2", // Hardcoded - to be replaced
-        ReturnAddress3: "Test RTO Addr3", // Hardcoded - to be replaced
+        ReturnAddress1: "UDYOG VIHAR, BAHADUR KE ROAD",
+        ReturnAddress2: "BHATTIAN, VILL. BHATTIAN",
+        ReturnAddress3: "Ludhiana, Punjab",
         ReturnAddressinfo: "",
-        ReturnContact: "Test RTO", // Hardcoded - to be replaced
-        ReturnEmailID: "testemail@bluedart.com", // Hardcoded - to be replaced
+        ReturnContact: "SHUBHDEEP ARORA",
+        ReturnEmailID: "",
         ReturnLatitude: "",
         ReturnLongitude: "",
         ReturnMaskedContactNumber: "",
-        ReturnMobile: "  ", // Hardcoded - to be replaced
-        ReturnPincode: "141008", // Hardcoded - to be replaced
+        ReturnMobile: "9132326000",
+        ReturnPincode: "141008",
         ReturnTelephone: ""
       },
       Services: {
@@ -193,24 +193,24 @@ export function buildBlueDartPayload(params: BlueDartShipmentParams) {
         noOfDCGiven: 0
       },
       Shipper: {
-        CustomerAddress1: "Test Cust Addr1", // Hardcoded - to be replaced
-        CustomerAddress2: "Test Cust Addr2", // Hardcoded - to be replaced
-        CustomerAddress3: "Test Cust Addr3", // Hardcoded - to be replaced
+        CustomerAddress1: "UDYOG VIHAR, BAHADUR KE ROAD",
+        CustomerAddress2: "BHATTIAN, VILL. BHATTIAN",
+        CustomerAddress3: "Ludhiana, Punjab",
         CustomerAddressinfo: "",
         CustomerBusinessPartyTypeCode: "",
         CustomerCode: customerCode,
-        CustomerEmailID: "TestCustEmail@bd.com", // Hardcoded - to be replaced
+        CustomerEmailID: "",
         CustomerGSTNumber: "",
         CustomerLatitude: "",
         CustomerLongitude: "",
         CustomerMaskedContactNumber: "",
-        CustomerMobile: "9996665554", // Hardcoded - to be replaced
-        CustomerName: "Test Cust Name", // Hardcoded - to be replaced
-        CustomerPincode: "141008", // Hardcoded - to be replaced
+        CustomerMobile: "913232600",
+        CustomerName: "MAJIME TECHNOLOGIES PRIVATE LIMITED",
+        CustomerPincode: "141008",
         CustomerTelephone: "",
         IsToPayCustomer: true,
-        OriginArea: "LDH", // Hardcoded - to be replaced
-        Sender: "TestRvp", // Hardcoded - to be replaced
+        OriginArea: "LDH",
+        Sender: "MAJIME TECHNOLOGIES PRIVATE LIMITED",
         VendorCode: ""
       }
     },
