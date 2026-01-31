@@ -35,12 +35,12 @@ export const handlePriorityFallback = onRequest(
         .doc(batchId);
       const jobRef = batchRef.collection("jobs").doc(jobId);
 
-      // FIX: Atomic status check and update inside transaction
+      // Atomic status check and update inside transaction
       const fallbackInfo = await db.runTransaction(async (tx: Transaction) => {
         const [jobSnap, batchSnap, businessSnap] = await Promise.all([
           tx.get(jobRef),
           tx.get(batchRef),
-          tx.get(db.collection("user").doc(businessId)),
+          tx.get(db.collection("users").doc(businessId)),
         ]);
 
         if (!jobSnap.exists || !batchSnap.exists || !businessSnap.exists) {
@@ -51,7 +51,7 @@ export const handlePriorityFallback = onRequest(
         const batchData = batchSnap.data()!;
         const businessDoc = businessSnap.data()!;
 
-        // FIX: Check terminal states atomically
+        // Check terminal states atomically
         if (["processing", "success", "failed"].includes(jobData.status)) {
           return { action: "already_handled", status: jobData.status };
         }
@@ -160,6 +160,9 @@ export const handlePriorityFallback = onRequest(
           if (fallbackInfo.courierLower === "xpressbees") {
             return String(process.env.SHIPMENT_TASK_TARGET_URL_3);
           }
+          if (fallbackInfo.courierLower === "bluedart") {
+            return String(process.env.SHIPMENT_TASK_TARGET_URL_4);
+          }
           throw new Error(`Unsupported fallback courier: ${fallbackInfo.courierLower}`);
         })();
 
@@ -201,7 +204,7 @@ export const handlePriorityFallback = onRequest(
             .doc(batchId);
           const jobRef = batchRef.collection("jobs").doc(jobId);
 
-          // FIX: Use transaction for cleanup
+          // Use transaction for cleanup
           await db.runTransaction(async (tx: Transaction) => {
             const job = await tx.get(jobRef);
             if (job.data()?.status !== "failed") {

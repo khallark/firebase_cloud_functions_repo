@@ -1,6 +1,4 @@
 import { onRequest } from "firebase-functions/https";
-import { ENQUEUE_FUNCTION_SECRET } from "../../config";
-import { requireHeaderSecret } from "../../helpers";
 import { db, storage } from "../../firebaseAdmin";
 import { META_ADS_MANAGER_SECRET } from "../../config";
 import { SHARED_STORE_ID_2 } from "../../config";
@@ -26,13 +24,9 @@ export const generateAdReportExcel = onRequest(
     cors: true,
     timeoutSeconds: 3600,
     memory: "2GiB",
-    secrets: [ENQUEUE_FUNCTION_SECRET, META_ADS_MANAGER_SECRET],
   },
   async (req, res) => {
     try {
-      // Validate secret
-      requireHeaderSecret(req, "x-api-key", ENQUEUE_FUNCTION_SECRET.value() || "");
-
       if (req.method !== "POST") {
         res.status(405).json({ error: "method_not_allowed" });
         return;
@@ -94,10 +88,16 @@ export const generateAdReportExcel = onRequest(
 
       // 2. Calculate Sale Amount, Cancellation, and Gross Sale
       console.log("🛍️ Fetching orders...");
+
+      const startDateString = `${metaSinceDate}T00:00:00+05:30`;
+      const endDateString = `${metaUntilDate}T23:59:59+05:30`;
+
+      console.log("Querying with:", startDateString, "to", endDateString);
+
       const ordersSnapshot = await db
-        .collection(`accounts/${SHARED_STORE_ID_2}/order`)
-        .where("createdAt", ">=", startOfDateRange.toISOString())
-        .where("createdAt", "<=", endOfDateRange.toISOString())
+        .collection(`accounts/${SHARED_STORE_ID_2}/orders`)
+        .where("createdAt", ">=", startDateString)
+        .where("createdAt", "<=", endDateString)
         .get();
 
       const ordersByDate = new Map<string, { sale: number; cancellation: number }>();
@@ -126,7 +126,7 @@ export const generateAdReportExcel = onRequest(
       console.log("📱 Fetching Meta Ads data...");
 
       // Resolve access token (covers secret.value() shape or plain string)
-      const ACCESS_TOKEN = (META_ADS_MANAGER_SECRET as any)?.value?.() ?? META_ADS_MANAGER_SECRET;
+      const ACCESS_TOKEN = META_ADS_MANAGER_SECRET;
 
       // ---------- Helper: follow paging.next and collect all items ----------
       async function fetchAllFromUrl(initialUrl: string) {

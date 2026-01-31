@@ -63,6 +63,7 @@ export const enqueueShipmentTasks = onRequest(
         if (courier === "Delhivery") return String(process.env.SHIPMENT_TASK_TARGET_URL_1);
         if (courier === "Shiprocket") return String(process.env.SHIPMENT_TASK_TARGET_URL_2);
         if (courier === "Xpressbees") return String(process.env.SHIPMENT_TASK_TARGET_URL_3);
+        if (courier === "Blue Dart" || courier === "BlueDart") return String(process.env.SHIPMENT_TASK_TARGET_URL_4);
 
         if (courier === "Priority") {
           if (!priorityCourier) {
@@ -74,6 +75,8 @@ export const enqueueShipmentTasks = onRequest(
             return String(process.env.SHIPMENT_TASK_TARGET_URL_2);
           if (priorityCourier === "xpressbees")
             return String(process.env.SHIPMENT_TASK_TARGET_URL_3);
+          if (priorityCourier === "bluedart")
+            return String(process.env.SHIPMENT_TASK_TARGET_URL_4);
           throw new Error(`Unsupported priority courier: ${priorityCourier}`);
         }
 
@@ -89,10 +92,10 @@ export const enqueueShipmentTasks = onRequest(
         pickupName,
         shippingMode,
         createdAt: FieldValue.serverTimestamp(),
-        createdBy: requestedBy, // <-- stamp UID
+        createdBy: requestedBy,
         total: orders.length,
         queued: orders.length,
-        status: "running", // queued | running | complete
+        status: "running",
         processing: 0,
         success: 0,
         failed: 0,
