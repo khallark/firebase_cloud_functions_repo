@@ -9,7 +9,6 @@ interface BlueDartAuthResponse {
  * Token is required for all Blue Dart API calls
  */
 export async function getBlueDartToken(appApiKey: string): Promise<string> {
-  
   try {
     const response = await fetch(
       "https://apigateway.bluedart.com/in/transportation/token/v1/login",
@@ -19,15 +18,15 @@ export async function getBlueDartToken(appApiKey: string): Promise<string> {
           ClientID: appApiKey,
           Accept: "application/json",
         },
-      }
+      },
     );
 
     if (!response.ok) {
       throw new Error(`AUTH_FAILED_HTTP_${response.status}`);
     }
 
-    const data = await response.json() as BlueDartAuthResponse;
-    
+    const data = (await response.json()) as BlueDartAuthResponse;
+
     if (!data.token) {
       throw new Error("AUTH_TOKEN_MISSING");
     }

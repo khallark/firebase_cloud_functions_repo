@@ -79,7 +79,7 @@ export function buildBlueDartPayload(params: BlueDartShipmentParams) {
       countryOfOrigin: "",
       docType: "",
       subSupplyType: 1,
-      supplyType: ""
+      supplyType: "",
     };
   });
 
@@ -112,21 +112,18 @@ export function buildBlueDartPayload(params: BlueDartShipmentParams) {
           ship?.zip || billing?.zip || "-",
           ship?.city || billing?.city || "-",
           ship?.province || billing?.province || "-",
-          ship?.country || billing?.country || "-"
+          ship?.country || billing?.country || "-",
         ].join(", "),
         ConsigneeGSTNumber: "",
         ConsigneeLatitude: "",
         ConsigneeLongitude: "",
         ConsigneeMaskedContactNumber: "",
         ConsigneeMobile: normalizePhoneNumber(
-          order.raw?.customer?.phone ||
-          ship?.phone ||
-          billing?.phone ||
-          ""
+          order.raw?.customer?.phone || ship?.phone || billing?.phone || "",
         ),
         ConsigneeName: ship?.name || billing?.name || "Customer",
         ConsigneePincode: ship?.zip || billing?.zip || "",
-        ConsigneeTelephone: ""
+        ConsigneeTelephone: "",
       },
       Returnadds: {
         ManifestNumber: "",
@@ -141,7 +138,7 @@ export function buildBlueDartPayload(params: BlueDartShipmentParams) {
         ReturnMaskedContactNumber: "",
         ReturnMobile: "9132326000",
         ReturnPincode: "141008",
-        ReturnTelephone: ""
+        ReturnTelephone: "",
       },
       Services: {
         ActualWeight: "0.25", // Hardcoded
@@ -149,7 +146,7 @@ export function buildBlueDartPayload(params: BlueDartShipmentParams) {
         Commodity: {
           CommodityDetail1: commodityDetail1,
           CommodityDetail2: commodityDetail2,
-          CommodityDetail3: ""
+          CommodityDetail3: "",
         },
         CreditReferenceNo: order.name || String(order.id),
         CreditReferenceNo2: "",
@@ -161,8 +158,8 @@ export function buildBlueDartPayload(params: BlueDartShipmentParams) {
             Length: 10, // Hardcoded
             Breadth: 10, // Hardcoded
             Height: 10, // Hardcoded
-            Count: 1 // Hardcoded
-          }
+            Count: 1, // Hardcoded
+          },
         ],
         FavouringName: "",
         IsDedicatedDeliveryNetwork: false,
@@ -190,7 +187,7 @@ export function buildBlueDartPayload(params: BlueDartShipmentParams) {
         SubProductCode: totalOutstanding > 0 ? "C" : "P", // C = COD, P = Prepaid
         TotalCashPaytoCustomer: 0,
         itemdtl: itemdtl,
-        noOfDCGiven: 0
+        noOfDCGiven: 0,
       },
       Shipper: {
         CustomerAddress1: "UDYOG VIHAR, BAHADUR KE ROAD",
@@ -211,14 +208,14 @@ export function buildBlueDartPayload(params: BlueDartShipmentParams) {
         IsToPayCustomer: true,
         OriginArea: "LDH",
         Sender: "MAJIME TECHNOLOGIES PRIVATE LIMITED",
-        VendorCode: ""
-      }
+        VendorCode: "",
+      },
     },
     Profile: {
       LoginID: loginId,
       LicenceKey: licenceKey,
-      Api_type: "S"
-    }
+      Api_type: "S",
+    },
   };
 
   return payload;

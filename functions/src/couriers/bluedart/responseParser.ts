@@ -26,7 +26,7 @@ export function evaluateBlueDartResponse(response: any): BlueDartResponseEvaluat
         ok: false,
         retryable: statusCode >= 500, // Retry server errors
         code: `HTTP_${statusCode}`,
-        message: errorResponse
+        message: errorResponse,
       };
     }
 
@@ -43,7 +43,7 @@ export function evaluateBlueDartResponse(response: any): BlueDartResponseEvaluat
           ok: false,
           retryable: isRetryableError(statusCode),
           code: statusCode,
-          message: statusInfo
+          message: statusInfo,
         };
       }
     }
@@ -52,7 +52,7 @@ export function evaluateBlueDartResponse(response: any): BlueDartResponseEvaluat
       ok: false,
       retryable: statusCode >= 500,
       code: `HTTP_${statusCode}`,
-      message: JSON.stringify(errorResponse)
+      message: JSON.stringify(errorResponse),
     };
   }
 
@@ -64,7 +64,7 @@ export function evaluateBlueDartResponse(response: any): BlueDartResponseEvaluat
       ok: false,
       retryable: false,
       code: "INVALID_RESPONSE_FORMAT",
-      message: "Response does not contain GenerateWayBillResult"
+      message: "Response does not contain GenerateWayBillResult",
     };
   }
 
@@ -92,24 +92,19 @@ export function evaluateBlueDartResponse(response: any): BlueDartResponseEvaluat
         ok: false,
         retryable: false,
         code: "INSUFFICIENT_BALANCE",
-        message: statusInfo
+        message: statusInfo,
       };
     }
 
     // Check for authentication errors
-    if (
-      statusCode.toLowerCase().includes("auth") ||
-      lowerMessage.includes("authentication")
-    ) {
-      const retryable =
-        lowerMessage.includes("token") ||
-        lowerMessage.includes("expired");
+    if (statusCode.toLowerCase().includes("auth") || lowerMessage.includes("authentication")) {
+      const retryable = lowerMessage.includes("token") || lowerMessage.includes("expired");
 
       return {
         ok: false,
         retryable,
         code: statusCode,
-        message: statusInfo
+        message: statusInfo,
       };
     }
 
@@ -117,7 +112,7 @@ export function evaluateBlueDartResponse(response: any): BlueDartResponseEvaluat
       ok: false,
       retryable: isRetryableError(statusCode),
       code: statusCode,
-      message: statusInfo
+      message: statusInfo,
     };
   }
 
@@ -130,7 +125,7 @@ export function evaluateBlueDartResponse(response: any): BlueDartResponseEvaluat
       message: "Shipment created successfully",
       awbNo: result.AWBNo,
       carrierShipmentId: null,
-      tokenNumber: result.TokenNumber || null
+      tokenNumber: result.TokenNumber || null,
     };
   }
 
@@ -140,7 +135,7 @@ export function evaluateBlueDartResponse(response: any): BlueDartResponseEvaluat
       ok: false,
       retryable: true,
       code: "AWB_NOT_GENERATED",
-      message: "Shipment processed but AWB number not generated"
+      message: "Shipment processed but AWB number not generated",
     };
   }
 
@@ -149,7 +144,7 @@ export function evaluateBlueDartResponse(response: any): BlueDartResponseEvaluat
     ok: false,
     retryable: false,
     code: "UNEXPECTED_RESPONSE",
-    message: "Response format not recognized"
+    message: "Response format not recognized",
   };
 }
 
@@ -182,13 +177,7 @@ function isRetryableError(statusCode: string): boolean {
   }
 
   // Retryable errors (network, timeout, temporary server issues)
-  const retryable = [
-    "timeout",
-    "network",
-    "server",
-    "unavailable",
-    "temporary"
-  ];
+  const retryable = ["timeout", "network", "server", "unavailable", "temporary"];
 
   for (const pattern of retryable) {
     if (lowerCode.includes(pattern)) {

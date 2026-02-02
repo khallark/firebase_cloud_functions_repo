@@ -3,7 +3,11 @@
 import { onRequest } from "firebase-functions/v2/https";
 import type { Request, Response } from "express";
 import { FieldValue, Transaction, Timestamp } from "firebase-admin/firestore";
-import { buildBlueDartPayload, evaluateBlueDartResponse, getBlueDartToken } from "../../../couriers";
+import {
+  buildBlueDartPayload,
+  evaluateBlueDartResponse,
+  getBlueDartToken,
+} from "../../../couriers";
 import { NON_RETRYABLE } from "../../helpers";
 import { TASKS_SECRET, SHARED_STORE_IDS } from "../../../config";
 import {
@@ -44,7 +48,6 @@ function sanitizeForFirestore(obj: any): any {
 export const processBlueDartShipmentTask = onRequest(
   { cors: true, timeoutSeconds: 60, secrets: [TASKS_SECRET] },
   async (req: Request, res: Response): Promise<void> => {
-
     try {
       requireHeaderSecret(req, "x-tasks-secret", TASKS_SECRET.value() || "");
       if (req.method !== "POST") {
@@ -212,7 +215,7 @@ export const processBlueDartShipmentTask = onRequest(
       if (isPriority) {
         const priorityCouriers = businessData?.integrations?.couriers?.priorityList;
         const blueDartPriorityConfig = priorityCouriers?.find(
-          (courier: any) => courier.name === "bluedart"
+          (courier: any) => courier.name === "bluedart",
         );
 
         if (blueDartPriorityConfig?.customerCode) {
@@ -244,7 +247,8 @@ export const processBlueDartShipmentTask = onRequest(
           jobId,
           errorCode: authError.message.split(/\s/)[0],
           errorMessage: authError.message,
-          isRetryable: authError.message.includes("NETWORK") || authError.message.includes("HTTP_5"),
+          isRetryable:
+            authError.message.includes("NETWORK") || authError.message.includes("HTTP_5"),
         });
 
         if (failure.shouldReturnFailure) {
@@ -407,7 +411,7 @@ export const processBlueDartShipmentTask = onRequest(
         ok: true,
         awb: verdict.awbNo,
         carrierShipmentId: verdict.carrierShipmentId ?? null,
-        tokenNumber: verdict.tokenNumber ?? null
+        tokenNumber: verdict.tokenNumber ?? null,
       });
       return;
     } catch (e: any) {

@@ -7,6 +7,7 @@ import {
   DocumentReference,
   DocumentSnapshot,
   FieldValue,
+  FieldPath,
 } from "firebase-admin/firestore";
 import { onDocumentWritten } from "firebase-functions/firestore";
 import { db } from "../../firebaseAdmin";
@@ -261,33 +262,35 @@ const updateBlockedStock = async (
 };
 
 // Define the complete order counts schema
-const ORDER_COUNTS_SCHEMA: Record<string, number> = {
-  "All Orders": 0,
-  New: 0,
-  Confirmed: 0,
-  "Ready To Dispatch": 0,
-  Dispatched: 0,
-  "In Transit": 0,
-  "Out For Delivery": 0,
-  Delivered: 0,
-  "RTO In Transit": 0,
-  "RTO Delivered": 0,
-  "DTO Requested": 0,
-  "DTO Booked": 0,
-  "DTO In Transit": 0,
-  "DTO Delivered": 0,
-  "Pending Refunds": 0,
-  "DTO Refunded": 0,
-  Lost: 0,
-  Closed: 0,
-  "RTO Processed": 0,
-  "RTO Closed": 0,
-  "Cancellation Requested": 0,
-  Cancelled: 0,
-};
+// const ORDER_COUNTS_SCHEMA: Record<string, number> = {
+//   "All Orders": 0,
+//   New: 0,
+//   Confirmed: 0,
+//   "Ready To Dispatch": 0,
+//   Dispatched: 0,
+//   "In Transit": 0,
+//   "Out For Delivery": 0,
+//   Delivered: 0,
+//   "RTO In Transit": 0,
+//   "RTO Delivered": 0,
+//   "DTO Requested": 0,
+//   "DTO Booked": 0,
+//   "DTO In Transit": 0,
+//   "DTO Delivered": 0,
+//   "Pending Refunds": 0,
+//   "DTO Refunded": 0,
+//   Lost: 0,
+//   Closed: 0,
+//   "RTO Processed": 0,
+//   "RTO Closed": 0,
+//   "Cancellation Requested": 0,
+//   Cancelled: 0,
+// };
 
-// Update order counts using a proper transaction
-const updateOrderCountsWithTransaction = async (
+// Update order counts using FieldValue.increment() - NO TRANSACTIONS
+// This eliminates contention issues during bulk operations
+// Uses FieldPath to properly handle status names with spaces
+const updateOrderCountsWithIncrement = async (
   storeId: string,
   statusUpdates: Record<string, number>,
   vendors?: string[],
@@ -298,98 +301,106 @@ const updateOrderCountsWithTransaction = async (
     .collection("metadata")
     .doc("orderCounts");
 
-  // Get vendor refs if needed
-  const vendorRefs: DocumentReference[] = [];
-
-  if (SHARED_STORE_IDS.includes(storeId) && vendors && vendors.length > 0) {
-    console.log("Shared Store detected, preparing vendor count updates...");
-
-    const uniqueVendors = [
-      ...new Set(vendors.map((v) => (["ghamand", "bbb"].includes(v.toLowerCase()) ? "OWR" : v))),
-    ];
-
-    for (const vendor of uniqueVendors) {
-      try {
-        const memberDocQuery = await db
-          .collection("accounts")
-          .doc(storeId)
-          .collection("members")
-          .where("vendorName", "==", vendor)
-          .limit(1)
-          .get();
-
-        if (!memberDocQuery.empty) {
-          vendorRefs.push(memberDocQuery.docs[0].ref);
-          console.log(`Added vendor ${vendor} to transaction`);
-        }
-      } catch (error) {
-        console.error(`❌ Failed to prepare vendor ${vendor}:`, error);
-      }
-    }
-  }
-
-  // Execute everything in a single transaction for consistency
   try {
-    await db.runTransaction(async (transaction) => {
-      // Read all documents first (transaction requirement)
-      const metadataDoc = await transaction.get(metadataRef);
-      const vendorDocs = await Promise.all(vendorRefs.map((ref) => transaction.get(ref)));
+    // Build update parameters as alternating field-value pairs
+    // This properly handles field names with spaces
+    const updateArgs: any[] = [];
 
-      // Build the complete counts object for metadata
-      const currentCounts = metadataDoc.exists ? metadataDoc.data()?.counts || {} : {};
-      const updatedCounts: Record<string, number> = { ...ORDER_COUNTS_SCHEMA };
-
-      Object.keys(ORDER_COUNTS_SCHEMA).forEach((key) => {
-        updatedCounts[key] = currentCounts[key] ?? ORDER_COUNTS_SCHEMA[key];
-      });
-
-      // Apply increments by extracting the numeric values
-      Object.entries(statusUpdates).forEach(([key, value]) => {
-        updatedCounts[key] = (updatedCounts[key] || 0) + value;
-      });
-
-      // Update order counts metadata with complete object
-      transaction.set(
-        metadataRef,
-        {
-          counts: updatedCounts,
-          lastUpdated: FieldValue.serverTimestamp(),
-        },
-        { merge: true },
-      );
-
-      // Update vendor counts with complete object
-      vendorDocs.forEach((vendorDoc, index) => {
-        const vendorCurrentCounts = vendorDoc.exists ? vendorDoc.data()?.counts || {} : {};
-        const vendorUpdatedCounts: Record<string, number> = { ...ORDER_COUNTS_SCHEMA };
-
-        // Merge existing counts
-        Object.keys(ORDER_COUNTS_SCHEMA).forEach((key) => {
-          vendorUpdatedCounts[key] = vendorCurrentCounts[key] ?? ORDER_COUNTS_SCHEMA[key];
-        });
-
-        // Apply increments
-        Object.entries(statusUpdates).forEach(([key, delta]) => {
-          vendorUpdatedCounts[key] = (vendorUpdatedCounts[key] || 0) + delta;
-        });
-
-        transaction.set(
-          vendorRefs[index],
-          {
-            counts: vendorUpdatedCounts,
-            lastUpdated: FieldValue.serverTimestamp(),
-          },
-          { merge: true },
-        );
-      });
+    Object.entries(statusUpdates).forEach(([key, delta]) => {
+      // Use FieldPath to properly escape field names with spaces
+      updateArgs.push(new FieldPath("counts", key));
+      updateArgs.push(FieldValue.increment(delta));
     });
 
-    console.log(`✅ Order counts transaction committed (${vendorRefs.length} vendors updated)`);
+    // Add lastUpdated timestamp
+    updateArgs.push("lastUpdated");
+    updateArgs.push(FieldValue.serverTimestamp());
+
+    // Update metadata counts using alternating field-value pairs
+    // This is the proper way to handle FieldPath with special characters
+    // Type assertion needed for TypeScript to accept the spread operator
+    await metadataRef.update(
+      updateArgs[0] as string | FieldPath,
+      updateArgs[1],
+      ...updateArgs.slice(2),
+    );
+
+    console.log(`✅ Order counts updated using increments:`, statusUpdates);
+
+    // Handle vendor updates if this is a shared store
+    if (SHARED_STORE_IDS.includes(storeId) && vendors && vendors.length > 0) {
+      console.log("Shared Store detected, updating vendor counts...");
+
+      const uniqueVendors = [
+        ...new Set(vendors.map((v) => (["ghamand", "bbb"].includes(v.toLowerCase()) ? "OWR" : v))),
+      ];
+
+      // Update all vendors in parallel (each uses atomic increment)
+      const vendorUpdates = uniqueVendors.map(async (vendor) => {
+        try {
+          const memberDocQuery = await db
+            .collection("accounts")
+            .doc(storeId)
+            .collection("members")
+            .where("vendorName", "==", vendor)
+            .limit(1)
+            .get();
+
+          if (!memberDocQuery.empty) {
+            const vendorRef = memberDocQuery.docs[0].ref;
+
+            // Build vendor update parameters
+            const vendorUpdateArgs: any[] = [];
+
+            Object.entries(statusUpdates).forEach(([key, delta]) => {
+              vendorUpdateArgs.push(new FieldPath("counts", key));
+              vendorUpdateArgs.push(FieldValue.increment(delta));
+            });
+
+            vendorUpdateArgs.push("lastUpdated");
+            vendorUpdateArgs.push(FieldValue.serverTimestamp());
+
+            await vendorRef.update(
+              vendorUpdateArgs[0] as string | FieldPath,
+              vendorUpdateArgs[1],
+              ...vendorUpdateArgs.slice(2),
+            );
+            console.log(`✅ Updated vendor ${vendor} counts`);
+          } else {
+            console.warn(`⚠️ Vendor ${vendor} not found`);
+          }
+        } catch (error) {
+          console.error(`❌ Failed to update vendor ${vendor}:`, error);
+        }
+      });
+
+      await Promise.all(vendorUpdates);
+      console.log(`✅ All vendor counts updated (${uniqueVendors.length} vendors)`);
+    }
   } catch (error) {
     console.error(`❌ Failed to update order counts:`, error);
     throw error;
   }
 };
+
+// Helper function to initialize order counts schema (call once per store/vendor)
+// This ensures all count fields exist before increments are used
+// export const initializeOrderCounts = async (
+//   docRef: DocumentReference,
+// ): Promise<void> => {
+//   try {
+//     await docRef.set(
+//       {
+//         counts: ORDER_COUNTS_SCHEMA,
+//         lastUpdated: FieldValue.serverTimestamp(),
+//       },
+//       { merge: true },
+//     );
+//     console.log(`✅ Initialized order counts schema`);
+//   } catch (error) {
+//     console.error(`❌ Failed to initialize order counts:`, error);
+//   }
+// };
 
 export const updateOrderCounts = onDocumentWritten(
   {
@@ -417,7 +428,7 @@ export const updateOrderCounts = onDocumentWritten(
       const oldStatus = oldOrder.customStatus || "New";
 
       try {
-        await updateOrderCountsWithTransaction(
+        await updateOrderCountsWithIncrement(
           storeId,
           {
             "All Orders": -1,
@@ -445,7 +456,7 @@ export const updateOrderCounts = onDocumentWritten(
       const newStatus = newOrder.customStatus || "New";
 
       try {
-        await updateOrderCountsWithTransaction(
+        await updateOrderCountsWithIncrement(
           storeId,
           {
             "All Orders": 1,
@@ -476,7 +487,7 @@ export const updateOrderCounts = onDocumentWritten(
 
     if (oldStatus !== newStatus) {
       try {
-        await updateOrderCountsWithTransaction(
+        await updateOrderCountsWithIncrement(
           storeId,
           {
             [oldStatus]: -1,
