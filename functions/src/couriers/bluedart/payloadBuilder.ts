@@ -48,9 +48,22 @@ export function buildBlueDartPayload(params: BlueDartShipmentParams) {
       console.warn(`Invalid GST split for item ${item.id}: IGST + CGST/SGST together`);
     }
 
-    const price = Number(item.price || 0);
+    const pricePerUnit = Number(item.price || 0);
     const qty = Number(item.quantity || 1);
-    const taxableAmount = price * qty;
+
+    // Calculate discount per item
+    const lineItemDiscount = Array.isArray(item.discount_allocations) && item.discount_allocations.length > 0
+      ? item.discount_allocations.reduce((total: number, discount: any) => total + Number(discount.amount || 0), 0)
+      : 0;
+
+    // Calculate line total before discount
+    const lineTotal = pricePerUnit * qty;
+
+    // Calculate line total after discount (taxable amount)
+    const taxableAmount = lineTotal - lineItemDiscount;
+
+    // Calculate final item value (price per unit after discount)
+    const itemValueAfterDiscount = qty > 0 ? taxableAmount / qty : pricePerUnit;
 
     return {
       HSCode: "61091000", // Hardcoded - apparel HS code
@@ -58,8 +71,8 @@ export function buildBlueDartPayload(params: BlueDartShipmentParams) {
       InvoiceDate: `/Date(${Date.now()})/`,
       InvoiceNumber: `INV-${order.name || String(order.id)}-${index + 1}`,
       ItemID: String(item.id || index),
-      ItemName: item.title || item.name || "Item",
-      ItemValue: price,
+      ItemName: item.name || item.title || "Item",
+      ItemValue: itemValueAfterDiscount, // Price per unit AFTER discount
       Itemquantity: qty,
       PlaceofSupply: ship?.province_code || billing?.province_code || "",
       ProductDesc1: "",
@@ -69,11 +82,11 @@ export function buildBlueDartPayload(params: BlueDartShipmentParams) {
       IGSTAmount: IGSTAmount,
       SGSTAmount: SGSTAmount,
       SKUNumber: item.sku || "",
-      SellerGSTNNumber: "<your_gstn>", // Hardcoded - to be replaced
-      SellerName: "<my_legal_business_name>", // Hardcoded - to be replaced
+      SellerGSTNNumber: "03AAQCM9385B1Z8", // Hardcoded - to be replaced
+      SellerName: "MAJIME TECHNOLOGIES PRIVATE LIMITED", // Hardcoded - to be replaced
       SubProduct1: "",
       SubProduct2: "",
-      TaxableAmount: taxableAmount,
+      TaxableAmount: taxableAmount, // Line total after discount
       TotalValue: taxableAmount + CGSTAmount + SGSTAmount + IGSTAmount,
       cessAmount: "0.0",
       countryOfOrigin: "",
@@ -127,8 +140,8 @@ export function buildBlueDartPayload(params: BlueDartShipmentParams) {
       },
       Returnadds: {
         ManifestNumber: "",
-        ReturnAddress1: "UDYOG VIHAR, BAHADUR KE ROAD",
-        ReturnAddress2: "BHATTIAN, VILL. BHATTIAN",
+        ReturnAddress1: "Village Husainpura, Hadbast 99",
+        ReturnAddress2: "Near Paras Estate",
         ReturnAddress3: "Ludhiana, Punjab",
         ReturnAddressinfo: "",
         ReturnContact: "SHUBHDEEP ARORA",
@@ -190,22 +203,22 @@ export function buildBlueDartPayload(params: BlueDartShipmentParams) {
         noOfDCGiven: 0,
       },
       Shipper: {
-        CustomerAddress1: "UDYOG VIHAR, BAHADUR KE ROAD",
-        CustomerAddress2: "BHATTIAN, VILL. BHATTIAN",
+        CustomerAddress1: "Village Husainpura, Hadbast 99",
+        CustomerAddress2: "Near Paras Estate",
         CustomerAddress3: "Ludhiana, Punjab",
         CustomerAddressinfo: "",
         CustomerBusinessPartyTypeCode: "",
         CustomerCode: customerCode,
         CustomerEmailID: "",
-        CustomerGSTNumber: "",
+        CustomerGSTNumber: "03AAQCM9385B1Z8",
         CustomerLatitude: "",
         CustomerLongitude: "",
         CustomerMaskedContactNumber: "",
-        CustomerMobile: "913232600",
+        CustomerMobile: "9132326000",
         CustomerName: "MAJIME TECHNOLOGIES PRIVATE LIMITED",
         CustomerPincode: "141008",
         CustomerTelephone: "",
-        IsToPayCustomer: true,
+        IsToPayCustomer: false,
         OriginArea: "LDH",
         Sender: "MAJIME TECHNOLOGIES PRIVATE LIMITED",
         VendorCode: "",

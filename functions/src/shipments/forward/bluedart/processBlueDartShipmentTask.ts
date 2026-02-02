@@ -237,7 +237,7 @@ export const processBlueDartShipmentTask = onRequest(
       // Get JWT token for authentication
       let jwtToken: string;
       try {
-        jwtToken = await getBlueDartToken(appApiKey);
+        jwtToken = await getBlueDartToken(appApiKey, appApiSecret);
       } catch (authError: any) {
         const failure = await handleJobFailure({
           businessId,
@@ -392,6 +392,12 @@ export const processBlueDartShipmentTask = onRequest(
             awb: verdict.awbNo,
             courier: "Blue Dart",
             courierProvider: "Blue Dart",
+
+            // ✅ ADD THESE THREE LINES
+            bdDestinationArea: verdict.destinationArea ?? null,
+            bdClusterCode: verdict.clusterCode ?? null,
+            bdDestinationLocation: verdict.destinationLocation ?? null,
+
             customStatus: "Ready To Dispatch",
             shippingMode,
             lastStatusUpdate: FieldValue.serverTimestamp(),

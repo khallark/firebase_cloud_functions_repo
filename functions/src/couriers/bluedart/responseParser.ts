@@ -5,10 +5,16 @@ interface BlueDartResponseEvaluation {
   retryable: boolean;
   code: string;
   message: string;
-  carrierShipmentId?: string | null;
+
   awbNo?: string | null;
+  carrierShipmentId?: string | null;
   tokenNumber?: string | null;
+
+  destinationArea?: string | null;
+  clusterCode?: string | null;
+  destinationLocation?: string | null;
 }
+
 
 /**
  * Parses and evaluates Blue Dart GenerateWayBill API response
@@ -123,11 +129,18 @@ export function evaluateBlueDartResponse(response: any): BlueDartResponseEvaluat
       retryable: false,
       code: "OK",
       message: "Shipment created successfully",
+
       awbNo: result.AWBNo,
       carrierShipmentId: null,
       tokenNumber: result.TokenNumber || null,
+
+      // ✅ ADD THESE THREE LINES
+      destinationArea: result.DestinationArea || null,
+      clusterCode: result.ClusterCode || null,
+      destinationLocation: result.DestinationLocation || null,
     };
   }
+
 
   // Edge case: IsError is false but no AWBNo
   if (result.IsError === false) {
