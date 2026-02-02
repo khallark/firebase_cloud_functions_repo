@@ -195,7 +195,7 @@ export function buildBlueDartPayload(params: BlueDartShipmentParams) {
         ProductCode: "A", // Hardcoded
         ProductFeature: "",
         ProductType: 1,
-        RegisterPickup: true,
+        RegisterPickup: false,
         SpecialInstruction: "",
         SubProductCode: totalOutstanding > 0 ? "C" : "P", // C = COD, P = Prepaid
         TotalCashPaytoCustomer: 0,
