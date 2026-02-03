@@ -124,7 +124,7 @@ export const updateBlueDartStatusesJob = onRequest(
       if (result.hasMore && result.nextCursor) {
         await queueNextChunk(
           TASKS_SECRET.value() || "",
-          process.env.BLUEDART_UPDATE_STATUS_TASK_JOB_TARGET_URL!,
+          process.env.UPDATE_STATUS_TASK_JOB_TARGET_URL_BLUEDART!,
           {
             accountId,
             businessId,

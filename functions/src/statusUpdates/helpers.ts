@@ -13,6 +13,8 @@ import {
 import { maybeCompleteBatch } from "../helpers";
 import { db } from "../firebaseAdmin";
 
+// ─── Status-determination helpers (one per courier) ─────────────────────────
+
 export function determineNewDelhiveryStatus(status: any): string | null {
   const { Status, StatusType } = status;
 
@@ -57,6 +59,26 @@ export function determineNewXpressbeesStatus(currentStatus: string): string | nu
   return statusMap[currentStatus] || null;
 }
 
+// TODO: Mapping to be populated once Blue Dart's StatusType values are
+// validated against live shipment data.
+//
+// Candidate mapping (StatusType → app status):
+//   PU  → "Ready To Dispatch"
+//   IT  → "In Transit"
+//   OD  → "Out For Delivery"
+//   DL  → "Delivered"
+//   RTO → "RTO In Transit" | "RTO Delivered"  (sub-type TBD)
+//   LS  → "Lost"
+//
+// @param statusType  Short code from Blue Dart, e.g. "PU", "IT", "DL"
+// @param rawStatus   Human-readable status string (kept for logging / fallback)
+export function determineNewBlueDartStatus(statusType: string, rawStatus: string): string | null {
+  // Placeholder — will be filled once the mapping is confirmed.
+  return null;
+}
+
+// ─── Token helpers (one per courier that needs one) ─────────────────────────
+
 export async function getXpressbeesToken(email: string, password: string): Promise<string | null> {
   try {
     const response = await fetch("https://shipment.xpressbees.com/api/users/login", {
@@ -84,6 +106,53 @@ export async function getXpressbeesToken(email: string, password: string): Promi
     return null;
   }
 }
+
+// Fetches a fresh JWT from Blue Dart's auth endpoint.
+// Throws structured errors whose code (first space-delimited token) is
+// consumed by the NON_RETRYABLE list in process.ts + handleJobError:
+//   BLUEDART_AUTH_FAILED          — 4xx from the auth endpoint (bad creds)
+//   BLUEDART_AUTH_TOKEN_MISSING   — 2xx but no JWTToken in the body
+//   BLUEDART_AUTH_NETWORK_ERROR   — fetch threw (DNS, timeout, etc.) — retryable
+export async function getBlueDartToken(appApiKey: string, appApiSecret: string): Promise<string> {
+  try {
+    const response = await fetch(
+      "https://apigateway.bluedart.com/in/transportation/token/v1/login",
+      {
+        method: "GET",
+        headers: {
+          ClientID: appApiKey,
+          clientSecret: appApiSecret,
+          Accept: "application/json",
+        },
+      },
+    );
+
+    const data = (await response.json()) as any;
+
+    if (!response.ok) {
+      // Extract messages from Blue Dart's error-response array
+      const errorMsgs = Array.isArray(data?.["error-response"])
+        ? data["error-response"].map((e: any) => e.msg).join(", ")
+        : data?.title || "Authentication failed";
+      throw new Error(`BLUEDART_AUTH_FAILED ${errorMsgs}`);
+    }
+
+    if (!data.JWTToken) {
+      throw new Error("BLUEDART_AUTH_TOKEN_MISSING");
+    }
+
+    return data.JWTToken;
+  } catch (error: any) {
+    // Re-throw errors we already structured
+    if (error.message?.startsWith("BLUEDART_AUTH")) {
+      throw error;
+    }
+    // Anything else is a network / parse failure — retryable
+    throw new Error(`BLUEDART_AUTH_NETWORK_ERROR ${error.message}`);
+  }
+}
+
+// ─── Shared utilities ───────────────────────────────────────────────────────
 
 export function getStatusRemarks(status: string): string {
   const remarks: Record<string, string> = {
@@ -119,7 +188,19 @@ export async function handleJobError(error: any, body: any): Promise<void> {
 
   const msg = error.message || String(error);
   const code = msg.split(/\s/)[0];
-  const NON_RETRYABLE = ["ACCOUNT_NOT_FOUND", "API_KEY_MISSING", "NO_VALID_USERS_FOR_ACCOUNT"];
+
+  // Covers all couriers — codes that are permanent regardless of who threw them
+  const NON_RETRYABLE = [
+    // generic
+    "ACCOUNT_NOT_FOUND",
+    "NO_VALID_USERS_FOR_ACCOUNT",
+    // Delhivery
+    "API_KEY_MISSING",
+    // Blue Dart
+    "BLUEDART_CREDENTIALS_MISSING",
+    "BLUEDART_AUTH_FAILED",
+    "BLUEDART_AUTH_TOKEN_MISSING",
+  ];
   const isRetryable = !NON_RETRYABLE.includes(code);
 
   const batchRef = db.collection("status_update_batches").doc(batchId);
@@ -157,7 +238,7 @@ export async function handleJobError(error: any, body: any): Promise<void> {
 
 export const CHUNK_SIZE = 200; // Orders processed per scheduled task
 export const MANUAL_CHUNK_SIZE = 100; // Order IDs processed per manual task
-export const API_BATCH_SIZE = 50; // Orders per Delhivery API call
+export const API_BATCH_SIZE = 50; // Orders per API-batch (Firestore write boundary)
 
 export interface ChunkResult {
   processed: number;

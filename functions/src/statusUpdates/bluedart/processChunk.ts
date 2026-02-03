@@ -122,6 +122,11 @@ export async function processBlueDartOrderChunk(
       // Send WhatsApp status-change messages after the write is confirmed
       await sendStatusChangeMessages(updates, shopData);
     }
+
+    // Rate limiting between API calls
+    if (i + API_BATCH_SIZE < eligibleOrders.length) {
+      await sleep(150);
+    }
   }
 
   const lastDoc = snapshot.docs[snapshot.docs.length - 1];
@@ -136,75 +141,65 @@ export async function processBlueDartOrderChunk(
 }
 
 // ─── Tracking-API layer ──────────────────────────────────────────────────────
-// Blue Dart's tracking endpoint accepts a single AWB per request (no
-// comma-separated batch like Delhivery), so we iterate and call individually
-// with a 200 ms sleep between each call to stay within rate limits.
+// Blue Dart's tracking endpoint accepts up to 50 comma-separated AWBs in the
+// `numbers` parameter.  API_BATCH_SIZE is already 50, so each slice passed here
+// maps to exactly one HTTP call.  Any AWB that Blue Dart doesn't recognise is
+// simply omitted from the ShipmentData.Shipment array — no error is raised.
 async function fetchAndProcessBlueDartBatch(
   orders: any[],
   jwtToken: string,
   loginId: string,
   trackingLicenceKey: string,
 ): Promise<OrderUpdate[]> {
-  const allShipments: any[] = [];
+  // Pick the correct AWB per order (reverse AWB for DTO states, same as Delhivery)
+  const waybills = orders
+    .map((order) => (order.customStatus?.includes("DTO") ? order.awb_reverse : order.awb))
+    .filter(Boolean)
+    .join(",");
 
-  for (let i = 0; i < orders.length; i++) {
-    const order  = orders[i];
-    // Use the reverse AWB when the order is in a DTO (customer-return) state,
-    // identical to the Delhivery pattern.
-    const awb = order.customStatus?.includes("DTO") ? order.awb_reverse : order.awb;
-    if (!awb) continue;
+  if (!waybills) return [];
 
-    try {
-      const trackingUrl =
-        `https://apigateway.bluedart.com/in/transportation/tracking/v1/shipment` +
-        `?handler=tnt` +
-        `&numbers=${encodeURIComponent(awb)}` +
-        `&format=json` +
-        `&scan=1` +
-        `&verno=1` +
-        `&awb=awb` +
-        `&loginid=${encodeURIComponent(loginId)}` +
-        `&lickey=${encodeURIComponent(trackingLicenceKey)}`;
+  try {
+    const trackingUrl =
+      `https://apigateway.bluedart.com/in/transportation/tracking/v1/shipment` +
+      `?handler=tnt` +
+      `&numbers=${encodeURIComponent(waybills)}` +
+      `&format=json` +
+      `&scan=1` +
+      `&verno=1` +
+      `&awb=awb` +
+      `&loginid=${encodeURIComponent(loginId)}` +
+      `&lickey=${encodeURIComponent(trackingLicenceKey)}`;
 
-      const response = await fetch(trackingUrl, {
-        method: "GET",
-        headers: {
-          JWTToken: jwtToken,
-          Accept: "application/json",
-        },
-      });
+    const response = await fetch(trackingUrl, {
+      method: "GET",
+      headers: {
+        JWTToken: jwtToken,
+        Accept: "application/json",
+      },
+    });
 
-      if (!response.ok) {
-        // 5xx / 429 → propagate so the whole job is retried by Cloud Tasks
-        if (response.status >= 500 || response.status === 429) {
-          throw new Error(`HTTP_${response.status}`);
-        }
-        // Other client errors (e.g. 404 for an unknown AWB) — log & skip
-        console.error(`[Blue Dart] Tracking API error for AWB ${awb}: ${response.status}`);
-        continue;
+    if (!response.ok) {
+      // 5xx / 429 → propagate so the whole job is retried by Cloud Tasks
+      if (response.status >= 500 || response.status === 429) {
+        throw new Error(`HTTP_${response.status}`);
       }
-
-      const trackingData = (await response.json()) as any;
-      // Response shape: { ShipmentData: { Shipment: [...] } }
-      const shipments = trackingData?.ShipmentData?.Shipment || [];
-      allShipments.push(...shipments);
-    } catch (error: any) {
-      if (error.message?.startsWith("HTTP_")) {
-        throw error; // bubble up — Cloud Tasks will retry the whole chunk
-      }
-      console.error(`[Blue Dart] Error fetching tracking for AWB ${awb}:`, error);
-      // Non-fatal: continue with the remaining AWBs
+      console.error(`[Blue Dart] Tracking API error: ${response.status}`);
+      return [];
     }
 
-    // Rate-limit between individual tracking calls (skip after the last one)
-    if (i < orders.length - 1) {
-      await sleep(200);
+    const trackingData = (await response.json()) as any;
+    // Response shape: { ShipmentData: { Shipment: [...] } }
+    const shipments = trackingData?.ShipmentData?.Shipment || [];
+
+    return prepareBlueDartOrderUpdates(orders, shipments);
+  } catch (error: any) {
+    if (error.message?.startsWith("HTTP_")) {
+      throw error; // bubble up — Cloud Tasks will retry the whole chunk
     }
+    console.error("[Blue Dart] Batch tracking error:", error);
+    return [];
   }
-
-  if (allShipments.length === 0) return [];
-
-  return prepareBlueDartOrderUpdates(orders, allShipments);
 }
 
 // ─── Update preparation ─────────────────────────────────────────────────────
