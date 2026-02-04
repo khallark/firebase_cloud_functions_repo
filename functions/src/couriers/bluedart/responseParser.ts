@@ -15,7 +15,6 @@ interface BlueDartResponseEvaluation {
   destinationLocation?: string | null;
 }
 
-
 /**
  * Parses and evaluates Blue Dart GenerateWayBill API response
  * Handles both successful responses and various error formats
@@ -140,7 +139,6 @@ export function evaluateBlueDartResponse(response: any): BlueDartResponseEvaluat
       destinationLocation: result.DestinationLocation || null,
     };
   }
-
 
   // Edge case: IsError is false but no AWBNo
   if (result.IsError === false) {

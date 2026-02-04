@@ -45,7 +45,10 @@ export const enqueueBlueDartStatusUpdateTasksScheduled = onSchedule(
       let allShopIds = new Set<{ accountId: string; businessId: string }>();
       activeBusinesses.forEach((doc) => {
         if (!doc.id) {
-          console.error("[Blue Dart] ⚠️ Found document without ID in activeBusinesses:", doc.ref.path);
+          console.error(
+            "[Blue Dart] ⚠️ Found document without ID in activeBusinesses:",
+            doc.ref.path,
+          );
           return;
         }
 

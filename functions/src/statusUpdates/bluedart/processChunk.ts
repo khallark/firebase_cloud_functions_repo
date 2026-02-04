@@ -64,12 +64,16 @@ export async function processBlueDartOrderChunk(
     return { processed: 0, updated: 0, hasMore: false };
   }
 
+  console.log(
+    `[Blue Dart] Found ${snapshot.docs.length} unfiltered orders for account ${accountId}`,
+  );
+
   const eligibleOrders = snapshot.docs
     .map((doc: QueryDocumentSnapshot) => ({ id: doc.id, ref: doc.ref, ...doc.data() }))
     .filter((order: any) => {
       // (courier == "Blue Dart" AND no courier_reverse) OR (courier_reverse == "Blue Dart")
-      const hasBlueDartCourier        = order.courier === "Blue Dart";
-      const hasNoCourierReverse       = !order.courier_reverse;
+      const hasBlueDartCourier = order.courier === "Blue Dart";
+      const hasNoCourierReverse = !order.courier_reverse;
       const hasBlueDartCourierReverse = order.courier_reverse === "Blue Dart";
 
       const meetsCourierCondition =
@@ -82,6 +86,9 @@ export async function processBlueDartOrderChunk(
     });
 
   if (eligibleOrders.length === 0) {
+    console.log(
+      `[Blue Dart] No elegible orders for this batch of account ${accountId}, skipping`,
+    );
     const lastDoc = snapshot.docs[snapshot.docs.length - 1];
     return {
       processed: snapshot.size,
@@ -217,7 +224,7 @@ function prepareBlueDartOrderUpdates(orders: any[], shipments: any[]): OrderUpda
   // Blue Dart's WaybillNo back to the right order in O(1).
   const ordersByAwb = new Map<string, any>();
   for (const order of orders) {
-    if (order.awb)         ordersByAwb.set(order.awb,         order);
+    if (order.awb) ordersByAwb.set(order.awb, order);
     if (order.awb_reverse) ordersByAwb.set(order.awb_reverse, order);
   }
 

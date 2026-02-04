@@ -25,7 +25,7 @@ export async function getBlueDartToken(appApiKey: string, appApiSecret: string):
           clientSecret: appApiSecret,
           Accept: "application/json",
         },
-      }
+      },
     );
 
     const data = await response.json();
@@ -38,12 +38,10 @@ export async function getBlueDartToken(appApiKey: string, appApiSecret: string):
       let errorMessage = "Authentication failed";
       if (errorData["error-response"]) {
         if (Array.isArray(errorData["error-response"]) && errorData["error-response"].length > 0) {
-          errorMessage = errorData["error-response"]
-            .map(err => err.msg)
-            .join(", ");
+          errorMessage = errorData["error-response"].map((err) => err.msg).join(", ");
         }
-        if(typeof errorData["error-response"] === 'string') {
-          errorMessage = errorData["error-response"]
+        if (typeof errorData["error-response"] === "string") {
+          errorMessage = errorData["error-response"];
         }
       }
 

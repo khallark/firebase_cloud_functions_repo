@@ -52,9 +52,13 @@ export function buildBlueDartPayload(params: BlueDartShipmentParams) {
     const qty = Number(item.quantity || 1);
 
     // Calculate discount per item
-    const lineItemDiscount = Array.isArray(item.discount_allocations) && item.discount_allocations.length > 0
-      ? item.discount_allocations.reduce((total: number, discount: any) => total + Number(discount.amount || 0), 0)
-      : 0;
+    const lineItemDiscount =
+      Array.isArray(item.discount_allocations) && item.discount_allocations.length > 0
+        ? item.discount_allocations.reduce(
+            (total: number, discount: any) => total + Number(discount.amount || 0),
+            0,
+          )
+        : 0;
 
     // Calculate line total before discount
     const lineTotal = pricePerUnit * qty;

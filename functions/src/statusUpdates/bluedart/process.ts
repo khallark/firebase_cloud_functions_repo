@@ -41,20 +41,33 @@ export const updateBlueDartStatusesJob = onRequest(
       const batchRef = db.collection("status_update_batches").doc(batchId);
       const jobRef = batchRef.collection("jobs").doc(jobId);
 
-      // Idempotency check
+      // Idempotency check — skip jobs that are already terminal
       const jSnap = await jobRef.get();
-      if (jSnap.exists && jSnap.data()?.status === "success") {
-        res.json({ ok: true, dedup: true });
-        return;
+      if (jSnap.exists) {
+        const jStatus = jSnap.data()?.status;
+        if (jStatus === "success" || jStatus === "failed") {
+          res.json({ ok: true, dedup: true, previousStatus: jStatus });
+          return;
+        }
       }
 
       // Initialize job on first chunk
       if (chunkIndex === 0) {
+        let alreadyRunning = false;
+
         await db.runTransaction(async (tx: Transaction) => {
           const snap = await tx.get(jobRef);
           const data = snap.data() || {};
           const prevAttempts = Number(data.attempts || 0);
           const firstAttempt = prevAttempts === 0 || data.status === "queued";
+
+          // If the job is already "processing" this is a duplicate delivery of
+          // chunk 0 (Cloud Tasks timeout retry after the first chunk-0 already
+          // started work).  Don't reset counters — just bail.
+          if (data.status === "processing" && prevAttempts > 0) {
+            alreadyRunning = true;
+            return; // exit transaction without writing
+          }
 
           tx.set(
             jobRef,
@@ -75,6 +88,11 @@ export const updateBlueDartStatusesJob = onRequest(
           if (firstAttempt) inc.queued = FieldValue.increment(-1);
           tx.update(batchRef, inc);
         });
+
+        if (alreadyRunning) {
+          res.json({ ok: true, dedup: true, reason: "chunk_0_already_processing" });
+          return;
+        }
       }
 
       // ── Verify business exists ──────────────────────────────────────────────
@@ -124,7 +142,7 @@ export const updateBlueDartStatusesJob = onRequest(
       if (result.hasMore && result.nextCursor) {
         await queueNextChunk(
           TASKS_SECRET.value() || "",
-          process.env.UPDATE_STATUS_TASK_JOB_TARGET_URL_BLUEDART!,
+          process.env.BLUEDART_UPDATE_STATUS_TASK_JOB_TARGET_URL!,
           {
             accountId,
             businessId,

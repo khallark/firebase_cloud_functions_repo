@@ -72,7 +72,10 @@ export function determineNewXpressbeesStatus(currentStatus: string): string | nu
 //
 // @param statusType  Short code from Blue Dart, e.g. "PU", "IT", "DL"
 // @param rawStatus   Human-readable status string (kept for logging / fallback)
-export function determineNewBlueDartStatus(statusType: string, rawStatus: string): string | null {
+export function determineNewBlueDartStatus(
+  // statusType: string,
+  // rawStatus: string
+): string | null {
   // Placeholder — will be filled once the mapping is confirmed.
   return null;
 }
