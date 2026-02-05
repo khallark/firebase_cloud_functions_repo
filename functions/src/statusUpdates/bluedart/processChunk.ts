@@ -1,15 +1,13 @@
-import { Filter, QueryDocumentSnapshot } from "firebase-admin/firestore";
+import { FieldValue, Filter, QueryDocumentSnapshot, Timestamp } from "firebase-admin/firestore";
 import {
   API_BATCH_SIZE,
   CHUNK_SIZE,
   ChunkResult,
+  determineNewBlueDartStatus,
+  getStatusRemarks,
   OrderUpdate,
   sendStatusChangeMessages,
 } from "../helpers";
-// When the TODO status-logic blocks in prepareBlueDartOrderUpdates are
-// uncommented, restore these imports:
-//   import { FieldValue, Timestamp } from "firebase-admin/firestore";
-//   import { getStatusRemarks } from "../helpers";
 import { sleep } from "../../helpers";
 import { db } from "../../firebaseAdmin";
 
@@ -250,8 +248,7 @@ function prepareBlueDartOrderUpdates(orders: any[], shipments: any[]): OrderUpda
     //                                ScanDate, Scan (description), ScanTime,
     //                                ScanGroupType
     //
-    // const rawStatus     = shipment.Status;        // e.g. "PICKUP HAS BEEN REGISTERED"
-    // const rawStatusType = shipment.StatusType;    // e.g. "PU"
+    const rawStatusType = shipment.StatusType;    // e.g. "PU"
     // ---------------------------------------------------------------------
 
     // ---------------------------------------------------------------------
@@ -268,22 +265,22 @@ function prepareBlueDartOrderUpdates(orders: any[], shipments: any[]): OrderUpda
     //         or "RTO Delivered"           (returned to origin — delivered)
     //   LS  → "Lost"                       (shipment marked lost)
     //
-    // const newStatus = determineNewBlueDartStatus(rawStatusType, rawStatus);
-    // if (!newStatus) continue;                      // unrecognised code → skip
-    // if (newStatus === order.customStatus) continue; // no change → skip
-    //
-    // updates.push({
-    //   ref: order.ref,
-    //   data: {
-    //     customStatus: newStatus,
-    //     lastStatusUpdate: FieldValue.serverTimestamp(),
-    //     customStatusesLogs: FieldValue.arrayUnion({
-    //       status: newStatus,
-    //       createdAt: Timestamp.now(),
-    //       remarks: getStatusRemarks(newStatus),
-    //     }),
-    //   },
-    // });
+    const newStatus = determineNewBlueDartStatus(rawStatusType);
+    if (!newStatus) continue;                      // unrecognised code → skip
+    if (newStatus === order.customStatus) continue; // no change → skip
+
+    updates.push({
+      ref: order.ref,
+      data: {
+        customStatus: newStatus,
+        lastStatusUpdate: FieldValue.serverTimestamp(),
+        customStatusesLogs: FieldValue.arrayUnion({
+          status: newStatus,
+          createdAt: Timestamp.now(),
+          remarks: getStatusRemarks(newStatus),
+        }),
+      },
+    });
     // ---------------------------------------------------------------------
   }
 

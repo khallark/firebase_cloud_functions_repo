@@ -73,12 +73,35 @@ export function determineNewXpressbeesStatus(currentStatus: string): string | nu
 // @param statusType  Short code from Blue Dart, e.g. "PU", "IT", "DL"
 // @param rawStatus   Human-readable status string (kept for logging / fallback)
 export function determineNewBlueDartStatus(
-  // statusType: string,
-  // rawStatus: string
+  statusType: string
 ): string | null {
-  // Placeholder — will be filled once the mapping is confirmed.
-  return null;
+  if (!statusType) return null;
+
+  switch (statusType.toUpperCase()) {
+    case "IT":
+      return "In Transit";
+
+    case "OD":
+      return "Out For Delivery";
+
+    case "DL":
+      return "Delivered";
+
+    // case "UD":
+    //   return "Undelivered";
+
+    case "RTO":
+      return "RTO In Transit"; // can be split later using remarks / scan codes
+
+    case "LS":
+      return "Lost";
+
+    default:
+      // Unknown / unmapped status from Blue Dart
+      return null;
+  }
 }
+
 
 // ─── Token helpers (one per courier that needs one) ─────────────────────────
 

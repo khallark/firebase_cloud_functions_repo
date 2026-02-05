@@ -154,7 +154,7 @@ export const processFulfillmentTask = onRequest(
           await batch.commit();
 
           // Clean up UPCs after successful batch commit
-          await cleanupOrderUPCs(businessId, orderId);
+          await dispatchOrderUPCs(businessId, orderId);
 
           await maybeCompleteSummary(summaryRef);
 
@@ -253,7 +253,7 @@ export const processFulfillmentTask = onRequest(
           await successBatch.commit();
 
           // Clean up UPCs after successful dispatch
-          await cleanupOrderUPCs(businessId, orderId);
+          await dispatchOrderUPCs(businessId, orderId);
 
           await maybeCompleteSummary(summaryRef);
           await sendDispatchedOrderWhatsAppMessage(shopData, orderData);
@@ -339,11 +339,7 @@ export const processFulfillmentTask = onRequest(
   },
 );
 
-/**
- * Clean up UPCs associated with a dispatched order
- * Sets putAway back to "none" and clears order/shop associations
- */
-async function cleanupOrderUPCs(businessId: string, orderId: string): Promise<void> {
+async function dispatchOrderUPCs(businessId: string, orderId: string): Promise<void> {
   try {
     // Query all UPCs associated with this order
     const upcsSnapshot = await db
@@ -357,7 +353,7 @@ async function cleanupOrderUPCs(businessId: string, orderId: string): Promise<vo
       return;
     }
 
-    console.log(`Found ${upcsSnapshot.size} UPCs to clean up for order ${orderId}`);
+    console.log(`Found ${upcsSnapshot.size} UPCs for order ${orderId}`);
 
     // Firestore batch limit is 500, so handle in chunks
     const BATCH_SIZE = 500;
@@ -376,14 +372,12 @@ async function cleanupOrderUPCs(businessId: string, orderId: string): Promise<vo
       }
 
       await batch.commit();
-      console.log(`Cleaned up batch ${Math.floor(i / BATCH_SIZE) + 1} of UPCs`);
+      console.log(`Processed batch ${Math.floor(i / BATCH_SIZE) + 1} of UPCs`);
     }
 
-    console.log(`Successfully cleaned up ${docs.length} UPCs from put-away, for order ${orderId}`);
+    console.log(`Successfully processed ${docs.length} UPCs, for order ${orderId}`);
   } catch (error) {
-    console.error(`Error cleaning up UPCs for order ${orderId}:`, error);
-    // Don't throw - we don't want UPC cleanup failure to fail the entire dispatch
-    // The order is already dispatched on Shopify at this point
+    console.error(`Error processing UPCs for order ${orderId}:`, error);
   }
 }
 
