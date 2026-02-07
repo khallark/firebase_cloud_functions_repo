@@ -106,10 +106,10 @@ export const updateBlueDartStatusesJob = onRequest(
       // appApiKey        → sent as ClientID header to the token endpoint
       // appApiSecret     → sent as clientSecret header to the token endpoint
       const blueDartConfig = businessDoc.data()?.integrations?.couriers?.bluedart;
-      const loginId          = blueDartConfig?.loginId;
+      const loginId = blueDartConfig?.loginId;
       const trackingLicenceKey = blueDartConfig?.trackingLicenceKey;
-      const appApiKey        = blueDartConfig?.appApiKey;
-      const appApiSecret     = blueDartConfig?.appApiSecret;
+      const appApiKey = blueDartConfig?.appApiKey;
+      const appApiSecret = blueDartConfig?.appApiSecret;
 
       if (!loginId || !trackingLicenceKey || !appApiKey || !appApiSecret) {
         throw new Error("BLUEDART_CREDENTIALS_MISSING");

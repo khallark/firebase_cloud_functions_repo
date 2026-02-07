@@ -84,9 +84,7 @@ export async function processBlueDartOrderChunk(
     });
 
   if (eligibleOrders.length === 0) {
-    console.log(
-      `[Blue Dart] No elegible orders for this batch of account ${accountId}, skipping`,
-    );
+    console.log(`[Blue Dart] No elegible orders for this batch of account ${accountId}, skipping`);
     const lastDoc = snapshot.docs[snapshot.docs.length - 1];
     return {
       processed: snapshot.size,
@@ -248,7 +246,7 @@ function prepareBlueDartOrderUpdates(orders: any[], shipments: any[]): OrderUpda
     //                                ScanDate, Scan (description), ScanTime,
     //                                ScanGroupType
     //
-    const rawStatusType = shipment.StatusType;    // e.g. "PU"
+    const rawStatusType = shipment.StatusType; // e.g. "PU"
     // ---------------------------------------------------------------------
 
     // ---------------------------------------------------------------------
@@ -266,7 +264,7 @@ function prepareBlueDartOrderUpdates(orders: any[], shipments: any[]): OrderUpda
     //   LS  → "Lost"                       (shipment marked lost)
     //
     const newStatus = determineNewBlueDartStatus(rawStatusType);
-    if (!newStatus) continue;                      // unrecognised code → skip
+    if (!newStatus) continue; // unrecognised code → skip
     if (newStatus === order.customStatus) continue; // no change → skip
 
     updates.push({

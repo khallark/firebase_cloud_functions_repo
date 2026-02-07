@@ -72,9 +72,7 @@ export function determineNewXpressbeesStatus(currentStatus: string): string | nu
 //
 // @param statusType  Short code from Blue Dart, e.g. "PU", "IT", "DL"
 // @param rawStatus   Human-readable status string (kept for logging / fallback)
-export function determineNewBlueDartStatus(
-  statusType: string
-): string | null {
+export function determineNewBlueDartStatus(statusType: string): string | null {
   if (!statusType) return null;
 
   switch (statusType.toUpperCase()) {
@@ -101,7 +99,6 @@ export function determineNewBlueDartStatus(
       return null;
   }
 }
-
 
 // ─── Token helpers (one per courier that needs one) ─────────────────────────
 

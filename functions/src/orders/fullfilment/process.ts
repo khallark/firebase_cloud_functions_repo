@@ -154,7 +154,7 @@ export const processFulfillmentTask = onRequest(
           await batch.commit();
 
           // Clean up UPCs after successful batch commit
-          await dispatchOrderUPCs(businessId, orderId);
+          await dispatchOrderUPCs(shop, orderId, orderData);
 
           await maybeCompleteSummary(summaryRef);
 
@@ -253,7 +253,7 @@ export const processFulfillmentTask = onRequest(
           await successBatch.commit();
 
           // Clean up UPCs after successful dispatch
-          await dispatchOrderUPCs(businessId, orderId);
+          await dispatchOrderUPCs(shop, orderId, orderData);
 
           await maybeCompleteSummary(summaryRef);
           await sendDispatchedOrderWhatsAppMessage(shopData, orderData);
@@ -339,43 +339,110 @@ export const processFulfillmentTask = onRequest(
   },
 );
 
-async function dispatchOrderUPCs(businessId: string, orderId: string): Promise<void> {
+async function dispatchOrderUPCs(shop: string, orderId: string, orderData: any): Promise<void> {
   try {
-    // Query all UPCs associated with this order
-    const upcsSnapshot = await db
-      .collection(`users/${businessId}/upcs`)
-      .where("orderId", "==", orderId)
-      .where("putAway", "==", "outbound")
-      .get();
+    const lineItems = orderData?.raw?.line_items || [];
 
-    if (upcsSnapshot.empty) {
-      console.log(`No UPCs found for order ${orderId}`);
+    if (lineItems.length === 0) {
+      console.log(`No line items found for order ${orderId}`);
       return;
     }
 
-    console.log(`Found ${upcsSnapshot.size} UPCs for order ${orderId}`);
+    console.log(`Processing UPCs for ${lineItems.length} line items in order ${orderId}`);
 
-    // Firestore batch limit is 500, so handle in chunks
-    const BATCH_SIZE = 500;
-    const docs = upcsSnapshot.docs;
+    // Track all businessIds and their UPCs
+    const businessIdToUPCs = new Map<string, any[]>();
 
-    for (let i = 0; i < docs.length; i += BATCH_SIZE) {
-      const batch = db.batch();
-      const chunk = docs.slice(i, i + BATCH_SIZE);
+    // Process each line item to find the correct businessId
+    for (const item of lineItems) {
+      try {
+        const productId = String(item.product_id);
+        const variantId = String(item.variant_id);
 
-      for (const doc of chunk) {
-        const updateData: Partial<UPC> = {
-          putAway: null,
-          updatedAt: Timestamp.now(),
-        };
-        batch.update(doc.ref, updateData);
+        // Get product mapping to find actual businessId
+        const storeProductDoc = await db.doc(`accounts/${shop}/products/${productId}`).get();
+
+        if (!storeProductDoc.exists) {
+          console.warn(`⚠️ Store product ${productId} not found for order ${orderId}`);
+          continue;
+        }
+
+        const storeProductData = storeProductDoc.data();
+        const variantMapping =
+          storeProductData?.variantMappingDetails?.[variantId] ||
+          storeProductData?.variantMappings?.[variantId];
+
+        if (!variantMapping) {
+          console.warn(`⚠️ No mapping for variant ${variantId} in order ${orderId}`);
+          continue;
+        }
+
+        const actualBusinessId =
+          typeof variantMapping === "object" ? variantMapping.businessId : null;
+
+        const businessProductSku =
+          typeof variantMapping === "object" ? variantMapping.businessProductSku : variantMapping;
+
+        if (!actualBusinessId) {
+          console.warn(
+            `⚠️ No businessId found in variant mapping for order ${orderId}, product ${productId}`,
+          );
+          continue;
+        }
+
+        // Query UPCs for this specific product and businessId
+        const upcsSnapshot = await db
+          .collection(`users/${actualBusinessId}/upcs`)
+          .where("orderId", "==", orderId)
+          .where("productId", "==", businessProductSku)
+          .where("putAway", "==", "outbound")
+          .get();
+
+        if (!upcsSnapshot.empty) {
+          if (!businessIdToUPCs.has(actualBusinessId)) {
+            businessIdToUPCs.set(actualBusinessId, []);
+          }
+          businessIdToUPCs.get(actualBusinessId)!.push(...upcsSnapshot.docs);
+        }
+      } catch (itemError) {
+        console.error(`❌ Error processing line item for UPCs:`, itemError);
+        // Continue with other items
       }
-
-      await batch.commit();
-      console.log(`Processed batch ${Math.floor(i / BATCH_SIZE) + 1} of UPCs`);
     }
 
-    console.log(`Successfully processed ${docs.length} UPCs, for order ${orderId}`);
+    // Now update all UPCs grouped by businessId
+    let totalProcessed = 0;
+    const BATCH_SIZE = 500;
+
+    for (const [actualBusinessId, upcDocs] of businessIdToUPCs.entries()) {
+      console.log(
+        `Found ${upcDocs.length} UPCs for businessId ${actualBusinessId} in order ${orderId}`,
+      );
+
+      // Process in batches (Firestore batch limit is 500)
+      for (let i = 0; i < upcDocs.length; i += BATCH_SIZE) {
+        const batch = db.batch();
+        const chunk = upcDocs.slice(i, i + BATCH_SIZE);
+
+        for (const doc of chunk) {
+          const updateData: Partial<UPC> = {
+            putAway: null,
+            updatedAt: Timestamp.now(),
+          };
+          batch.update(doc.ref, updateData);
+        }
+
+        await batch.commit();
+        totalProcessed += chunk.length;
+        console.log(
+          `Processed batch ${Math.floor(i / BATCH_SIZE) + 1} of UPCs for businessId ${actualBusinessId}`,
+        );
+      }
+    }
+
+    console.log(
+      `Successfully processed ${totalProcessed} UPCs across ${businessIdToUPCs.size} business(es) for order ${orderId}`,
+    );
   } catch (error) {
     console.error(`Error processing UPCs for order ${orderId}:`, error);
   }

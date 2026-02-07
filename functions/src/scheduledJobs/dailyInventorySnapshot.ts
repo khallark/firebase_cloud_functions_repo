@@ -1,6 +1,6 @@
 import { onSchedule } from "firebase-functions/scheduler";
 import { db } from "../firebaseAdmin";
-import { DocumentSnapshot, Timestamp } from "firebase-admin/firestore";
+import { DocumentSnapshot, QueryDocumentSnapshot, Timestamp } from "firebase-admin/firestore";
 
 interface Inventory {
   autoAddition: number;
@@ -13,11 +13,7 @@ interface Inventory {
 
 function calculatePhysicalStock(inv: Inventory): number {
   return (
-    inv.openingStock +
-    inv.inwardAddition -
-    inv.deduction +
-    inv.autoAddition -
-    inv.autoDeduction
+    inv.openingStock + inv.inwardAddition - inv.deduction + inv.autoAddition - inv.autoDeduction
   );
 }
 
@@ -42,7 +38,7 @@ function getTodayIST() {
 /**
  * Build variantId → quantity sold map
  */
-function buildVariantSalesMap(orderDocs: FirebaseFirestore.QueryDocumentSnapshot[]) {
+function buildVariantSalesMap(orderDocs: QueryDocumentSnapshot[]) {
   const map = new Map<string, number>();
 
   for (const doc of orderDocs) {
@@ -52,10 +48,7 @@ function buildVariantSalesMap(orderDocs: FirebaseFirestore.QueryDocumentSnapshot
     for (const item of lineItems) {
       if (!item?.variant_id || typeof item.quantity !== "number") continue;
 
-      map.set(
-        item.variant_id,
-        (map.get(item.variant_id) || 0) + item.quantity
-      );
+      map.set(item.variant_id, (map.get(item.variant_id) || 0) + item.quantity);
     }
   }
 
@@ -69,7 +62,7 @@ async function createInventorySnapshot(
   businessId: string,
   productDoc: DocumentSnapshot,
   variantSalesMap: Map<string, number>,
-  today: string
+  today: string,
 ): Promise<void> {
   if (!productDoc.exists) return;
 
@@ -79,19 +72,17 @@ async function createInventorySnapshot(
   const stockLevel = calculatePhysicalStock(product.inventory);
 
   const mappedVariants = product.mappedVariants;
-  const dailySales =
-    Array.isArray(mappedVariants)
-      ? mappedVariants.reduce(
-        (sum: number, mv: any) =>
-          sum + (variantSalesMap.get(mv.variantId) || 0),
-        0
+  const dailySales = Array.isArray(mappedVariants)
+    ? mappedVariants.reduce(
+        (sum: number, mv: any) => sum + (variantSalesMap.get(mv.variantId) || 0),
+        0,
       )
-      : 0;
+    : 0;
 
   const snapshotId = `${productDoc.id}_${today}`;
 
   await db
-    .collection('users')
+    .collection("users")
     .doc(businessId)
     .collection("inventory_snapshots")
     .doc(snapshotId)
@@ -105,11 +96,11 @@ async function createInventorySnapshot(
         timestamp: Timestamp.now(),
         exactDocState: { ...product },
       },
-      { merge: true } // idempotent
+      { merge: true }, // idempotent
     );
 }
 
-export const checkDelayedConfirmedOrders = onSchedule(
+export const dailyInventorySnapshot = onSchedule(
   {
     schedule: "59 23 * * *",
     timeZone: "Asia/Kolkata",
@@ -131,14 +122,14 @@ export const checkDelayedConfirmedOrders = onSchedule(
 
         // Fetch all stores' orders in parallel
         const orderSnapshots = await Promise.all(
-          linkedStores.map(store =>
+          linkedStores.map((store) =>
             db
               .collection("accounts")
               .doc(store)
               .collection("orders")
               .where("createdAt", ">=", startString)
-              .get()
-          )
+              .get(),
+          ),
         );
 
         // Merge variant sales across all stores
@@ -148,35 +139,22 @@ export const checkDelayedConfirmedOrders = onSchedule(
           const storeMap = buildVariantSalesMap(snapshot.docs);
 
           for (const [variantId, qty] of storeMap.entries()) {
-            variantSalesMap.set(
-              variantId,
-              (variantSalesMap.get(variantId) || 0) + qty
-            );
+            variantSalesMap.set(variantId, (variantSalesMap.get(variantId) || 0) + qty);
           }
         }
 
-        const productsSnapshot = await db
-          .collection(`users/${businessDoc.id}/products`)
-          .get();
+        const productsSnapshot = await db.collection(`users/${businessDoc.id}/products`).get();
 
         for (const productDoc of productsSnapshot.docs) {
           try {
-            await createInventorySnapshot(
-              businessDoc.id,
-              productDoc,
-              variantSalesMap,
-              today
-            );
+            await createInventorySnapshot(businessDoc.id, productDoc, variantSalesMap, today);
           } catch (err) {
-            console.error(
-              `Snapshot failed for product ${productDoc.id}`,
-              err
-            );
+            console.error(`Snapshot failed for product ${productDoc.id}`, err);
           }
         }
       }
     } catch (err) {
       console.error("Inventory snapshot job failed", err);
     }
-  }
+  },
 );

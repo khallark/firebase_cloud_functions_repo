@@ -89,7 +89,7 @@ export const migrateCancelledOrdersStatus = onRequest(
         .get();
 
       console.log(`orders for ${SHARED_STORE_ID}:`);
-      for(const doc of store1snapshot.docs) {
+      for (const doc of store1snapshot.docs) {
         console.log(doc.data()?.orderId || "N/A");
       }
 
@@ -100,12 +100,12 @@ export const migrateCancelledOrdersStatus = onRequest(
         .get();
 
       console.log(`orders for ${SHARED_STORE_ID_2}:`);
-      for(const doc of store2snapshot.docs) {
+      for (const doc of store2snapshot.docs) {
         console.log(doc.data()?.orderId || "N/A");
       }
 
       res.status(200).json({
-        success: true
+        success: true,
       });
     } catch (error: any) {
       console.error("Error:", error.message);
