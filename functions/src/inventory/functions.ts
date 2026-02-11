@@ -2,15 +2,15 @@
 // Firebase Cloud Functions for automated restock logic
 // import { onSchedule } from 'firebase-functions/v2/scheduler';
 import {
-    calculateRestockRecommendation,
-    // calculateAllRestockRecommendations,
-    // updateProductTrackingMetadata,
-} from './restockLogic';
+  calculateAllRestockRecommendations,
+  calculateRestockRecommendation,
+  // calculateAllRestockRecommendations,
+  // updateProductTrackingMetadata,
+} from "./restockLogic";
 // import { db } from '../firebaseAdmin';
 // import { Timestamp } from 'firebase-admin/firestore';
-import { onRequest } from 'firebase-functions/v2/https';
-import { ENQUEUE_FUNCTION_SECRET } from '../config';
-
+import { onRequest } from "firebase-functions/v2/https";
+import { ENQUEUE_FUNCTION_SECRET } from "../config";
 
 // ============================================================================
 // SCHEDULED FUNCTIONS (Run automatically)
@@ -19,7 +19,7 @@ import { ENQUEUE_FUNCTION_SECRET } from '../config';
 /**
  * Runs daily at 9 AM to generate restock recommendations
  * Sends notifications or creates purchase orders
- * 
+ *
  * Deploy: firebase deploy --only functions:dailyRestockCheck
  */
 // export const dailyRestockCheck = onSchedule(
@@ -79,67 +79,369 @@ import { ENQUEUE_FUNCTION_SECRET } from '../config';
 // HTTP CALLABLE FUNCTIONS (Call from your app)
 // ============================================================================
 
+function validateRestockRequest(body: any): {
+  valid: boolean;
+  businessId?: string;
+  productId?: string;
+  forecastDays?: number;
+  options?: {
+    serviceLevel?: number;
+    forceMinimumOrder?: boolean;
+  };
+  error?: string;
+} {
+  try {
+    // Check if body exists
+    if (!body || typeof body !== "object") {
+      return { valid: false, error: "Request body is required" };
+    }
+
+    // Validate businessId
+    if (!body.businessId || typeof body.businessId !== "string" || body.businessId.trim() === "") {
+      return { valid: false, error: "businessId is required and must be a non-empty string" };
+    }
+
+    // Validate productId
+    if (!body.productId || typeof body.productId !== "string" || body.productId.trim() === "") {
+      return { valid: false, error: "productId is required and must be a non-empty string" };
+    }
+
+    const businessId = body.businessId.trim();
+    const productId = body.productId.trim();
+
+    // Validate forecastDays
+    let forecastDays = 14; // Default
+    if (body.forecastDays !== undefined) {
+      const parsed = Number(body.forecastDays);
+      if (isNaN(parsed) || parsed < 1 || parsed > 90) {
+        return { valid: false, error: "forecastDays must be a number between 1 and 90" };
+      }
+      forecastDays = Math.floor(parsed);
+    }
+
+    // Validate options if provided
+    let options: { serviceLevel?: number; forceMinimumOrder?: boolean } | undefined;
+    if (body.options && typeof body.options === "object") {
+      options = {};
+
+      // Validate serviceLevel
+      if (body.options.serviceLevel !== undefined) {
+        const serviceLevel = Number(body.options.serviceLevel);
+        if (isNaN(serviceLevel) || serviceLevel < 0.5 || serviceLevel > 0.99) {
+          return { valid: false, error: "options.serviceLevel must be between 0.5 and 0.99" };
+        }
+        options.serviceLevel = serviceLevel;
+      }
+
+      // Validate forceMinimumOrder
+      if (body.options.forceMinimumOrder !== undefined) {
+        if (typeof body.options.forceMinimumOrder !== "boolean") {
+          return { valid: false, error: "options.forceMinimumOrder must be a boolean" };
+        }
+        options.forceMinimumOrder = body.options.forceMinimumOrder;
+      }
+    }
+
+    return {
+      valid: true,
+      businessId,
+      productId,
+      forecastDays,
+      options,
+    };
+  } catch (error) {
+    console.error("Error validating request:", error);
+    return { valid: false, error: "Invalid request format" };
+  }
+}
+
 /**
- * Get restock recommendation for a specific product
- * 
- * Usage from client:
- * const getRestock = httpsCallable(functions, 'getRestockRecommendation');
- * const result = await getRestock({ productId: 'abc123', forecastDays: 14 });
+ * Cloud Function: Get restock recommendation for a product
+ * ROBUST VERSION with comprehensive error handling and validation
  */
 export const getRestockRecommendation = onRequest(
-    { cors: true, timeoutSeconds: 540, secrets: [ENQUEUE_FUNCTION_SECRET], memory: "512MiB" },
-    async (req, res) => {
-        const { businessId, productId, forecastDays = 14 } = req.body;
+  {
+    cors: true,
+    timeoutSeconds: 540,
+    secrets: [ENQUEUE_FUNCTION_SECRET],
+    memory: "512MiB",
+  },
+  async (req, res) => {
+    const startTime = Date.now();
+    let businessId: string | undefined;
+    let productId: string | undefined;
 
-        if (!businessId || !productId) {
-            throw new Error('invalid argument: businessId or productId missing');
-        }
-        try {
-            const recommendation = await calculateRestockRecommendation(
-                businessId,
-                productId,
-                forecastDays
-            );
+    try {
+      // Log request
+      console.log("Restock recommendation request received", {
+        method: req.method,
+        hasBody: !!req.body,
+        timestamp: new Date().toISOString(),
+      });
 
-            res.status(200).json({
-                success: true,
-                recommendation,
-            });
-        } catch (error) {
-            console.error('Error calculating restock:', error);
-            res.status(500).json({ error: `Failed to calculate restock: ${error}` });
+      // Only accept POST requests
+      if (req.method !== "POST") {
+        res.status(405).json({
+          success: false,
+          error: "Method not allowed. Use POST.",
+        });
+        return;
+      }
+
+      // Validate request body
+      const validation = validateRestockRequest(req.body);
+
+      if (!validation.valid) {
+        console.warn("Invalid request:", validation.error);
+        res.status(400).json({
+          success: false,
+          error: validation.error || "Invalid request",
+        });
+        return;
+      }
+
+      businessId = validation.businessId!;
+      productId = validation.productId!;
+      const forecastDays = validation.forecastDays!;
+      const options = validation.options;
+
+      console.log("Processing restock recommendation:", {
+        businessId,
+        productId,
+        forecastDays,
+        options,
+      });
+
+      // Calculate recommendation with timeout handling
+      const recommendation = await Promise.race([
+        calculateRestockRecommendation(businessId, productId, forecastDays, options),
+        new Promise(
+          (_, reject) => setTimeout(() => reject(new Error("Calculation timeout")), 530000), // 530s (before Cloud Function timeout)
+        ),
+      ]);
+
+      const duration = Date.now() - startTime;
+
+      console.log("Restock calculation successful:", {
+        businessId,
+        productId,
+        suggestedQuantity: (recommendation as any).suggestedQuantity,
+        confidence: (recommendation as any).confidence,
+        duration: `${duration}ms`,
+      });
+
+      // Log warnings if any
+      if ((recommendation as any).warnings && (recommendation as any).warnings.length > 0) {
+        console.warn("Data quality warnings:", {
+          businessId,
+          productId,
+          warnings: (recommendation as any).warnings,
+        });
+      }
+
+      res.status(200).json({
+        success: true,
+        recommendation,
+        meta: {
+          processingTimeMs: duration,
+          timestamp: new Date().toISOString(),
+        },
+      });
+    } catch (error: any) {
+      const duration = Date.now() - startTime;
+
+      console.error("Error calculating restock:", {
+        businessId,
+        productId,
+        error: error.message,
+        stack: error.stack,
+        duration: `${duration}ms`,
+      });
+
+      // Determine appropriate status code based on error type
+      let statusCode = 500;
+      let errorMessage = "Internal server error";
+      let errorDetails: string | undefined;
+
+      if (error.message) {
+        errorDetails = error.message;
+
+        // Handle specific error types
+        if (error.message.includes("not found")) {
+          statusCode = 404;
+          errorMessage = "Resource not found";
+        } else if (error.message.includes("Invalid")) {
+          statusCode = 400;
+          errorMessage = "Invalid request";
+        } else if (error.message.includes("timeout")) {
+          statusCode = 504;
+          errorMessage = "Request timeout";
+        } else if (error.message.includes("permission") || error.message.includes("unauthorized")) {
+          statusCode = 403;
+          errorMessage = "Permission denied";
         }
+      }
+
+      res.status(statusCode).json({
+        success: false,
+        error: errorMessage,
+        details: errorDetails,
+        meta: {
+          processingTimeMs: duration,
+          timestamp: new Date().toISOString(),
+        },
+      });
     }
+  },
 );
 
 /**
- * Get all restock recommendations
- * 
- * Usage from client:
- * const getAllRestocks = httpsCallable(functions, 'getAllRestockRecommendations');
- * const result = await getAllRestocks({ minStockThreshold: 10 });
+ * Cloud Function: Get restock recommendations for all products
+ * ROBUST VERSION with batch processing and error handling
  */
-// export const getAllRestockRecommendations = functions.https.onCall(
-//     async (data, context) => {
-//         const { minStockThreshold, forecastDays = 14 } = data;
+export const getAllRestockRecommendations = onRequest(
+  {
+    cors: true,
+    timeoutSeconds: 540,
+    secrets: [ENQUEUE_FUNCTION_SECRET],
+    memory: "1GiB", // More memory for batch processing
+  },
+  async (req, res) => {
+    const startTime = Date.now();
+    let businessId: string | undefined;
 
-//         try {
-//             const recommendations = await calculateAllRestockRecommendations(db, {
-//                 minStockThreshold,
-//                 forecastDays,
-//             });
+    try {
+      console.log("Batch restock recommendations request received", {
+        method: req.method,
+        hasBody: !!req.body,
+        timestamp: new Date().toISOString(),
+      });
 
-//             return {
-//                 success: true,
-//                 recommendations,
-//                 count: recommendations.length,
-//             };
-//         } catch (error) {
-//             console.error('Error calculating restocks:', error);
-//             throw new functions.https.HttpsError('internal', 'Failed to calculate restocks');
-//         }
-//     }
-// );
+      // Only accept POST requests
+      if (req.method !== "POST") {
+        res.status(405).json({
+          success: false,
+          error: "Method not allowed. Use POST.",
+        });
+        return;
+      }
+
+      // Validate businessId
+      if (!req.body || !req.body.businessId || typeof req.body.businessId !== "string") {
+        res.status(400).json({
+          success: false,
+          error: "businessId is required and must be a string",
+        });
+        return;
+      }
+
+      businessId = String(req.body.businessId).trim();
+
+      // Validate optional parameters
+      let minStockThreshold: number | undefined;
+      if (req.body.minStockThreshold !== undefined) {
+        const parsed = Number(req.body.minStockThreshold);
+        if (isNaN(parsed) || parsed < 0) {
+          res.status(400).json({
+            success: false,
+            error: "minStockThreshold must be a non-negative number",
+          });
+          return;
+        }
+        minStockThreshold = parsed;
+      }
+
+      let forecastDays: number | undefined;
+      if (req.body.forecastDays !== undefined) {
+        const parsed = Number(req.body.forecastDays);
+        if (isNaN(parsed) || parsed < 1 || parsed > 90) {
+          res.status(400).json({
+            success: false,
+            error: "forecastDays must be between 1 and 90",
+          });
+          return;
+        }
+        forecastDays = parsed;
+      }
+
+      console.log("Processing batch recommendations:", {
+        businessId,
+        minStockThreshold,
+        forecastDays,
+      });
+
+      // Calculate with timeout
+      const recommendations = await Promise.race([
+        calculateAllRestockRecommendations(businessId, {
+          minStockThreshold,
+          forecastDays,
+        }),
+        new Promise((_, reject) =>
+          setTimeout(() => reject(new Error("Batch calculation timeout")), 530000),
+        ),
+      ]);
+
+      const duration = Date.now() - startTime;
+
+      console.log("Batch calculation successful:", {
+        businessId,
+        count: (recommendations as any[]).length,
+        duration: `${duration}ms`,
+      });
+
+      // Collect warnings summary
+      const totalWarnings = (recommendations as any[]).reduce(
+        (sum, rec) => sum + (rec.warnings?.length || 0),
+        0,
+      );
+
+      if (totalWarnings > 0) {
+        console.warn(`Total warnings across all products: ${totalWarnings}`);
+      }
+
+      res.status(200).json({
+        success: true,
+        recommendations,
+        meta: {
+          count: (recommendations as any[]).length,
+          totalWarnings,
+          processingTimeMs: duration,
+          timestamp: new Date().toISOString(),
+        },
+      });
+    } catch (error: any) {
+      const duration = Date.now() - startTime;
+
+      console.error("Error in batch restock calculation:", {
+        businessId,
+        error: error.message,
+        stack: error.stack,
+        duration: `${duration}ms`,
+      });
+
+      let statusCode = 500;
+      let errorMessage = "Internal server error";
+
+      if (error.message?.includes("not found")) {
+        statusCode = 404;
+        errorMessage = "Business not found";
+      } else if (error.message?.includes("timeout")) {
+        statusCode = 504;
+        errorMessage = "Request timeout - try reducing the scope";
+      }
+
+      res.status(statusCode).json({
+        success: false,
+        error: errorMessage,
+        details: error.message,
+        meta: {
+          processingTimeMs: duration,
+          timestamp: new Date().toISOString(),
+        },
+      });
+    }
+  },
+);
 
 /**
  * Manually trigger inventory snapshot for a product
