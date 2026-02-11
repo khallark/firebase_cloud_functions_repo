@@ -7,7 +7,7 @@ import { processBlueDartOrderChunk } from "./processChunk";
 import { db } from "../../firebaseAdmin";
 
 export const updateBlueDartStatusesJob = onRequest(
-  { cors: true, timeoutSeconds: 540, secrets: [TASKS_SECRET], memory: "512MiB" },
+  { cors: true, timeoutSeconds: 540, secrets: [TASKS_SECRET], memory: "1GiB" },
   async (req, res) => {
     try {
       requireHeaderSecret(req, "x-tasks-secret", TASKS_SECRET.value() || "");
@@ -142,7 +142,7 @@ export const updateBlueDartStatusesJob = onRequest(
       if (result.hasMore && result.nextCursor) {
         await queueNextChunk(
           TASKS_SECRET.value() || "",
-          process.env.BLUEDART_UPDATE_STATUS_TASK_JOB_TARGET_URL!,
+          process.env.UPDATE_STATUS_TASK_JOB_TARGET_URL_BLUEDART!,
           {
             accountId,
             businessId,
@@ -188,6 +188,7 @@ export const updateBlueDartStatusesJob = onRequest(
         totalChunks: jobData.totalChunks || 0,
       });
     } catch (error: any) {
+      console.error("[Blue Dart] Job error:", error.message, error.stack);
       await handleJobError(error, req.body);
       const msg = error.message || String(error);
       const code = msg.split(/\s/)[0];

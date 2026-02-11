@@ -104,8 +104,8 @@ export const dailyInventorySnapshot = onSchedule(
   {
     schedule: "59 23 * * *",
     timeZone: "Asia/Kolkata",
+    timeoutSeconds: 1800,
     memory: "4GiB",
-    timeoutSeconds: 7200,
   },
   async () => {
     const { date: today, startString } = getTodayIST();

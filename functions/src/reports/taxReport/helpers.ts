@@ -181,15 +181,16 @@ async function processSalesOrders(
   endOfRange.setHours(23, 59, 59, 999);
 
   console.log(
-    `📊 Fetching sales orders from ${startOfRange.toISOString()} to ${endOfRange.toISOString()}`,
+    `📊 Fetching sales orders from ${startOfRange.toISOString().slice(0, -1) + "+05:30"} to ${endOfRange.toISOString().slice(0, -1) + "+05:30"}`,
   );
 
   const ordersSnapshot = await db
     .collection("accounts")
     .doc(storeId)
     .collection("orders")
-    .where("createdAt", ">=", startOfRange.toISOString())
-    .where("createdAt", "<=", endOfRange.toISOString())
+    .where("createdAt", ">=", startOfRange.toISOString().slice(0, -1) + "+05:30")
+    .where("createdAt", "<=", endOfRange.toISOString() + "+05:30")
+    .orderBy("createdAt", "asc")
     .get();
 
   console.log(`Found ${ordersSnapshot.size} sales orders`);
@@ -985,8 +986,12 @@ async function createExcelWorkbook(
 /**
  * Core function to generate tax report for a date range
  */
+/**
+ * Core function to generate tax report for a date range
+ * Accepts a single storeId or an array of storeIds for combined reports
+ */
 export async function generateTaxReport(
-  storeId: string,
+  storeIds: string | string[],
   startDate: Date,
   endDate: Date,
 ): Promise<{
@@ -996,32 +1001,53 @@ export async function generateTaxReport(
   statePivot: StatePivot[];
   hsnPivot: HSNPivot[];
 }> {
+  const storeIdArray = Array.isArray(storeIds) ? storeIds : [storeIds];
+
   console.log(`📅 Generating report from ${startDate.toDateString()} to ${endDate.toDateString()}`);
+  console.log(`🏪 Stores: ${storeIdArray.join(", ")}`);
 
-  // Step 1: Process Sales Orders
+  // Step 1: Process Sales Orders from all stores
   console.log("\n📊 Step 1: Processing Sales Orders...");
-  const salesRows = await processSalesOrders(storeId, startDate, endDate);
-  console.log(`✅ Processed ${salesRows.length} sales line items`);
+  const allSalesRows: SalesRow[] = [];
+  for (const storeId of storeIdArray) {
+    console.log(`  📦 Fetching sales for store: ${storeId}`);
+    const rows = await processSalesOrders(storeId, startDate, endDate);
+    allSalesRows.push(...rows);
+    console.log(`  ✅ ${rows.length} sales line items from ${storeId}`);
+  }
+  allSalesRows.sort((a, b) => new Date(a.dateOfBill).getTime() - new Date(b.dateOfBill).getTime());
+  allSalesRows.forEach((row, i) => (row.srNo = i + 1));
+  console.log(`✅ Total sales line items: ${allSalesRows.length}`);
 
-  // Step 2: Process Sales Return Orders
+  // Step 2: Process Sales Return Orders from all stores
   console.log("\n📊 Step 2: Processing Sales Return Orders...");
-  const returnRows = await processSalesReturnOrders(storeId, startDate, endDate);
-  console.log(`✅ Processed ${returnRows.length} return line items`);
+  const allReturnRows: SalesReturnRow[] = [];
+  for (const storeId of storeIdArray) {
+    console.log(`  📦 Fetching returns for store: ${storeId}`);
+    const rows = await processSalesReturnOrders(storeId, startDate, endDate);
+    allReturnRows.push(...rows);
+    console.log(`  ✅ ${rows.length} return line items from ${storeId}`);
+  }
+  allReturnRows.sort(
+    (a, b) => new Date(a.dateOfReturn).getTime() - new Date(b.dateOfReturn).getTime(),
+  );
+  allReturnRows.forEach((row, i) => (row.srNo = i + 1));
+  console.log(`✅ Total return line items: ${allReturnRows.length}`);
 
   // Step 3: Generate State Pivot
   console.log("\n📊 Step 3: Generating State Wise Report...");
-  const statePivot = generateStatePivot(salesRows, returnRows);
+  const statePivot = generateStatePivot(allSalesRows, allReturnRows);
   console.log(`✅ Generated data for ${statePivot.length} states`);
 
   // Step 4: Generate HSN Pivot
   console.log("\n📊 Step 4: Generating HSN Wise Report...");
-  const hsnPivot = generateHSNPivot(salesRows, returnRows);
+  const hsnPivot = generateHSNPivot(allSalesRows, allReturnRows);
   console.log(`✅ Generated data for ${hsnPivot.length} HSN codes`);
 
   // Step 5: Create Excel Workbook
   console.log("\n📊 Step 5: Creating Excel Workbook...");
-  const workbook = await createExcelWorkbook(salesRows, returnRows, statePivot, hsnPivot);
+  const workbook = await createExcelWorkbook(allSalesRows, allReturnRows, statePivot, hsnPivot);
   console.log("✅ Excel workbook created");
 
-  return { workbook, salesRows, returnRows, statePivot, hsnPivot };
+  return { workbook, salesRows: allSalesRows, returnRows: allReturnRows, statePivot, hsnPivot };
 }

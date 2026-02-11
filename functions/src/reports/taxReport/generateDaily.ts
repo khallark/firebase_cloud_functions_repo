@@ -135,22 +135,31 @@ export const generateCustomTaxReportPreliminary = onRequest(
       }
 
       // Extract parameters from request body
-      const { businessId, storeId, startDate, endDate } = req.body as {
+      const { businessId, storeId, storeIds, startDate, endDate } = req.body as {
         businessId?: string;
         storeId?: string;
+        storeIds?: string[];
         startDate?: string;
         endDate?: string;
       };
 
-      console.log("📥 Tax Report Enqueue Request:", { storeId, startDate, endDate });
+      // Support both single storeId and array of storeIds
+      const resolvedStoreIds: string[] = storeIds || (storeId ? [storeId] : []);
 
-      // Validate required parameters
-      if (!businessId || !storeId || !startDate || !endDate) {
+      console.log("📥 Tax Report Enqueue Request:", {
+        storeIds: resolvedStoreIds,
+        startDate,
+        endDate,
+      });
+
+      // Validate storeId format
+      if (!businessId || resolvedStoreIds.length === 0 || !startDate || !endDate) {
         res.status(400).json({
           error: "Missing required parameters",
-          message: "Please provide storeId, startDate and endDate in YYYY-MM-DD format",
+          message:
+            "Please provide storeId (or storeIds), startDate and endDate in YYYY-MM-DD format",
           example: {
-            storeId: "shop.myshopify.com",
+            storeIds: ["shop1.myshopify.com", "shop2.myshopify.com"],
             startDate: "2025-12-04",
             endDate: "2025-12-06",
           },
@@ -173,13 +182,17 @@ export const generateCustomTaxReportPreliminary = onRequest(
         });
         return;
       }
-      const phone = businessDoc.data()?.primaryContact?.phone;
 
-      // Validate storeId format
-      if (typeof storeId !== "string" || storeId.trim().length === 0) {
+      const phone = "9779752241";
+
+      // Validate all storeIds
+      const invalidStoreId = resolvedStoreIds.find(
+        (id) => typeof id !== "string" || id.trim().length === 0,
+      );
+      if (invalidStoreId !== undefined) {
         res.status(400).json({
           error: "Invalid storeId",
-          message: "storeId must be a non-empty string",
+          message: "All storeIds must be non-empty strings",
         });
         return;
       }
@@ -257,7 +270,7 @@ export const generateCustomTaxReportPreliminary = onRequest(
       const taskName = await createTask(
         {
           phone,
-          storeId,
+          storeIds: resolvedStoreIds,
           startDate,
           endDate,
         },
@@ -276,7 +289,7 @@ export const generateCustomTaxReportPreliminary = onRequest(
         message: "Tax report generation has been queued successfully",
         taskName,
         dateRange: {
-          storeId,
+          storeIds: resolvedStoreIds,
           startDate,
           endDate,
           days: daysDiff + 1,
@@ -320,15 +333,17 @@ export const generateCustomTaxReport = onRequest(
       }
 
       // Extract dates from request body
-      const { phone, storeId, startDate, endDate } = req.body as {
+      const { phone, storeId, storeIds, startDate, endDate } = req.body as {
         phone?: string;
         storeId?: string;
+        storeIds?: string[];
         startDate?: string;
         endDate?: string;
       };
 
-      // Validate date parameters
-      if (!phone || !storeId || !startDate || !endDate) {
+      const resolvedStoreIds: string[] = storeIds || (storeId ? [storeId] : []);
+
+      if (!phone || resolvedStoreIds.length === 0 || !startDate || !endDate) {
         res.status(400).json({
           error: "Missing required parameters",
           message: "Please provide storeId, startDate and endDate in YYYY-MM-DD format",
@@ -378,7 +393,7 @@ export const generateCustomTaxReport = onRequest(
 
       // Generate report for custom date range
       const { workbook, salesRows, returnRows, statePivot, hsnPivot } = await generateTaxReport(
-        storeId,
+        resolvedStoreIds,
         start,
         end,
       );
@@ -388,8 +403,9 @@ export const generateCustomTaxReport = onRequest(
       const startStr = start.toLocaleDateString("en-GB").replace(/\//g, "-");
       const endStr = end.toLocaleDateString("en-GB").replace(/\//g, "-");
       const timestamp = Date.now();
+      const folderName = resolvedStoreIds.length === 1 ? resolvedStoreIds[0] : "combined";
       const fileName = `Tax_Report_${startStr}_to_${endStr}_${timestamp}.xlsx`;
-      const filePath = `tax_reports/${storeId}/${fileName}`;
+      const filePath = `tax_reports/${folderName}/${fileName}`;
 
       const bucket = storage.bucket();
       const file = bucket.file(filePath);
@@ -421,7 +437,8 @@ export const generateCustomTaxReport = onRequest(
 
       // Send WhatsApp Message
       console.log("\n📊 Step 7: Sending WhatsApp Message...");
-      const shopDoc = await db.collection("accounts").doc(storeId).get();
+      // Use first store's data for WhatsApp message template
+      const shopDoc = await db.collection("accounts").doc(resolvedStoreIds[0]).get();
       const shopData = shopDoc.data();
 
       if (shopData) {

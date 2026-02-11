@@ -88,7 +88,7 @@ export function determineNewBlueDartStatus(statusType: string): string | null {
     // case "UD":
     //   return "Undelivered";
 
-    case "RTO":
+    case "RT":
       return "RTO In Transit"; // can be split later using remarks / scan codes
 
     case "LS":

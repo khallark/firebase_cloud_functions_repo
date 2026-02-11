@@ -29,43 +29,43 @@ export const processReturnShipmentTask = onRequest(
     };
 
     /** Fetch pickup location from Delhivery tracking API */
-    async function fetchPickupLocation(
-      forwardAwb: string,
-      apiKey: string,
-    ): Promise<{ ok: boolean; pickupName?: string; error?: string }> {
-      try {
-        const trackingUrl = `https://track.delhivery.com/api/v1/packages/json/?waybill=${forwardAwb}`;
-        const resp = await fetch(trackingUrl, {
-          method: "GET",
-          headers: {
-            Authorization: `Token ${apiKey}`,
-            Accept: "application/json",
-          },
-        });
+    // async function fetchPickupLocation(
+    //   forwardAwb: string,
+    //   apiKey: string,
+    // ): Promise<{ ok: boolean; pickupName?: string; error?: string }> {
+    //   try {
+    //     const trackingUrl = `https://track.delhivery.com/api/v1/packages/json/?waybill=${forwardAwb}`;
+    //     const resp = await fetch(trackingUrl, {
+    //       method: "GET",
+    //       headers: {
+    //         Authorization: `Token ${apiKey}`,
+    //         Accept: "application/json",
+    //       },
+    //     });
 
-        if (!resp.ok) {
-          return { ok: false, error: `Tracking API returned HTTP ${resp.status}` };
-        }
+    //     if (!resp.ok) {
+    //       return { ok: false, error: `Tracking API returned HTTP ${resp.status}` };
+    //     }
 
-        const data = (await resp.json()) as any;
-        const shipment = data?.ShipmentData?.[0]?.Shipment;
+    //     const data = (await resp.json()) as any;
+    //     const shipment = data?.ShipmentData?.[0]?.Shipment;
 
-        if (!shipment) {
-          return { ok: false, error: "No shipment data found in tracking response" };
-        }
+    //     if (!shipment) {
+    //       return { ok: false, error: "No shipment data found in tracking response" };
+    //     }
 
-        const pickupLocation = shipment.PickupLocation;
+    //     const pickupLocation = shipment.PickupLocation;
 
-        if (!pickupLocation) {
-          return { ok: false, error: "PickupLocation not found in shipment data" };
-        }
+    //     if (!pickupLocation) {
+    //       return { ok: false, error: "PickupLocation not found in shipment data" };
+    //     }
 
-        return { ok: true, pickupName: String(pickupLocation) };
-      } catch (error) {
-        const message = error instanceof Error ? error.message : String(error);
-        return { ok: false, error: `Failed to fetch tracking data: ${message}` };
-      }
-    }
+    //     return { ok: true, pickupName: String(pickupLocation) };
+    //   } catch (error) {
+    //     const message = error instanceof Error ? error.message : String(error);
+    //     return { ok: false, error: `Failed to fetch tracking data: ${message}` };
+    //   }
+    // }
 
     /** Classify Delhivery return response */
     function evalDelhiveryReturnResp(carrier: any): {
@@ -322,32 +322,36 @@ export const processReturnShipmentTask = onRequest(
       }
 
       // Fetch pickup location from tracking API
-      const pickupResult = await fetchPickupLocation(forwardAwb, apiKey);
-      if (!pickupResult.ok || !pickupResult.pickupName) {
-        const failure = await handleReturnJobFailure({
-          shop,
-          batchRef,
-          jobRef,
-          jobId,
-          errorCode: "PICKUP_LOCATION_FETCH_FAILED",
-          errorMessage: pickupResult.error || "Failed to fetch pickup location from tracking API",
-          isRetryable: true, // Retry as it might be a transient issue
-        });
+      // const pickupResult = await fetchPickupLocation(forwardAwb, apiKey);
+      const pickupResult = {
+        ok: true,
+        pickupName: "Majime Productions 2",
+      };
+      // if (!pickupResult.ok || !pickupResult.pickupName) {
+      //   const failure = await handleReturnJobFailure({
+      //     shop,
+      //     batchRef,
+      //     jobRef,
+      //     jobId,
+      //     errorCode: "PICKUP_LOCATION_FETCH_FAILED",
+      //     errorMessage: pickupResult.error || "Failed to fetch pickup location from tracking API",
+      //     isRetryable: true, // Retry as it might be a transient issue
+      //   });
 
-        if (failure.shouldReturnFailure) {
-          res.status(failure.statusCode).json({
-            ok: false,
-            reason: failure.reason,
-            code: "PICKUP_LOCATION_FETCH_FAILED",
-          });
-        } else {
-          res.status(failure.statusCode).json({
-            ok: true,
-            action: failure.reason,
-          });
-        }
-        return;
-      }
+      //   if (failure.shouldReturnFailure) {
+      //     res.status(failure.statusCode).json({
+      //       ok: false,
+      //       reason: failure.reason,
+      //       code: "PICKUP_LOCATION_FETCH_FAILED",
+      //     });
+      //   } else {
+      //     res.status(failure.statusCode).json({
+      //       ok: true,
+      //       action: failure.reason,
+      //     });
+      //   }
+      //   return;
+      // }
 
       const pickupName = pickupResult.pickupName;
 

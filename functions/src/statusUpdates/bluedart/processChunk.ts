@@ -128,7 +128,7 @@ export async function processBlueDartOrderChunk(
 
     // Rate limiting between API calls
     if (i + API_BATCH_SIZE < eligibleOrders.length) {
-      await sleep(150);
+      await sleep(500);
     }
   }
 
@@ -185,7 +185,17 @@ async function fetchAndProcessBlueDartBatch(
     if (!response.ok) {
       // 5xx / 429 → propagate so the whole job is retried by Cloud Tasks
       if (response.status >= 500 || response.status === 429) {
-        throw new Error(`HTTP_${response.status}`);
+        await sleep(2000);
+        const retryResponse = await fetch(trackingUrl, {
+          method: "GET",
+          headers: {
+            JWTToken: jwtToken,
+            Accept: "application/json",
+          },
+        });
+        if (!retryResponse.ok) {
+          throw new Error(`HTTP_${retryResponse.status}`);
+        }
       }
       console.error(`[Blue Dart] Tracking API error: ${response.status}`);
       return [];
