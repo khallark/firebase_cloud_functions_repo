@@ -1,6 +1,6 @@
 import { onRequest } from "firebase-functions/v2/https";
 import { db } from "../firebaseAdmin";
-// import { SHARED_STORE_IDS } from "../config";
+// import { SHARED_STORE_ID, SHARED_STORE_ID_2 } from "../config";
 
 /**
  * One-time migration function to recalculate blockedStock for all business products

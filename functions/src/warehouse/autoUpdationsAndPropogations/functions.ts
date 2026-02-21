@@ -247,6 +247,10 @@ export const onUpcWritten = onDocumentWritten(
         }
 
         if (after.putAway === "inbound" && before.putAway !== "inbound") {
+          if (before.putAway === "outbound" || before.putAway === "none") {
+            return;
+          }
+
           if (!after.productId) {
             console.warn(`⚠️ UPC ${upcId} has no productId, skipping autoAddition`);
             return;

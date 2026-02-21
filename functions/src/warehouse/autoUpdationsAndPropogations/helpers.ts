@@ -402,6 +402,7 @@ export async function createUPCsForPlacement(
       updatedBy: userId,
       storeId: null,
       orderId: null,
+      grnRef: null,
       putAway: "none",
       productId: placement.productId,
       warehouseId: placement.warehouseId,

@@ -18,7 +18,7 @@ export const inventorySnapshotOfADate = onRequest(
     try {
       const snap = await db
         .collection("users/2yEGCC8AffNxDoTZEqhAkCRgxNl2/inventory_snapshots")
-        .where("date", "==", "2026-02-15")
+        .where("date", "==", "2026-02-17")
         .get();
 
       const result = await Promise.all(
@@ -54,6 +54,7 @@ export const inventorySnapshotOfADate = onRequest(
           return {
             productSku: data.productId as string,
             stock: data.stockLevel as number,
+            blockedStock: data?.exactDocState?.inventory?.blockedStock ?? null,
             variantSku,
             price,
           };

@@ -11,3 +11,4 @@ export * from "./migrateInventorySync";
 export * from "./checkWarehouseInventoryDiffs";
 export * from "./func";
 export * from "./inventorySnapshotOfADate";
+export * from "./initializeUpcLogsAndGrnField";

@@ -179,6 +179,8 @@ export type UPC =
       storeId: string | null;
       orderId: string | null;
 
+      grnRef: string | null;
+      
       putAway: "none" | "outbound" | null;
 
       productId: string;
@@ -197,6 +199,8 @@ export type UPC =
 
       storeId: string | null;
       orderId: string | null;
+
+      grnRef: string | null;
 
       putAway: "inbound";
 
