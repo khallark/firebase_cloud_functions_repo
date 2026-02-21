@@ -36,6 +36,45 @@ import { db } from "../../firebaseAdmin";
 import { FieldValue, Timestamp } from "firebase-admin/firestore";
 import { TASKS_SECRET } from "../../config";
 
+// Helper to extract the loggable snapshot from a UPC
+function getUPCSnapshot(upc: UPC) {
+  return {
+    putAway: upc.putAway,
+    warehouseId: upc.warehouseId ?? null,
+    zoneId: upc.zoneId ?? null,
+    rackId: upc.rackId ?? null,
+    shelfId: upc.shelfId ?? null,
+    placementId: upc.placementId ?? null,
+    storeId: upc.storeId,
+    orderId: upc.orderId,
+  };
+}
+
+const TRACKED_FIELDS = [
+  "putAway",
+  "warehouseId",
+  "zoneId",
+  "rackId",
+  "shelfId",
+  "placementId",
+] as const;
+
+function hasTrackedFieldChanged(before: UPC, after: UPC): boolean {
+  return TRACKED_FIELDS.some((field) => before[field] !== after[field]);
+}
+
+async function writeUPCLog(
+  businessId: string,
+  upcId: string,
+  snapshot: ReturnType<typeof getUPCSnapshot>,
+) {
+  const logRef = db.collection(`users/${businessId}/upcs/${upcId}/logs`).doc();
+  await logRef.set({
+    timestamp: Timestamp.now(),
+    snapshot,
+  });
+}
+
 export const onUpcWritten = onDocumentWritten(
   {
     document: "users/{businessId}/upcs/{upcId}",
@@ -52,6 +91,13 @@ export const onUpcWritten = onDocumentWritten(
     // CASE 1: UPC Created With putAway as 'inbound'
     // ============================================================
     if (!before && after) {
+      // Log the initial state on creation
+      try {
+        await writeUPCLog(businessId, upcId, getUPCSnapshot(after));
+      } catch (err) {
+        console.error(`⚠️ Failed to write creation log for UPC ${upcId}:`, err);
+      }
+
       if (after.putAway === "inbound") {
         console.log(`UPC ${upcId} created with 'inbound' putAway - incrementing autoAddition`);
         await db.runTransaction(async (transaction) => {
@@ -95,7 +141,16 @@ export const onUpcWritten = onDocumentWritten(
     // CASE 3: UPC Updated
     // ============================================================
     if (before && after) {
-      // Skip if putAway hasn't changed
+      // Log if any tracked field changed (before the putAway-specific check so we catch all field changes)
+      if (hasTrackedFieldChanged(before, after)) {
+        try {
+          await writeUPCLog(businessId, upcId, getUPCSnapshot(after));
+        } catch (err) {
+          console.error(`⚠️ Failed to write update log for UPC ${upcId}:`, err);
+        }
+      }
+
+      // Skip remaining logic if putAway hasn't changed
       if (before.putAway === after.putAway) {
         console.log(`⏭️ UPC ${upcId} - no putAway change, skipping`);
         return;
@@ -148,7 +203,6 @@ export const onUpcWritten = onDocumentWritten(
               `🆕 The placement ${after.placementId} for this upc exists, incrementing the quantity`,
             );
 
-            // UPC returned to placement - increment placement quantity
             transaction.update(placementRef, {
               quantity: FieldValue.increment(1),
               updatedAt: Timestamp.now(),
@@ -160,7 +214,6 @@ export const onUpcWritten = onDocumentWritten(
         }
 
         if (after.putAway === "outbound" && before.putAway === "none") {
-          // UPC moved from placement to outbound - decrement placement quantity
           const placementRef = db.doc(`users/${businessId}/placements/${before.placementId}`);
           transaction.update(placementRef, {
             quantity: FieldValue.increment(-1),
@@ -172,7 +225,6 @@ export const onUpcWritten = onDocumentWritten(
         // Handle inventory auto deduction/addition
         // --------------------------------------------------------
 
-        // CASE A: putAway becomes null → Order dispatched → autoDeduction++
         if (after.putAway === null && before.putAway !== null) {
           if (!after.productId) {
             console.warn(`⚠️ UPC ${upcId} has no productId, skipping autoDeduction`);
@@ -194,7 +246,6 @@ export const onUpcWritten = onDocumentWritten(
           console.log(`  ✅ Incremented autoDeduction for product ${after.productId}`);
         }
 
-        // CASE B: putAway becomes "inbound" → Product returned → autoAddition++
         if (after.putAway === "inbound" && before.putAway !== "inbound") {
           if (!after.productId) {
             console.warn(`⚠️ UPC ${upcId} has no productId, skipping autoAddition`);

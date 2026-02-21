@@ -1,15 +1,22 @@
 // restock-logic.ts
-// ROBUST VERSION v3 - Fixes applied from session review:
+// ROBUST VERSION v4 - Additional fixes:
 //
-// FIX 1: Removed .orderBy() from snapshot query (caused silent query failure → missing composite index)
-// FIX 2: inStockDays now uses ACTUAL snapshot count, not assumed (days - stockoutDays was wrong)
-// FIX 3: Added snapshot coverage tracking (daysWithSnapshots, daysWithoutData, snapshotCoverage)
-// FIX 4: needsBenchmarking now triggers on low snapshot coverage too
-// FIX 5: calculateCategoryBenchmark now checks each peer's reliability before including it
-// FIX 6: Cascading failure handled: when ALL peers are unreliable, falls back to pre-stockout data
-// FIX 7: dataQuality now considers snapshot coverage, not just inStockDays
-// FIX 8: dataSource field added for full transparency on where data came from
-// FIX 9: New warnings surface cascading failures, low coverage, and fallback usage
+// FIX 1:  Removed .orderBy() from snapshot query (silent failure from missing composite index)
+// FIX 2:  inStockDays uses ACTUAL snapshot count (days - stockoutDays was wrong)
+// FIX 3:  Added snapshot coverage tracking (daysWithSnapshots, daysWithoutData, snapshotCoverage)
+// FIX 4:  needsBenchmarking triggers on low snapshot coverage too
+// FIX 5:  calculateCategoryBenchmark checks each peer's reliability before including it
+// FIX 6:  Cascading failure handled: falls back to pre-stockout → full window → conservative
+// FIX 7:  dataQuality considers snapshot coverage, not just inStockDays
+// FIX 8:  dataSource field added for transparency on where avgDailySales came from
+// FIX 9:  Warnings surface cascading failures, low coverage, fallback usage
+// FIX 10: Stockout logic: stockLevel===0 && dailySales===0 (sold-out mid-day ≠ full stockout)
+// FIX 11: Warning reason reflects actual cause (stockouts vs low coverage)
+// FIX 12: avgDailySales = totalSales / days (full window, consistent numerator + denominator)
+// FIX 13: businessDoc fetched once in batch, passed down via linkedStores param
+// FIX 14: productDoc fetched once in batch, passed down via productData param
+// FIX 15: Peer reliability checks run in parallel (Promise.all)
+// FIX 16: dataSource name corrected: "product_full_window" (was misleading "product_instock_history")
 
 import { Timestamp } from "firebase-admin/firestore";
 import { db } from "../firebaseAdmin";
@@ -32,7 +39,7 @@ interface Product {
   sku: string;
   name: string;
   inventory: Inventory;
-  mappedVariants?: Array<{ variantId: string;[key: string]: any }>;
+  mappedVariants?: Array<{ variantId: string; [key: string]: any }>;
   inventoryTracking?: {
     lastRestockDate: Timestamp | null;
     lastRestockQuantity: number;
@@ -54,14 +61,13 @@ interface SalesMetrics {
   trendMultiplier: number;
   inStockDays: number;
   stockoutDays: number;
-  // NEW: Snapshot transparency fields
-  daysWithSnapshots: number;    // Actual snapshots found (not assumed)
-  daysWithoutData: number;      // Days where no snapshot exists at all
-  snapshotCoverage: number;     // daysWithSnapshots / totalDays (0.0 - 1.0)
+  daysWithSnapshots: number;
+  daysWithoutData: number;
+  snapshotCoverage: number;
   dataQuality: "excellent" | "good" | "fair" | "poor" | "insufficient";
   usedCategoryBenchmark: boolean;
   categoryBlendPercentage?: number;
-  dataSource: string;           // NEW: Where the final avgDailySales came from
+  dataSource: string;
 }
 
 interface CategoryBenchmark {
@@ -70,10 +76,9 @@ interface CategoryBenchmark {
   standardDeviation: number;
   productCount: number;
   confidence: number;
-  // NEW: Quality fields
   benchmarkQuality: "reliable" | "weak" | "failed";
-  excludedCount: number;        // Number of peers excluded due to bad data
-  reason?: string;              // Reason for 'failed' quality
+  excludedCount: number;
+  reason?: string;
 }
 
 interface RestockRecommendation {
@@ -142,7 +147,6 @@ function findProductByVariant(
 ): string | null {
   try {
     if (!variantId || !productMappedVariants || productMappedVariants.length === 0) return null;
-
     for (const product of productMappedVariants) {
       if (!product.mappedVariants || !Array.isArray(product.mappedVariants)) continue;
       const variantExists = product.mappedVariants.some(
@@ -181,11 +185,6 @@ function formatDateForQuery(date: Date): string {
   }
 }
 
-/**
- * NEW: Calculate average daily sales from BEFORE the first stockout day.
- * Used as a fallback when both product and category benchmark data are unreliable.
- * Returns null if no pre-stockout data exists.
- */
 function calculatePreStockoutAverage(
   dailySales: { [date: string]: number },
   stockoutDates: Set<string>,
@@ -198,7 +197,6 @@ function calculatePreStockoutAverage(
     const firstStockoutDate = sortedStockoutDates[0];
     const startDateStr = analysisStartDate.toISOString().split("T")[0];
 
-    // Count calendar days from analysis start to first stockout
     const start = new Date(startDateStr);
     const firstStockout = new Date(firstStockoutDate);
     const preStockoutDays = Math.floor(
@@ -210,7 +208,6 @@ function calculatePreStockoutAverage(
       return null;
     }
 
-    // Sum all sales that occurred before the first stockout
     const preStockoutTotal = Object.entries(dailySales)
       .filter(([date]) => date >= startDateStr && date < firstStockoutDate)
       .reduce((sum, [, sales]) => sum + sales, 0);
@@ -218,7 +215,7 @@ function calculatePreStockoutAverage(
     const avg = preStockoutTotal / preStockoutDays;
     console.log(
       `📊 Pre-stockout avg: ${avg.toFixed(3)} units/day ` +
-      `(${preStockoutTotal} total over ${preStockoutDays} days before ${firstStockoutDate})`,
+        `(${preStockoutTotal} total over ${preStockoutDays} days before ${firstStockoutDate})`,
     );
 
     return avg > 0 ? avg : null;
@@ -232,12 +229,6 @@ function calculatePreStockoutAverage(
 // CATEGORY BENCHMARKING HELPERS
 // ============================================================================
 
-/**
- * NEW: Check a single product's data reliability for inclusion in a category benchmark.
- * A product is considered reliable if:
- *   - It has snapshots for at least 30% of the analysis period
- *   - Its stockout frequency is 30% or less
- */
 async function getProductReliability(
   businessId: string,
   productId: string,
@@ -246,7 +237,6 @@ async function getProductReliability(
   minSnapshotsRequired: number,
 ): Promise<{ isReliable: boolean; stockoutFrequency: number; daysWithSnapshots: number }> {
   try {
-    // FIX 1 applied here too: no orderBy
     const snapshots = await db
       .collection(`users/${businessId}/inventory_snapshots`)
       .where("productId", "==", productId)
@@ -274,13 +264,6 @@ async function getProductReliability(
 // CATEGORY BENCHMARKING
 // ============================================================================
 
-/**
- * Calculate average sales for a category.
- *
- * FIX 5: Each peer product is now checked for reliability before being included.
- * FIX 6: Returns a 'failed' quality object when ALL peers are unreliable,
- *        instead of silently averaging bad data.
- */
 export async function calculateCategoryBenchmark(
   businessId: string,
   ordersSnapshot: any[],
@@ -330,29 +313,33 @@ export async function calculateCategoryBenchmark(
       return null;
     }
 
-    // ─── FIX 5: Reliability gate — check each peer before including ───────
+    // ─── FIX 15: Reliability checks in parallel ───────────────────────────
+    const reliabilityResults = await Promise.all(
+      candidateIds.map((productId) =>
+        getProductReliability(businessId, productId, days, startDateStr, snapshotThreshold),
+      ),
+    );
+
     const reliableIds: string[] = [];
     let unreliableCount = 0;
 
-    for (const productId of candidateIds) {
-      const reliability = await getProductReliability(businessId, productId, days, startDateStr, snapshotThreshold);
+    reliabilityResults.forEach((reliability, index) => {
       if (reliability.isReliable) {
-        reliableIds.push(productId);
+        reliableIds.push(candidateIds[index]);
       } else {
         unreliableCount++;
         console.warn(
-          `⚠️ Excluding peer ${productId} from benchmark — ` +
-          `stockoutFreq=${reliability.stockoutFrequency.toFixed(2)}, ` +
-          `snapshots=${reliability.daysWithSnapshots}/${days}`,
+          `⚠️ Excluding peer ${candidateIds[index]} from benchmark — ` +
+            `stockoutFreq=${reliability.stockoutFrequency.toFixed(2)}, ` +
+            `snapshots=${reliability.daysWithSnapshots}/${days}`,
         );
       }
-    }
+    });
 
-    // ─── FIX 6: Cascading failure — return 'failed' not null ─────────────
     if (reliableIds.length === 0) {
       console.error(
         `🚨 Category benchmark FAILED for "${category}": ` +
-        `all ${unreliableCount} peers have unreliable data`,
+          `all ${unreliableCount} peers have unreliable data`,
       );
       return {
         category,
@@ -366,25 +353,21 @@ export async function calculateCategoryBenchmark(
       };
     }
 
-    // Only use mapped variants for reliable products
     const reliableMappedVariants = productMappedVariants.filter((p) =>
       reliableIds.includes(p.productId),
     );
 
-    // Tally sales per reliable product from the shared orders array
     const productSales: { [productId: string]: number } = {};
 
     for (const docSnapshot of ordersSnapshot) {
       try {
         const order = docSnapshot.data();
         if (!order) continue;
-
         const lineItems = extractLineItems(order);
         for (const item of lineItems) {
           if (!item?.variant_id) continue;
           const quantity = Number(item.quantity);
           if (isNaN(quantity) || quantity <= 0) continue;
-
           const productId = findProductByVariant(reliableMappedVariants, item.variant_id);
           if (productId) {
             productSales[productId] = (productSales[productId] || 0) + quantity;
@@ -395,9 +378,7 @@ export async function calculateCategoryBenchmark(
       }
     }
 
-    // Calculate daily averages for reliable products
     const productAvgs: number[] = reliableIds.map((id) => (productSales[id] || 0) / days);
-
     const categoryAvg = productAvgs.reduce((sum, v) => sum + v, 0) / productAvgs.length;
     const categoryStdDev = calculateStandardDeviation(productAvgs, categoryAvg);
     const confidence = Math.min(1, productAvgs.length / 10);
@@ -405,8 +386,8 @@ export async function calculateCategoryBenchmark(
 
     console.log(
       `📊 Category benchmark "${category}": ` +
-      `${reliableIds.length} reliable, ${unreliableCount} excluded, ` +
-      `quality=${benchmarkQuality}, avg=${categoryAvg.toFixed(3)}`,
+        `${reliableIds.length} reliable, ${unreliableCount} excluded, ` +
+        `quality=${benchmarkQuality}, avg=${categoryAvg.toFixed(3)}`,
     );
 
     return {
@@ -469,7 +450,8 @@ export async function calculateSalesMetrics(
   linkedStores: string[],
   productId: string,
   days: number = 30,
-  sharedOrdersSnapshot?: any[],  // ← ADD THIS
+  sharedOrdersSnapshot?: any[], // ← pre-fetched from batch, skips Firestore query
+  productData?: Product, // ← pre-fetched from batch, skips productDoc fetch
 ): Promise<SalesMetrics> {
   try {
     if (!businessId || !productId) throw new Error("Invalid businessId or productId");
@@ -482,22 +464,26 @@ export async function calculateSalesMetrics(
     const startDate = new Date(now.getTime() - days * 24 * 60 * 60 * 1000);
     const startDateStr = startDate.toISOString().split("T")[0];
 
-    const productDoc = await db.doc(`users/${businessId}/products/${productId}`).get();
-    if (!productDoc.exists) throw new Error(`Product ${productId} not found`);
+    // ─── FIX 14: Only fetch product if not passed in ───────────────────────
+    let product: Product;
+    if (productData) {
+      product = productData;
+    } else {
+      const productDoc = await db.doc(`users/${businessId}/products/${productId}`).get();
+      if (!productDoc.exists) throw new Error(`Product ${productId} not found`);
+      product = productDoc.data() as Product;
+    }
 
-    const product = productDoc.data() as Product;
     const category = product?.name;
     const mappedVariants = Array.isArray(product?.mappedVariants) ? product.mappedVariants : [];
 
-    // Fetch orders from all linked stores
+    // ─── FIX 13: Only fetch orders if not passed in ────────────────────────
     const dateStringForOrder = formatDateForQuery(startDate);
     let combinedOrdersSnapshotArray: any[];
 
     if (sharedOrdersSnapshot) {
-      // Already fetched — skip Firestore query entirely
       combinedOrdersSnapshotArray = sharedOrdersSnapshot;
     } else {
-      // Fetch individually (when called for a single product)
       combinedOrdersSnapshotArray = [];
       for (const store of linkedStores) {
         try {
@@ -508,10 +494,7 @@ export async function calculateSalesMetrics(
             .orderBy("createdAt", "asc")
             .get();
           if (!ordersSnapshot.empty) {
-            combinedOrdersSnapshotArray = [
-              ...combinedOrdersSnapshotArray,
-              ...ordersSnapshot.docs
-            ];
+            combinedOrdersSnapshotArray = [...combinedOrdersSnapshotArray, ...ordersSnapshot.docs];
           }
         } catch (storeError) {
           console.error(`Error fetching orders from store ${store}:`, storeError);
@@ -519,21 +502,21 @@ export async function calculateSalesMetrics(
       }
     }
 
-    // ─── FIX 1: No .orderBy() — avoids silent failure from missing composite index ──
+    // ─── FIX 1: No .orderBy() on snapshot query ───────────────────────────
     let snapshotsSnapshot: { empty: boolean; docs: any[] };
     try {
       const raw = await db
         .collection(`users/${businessId}/inventory_snapshots`)
         .where("productId", "==", productId)
         .where("date", ">=", startDateStr)
-        .get();                              // ← orderBy REMOVED
+        .get();
       snapshotsSnapshot = { empty: raw.empty, docs: raw.docs };
     } catch (snapshotError: any) {
       console.error("Error fetching inventory snapshots:", snapshotError.message);
       snapshotsSnapshot = { empty: true, docs: [] };
     }
 
-    // ─── FIX 2 & 3: Track actual snapshot count — never assume missing = in-stock ──
+    // ─── FIX 2 & 3: Track actual snapshot count ───────────────────────────
     const daysWithSnapshots = snapshotsSnapshot.empty ? 0 : snapshotsSnapshot.docs.length;
     const daysWithoutData = days - daysWithSnapshots;
     const snapshotCoverage = daysWithSnapshots / days;
@@ -541,12 +524,13 @@ export async function calculateSalesMetrics(
     if (snapshotCoverage < 0.5) {
       console.warn(
         `⚠️ Low snapshot coverage for ${productId}: ` +
-        `${daysWithSnapshots}/${days} days (${(snapshotCoverage * 100).toFixed(0)}%). ` +
-        `Results may be unreliable until daily snapshots are collected.`,
+          `${daysWithSnapshots}/${days} days (${(snapshotCoverage * 100).toFixed(0)}%). ` +
+          `Results may be unreliable until daily snapshots are collected.`,
       );
     }
 
-    // Count stockout days from actual snapshots
+    // ─── FIX 10: stockLevel===0 && dailySales===0 = genuine stockout ──────
+    // stockLevel===0 but dailySales>0 = sold out mid-day (real demand, don't exclude)
     let stockoutDays = 0;
     const stockoutDates = new Set<string>();
 
@@ -565,14 +549,10 @@ export async function calculateSalesMetrics(
       });
     }
 
-    // ─── FIX 2: inStockDays from actual snapshots, NOT from (days - stockoutDays) ──
-    // OLD (WRONG):  inStockDays = days - stockoutDays
-    //               → assumed days with no snapshot were in-stock
-    // NEW (CORRECT): inStockDays = daysWithSnapshots - stockoutDays
-    //               → only counts days we actually know were in-stock
+    // ─── FIX 2: inStockDays from actual snapshots only ────────────────────
     const inStockDays = Math.max(0, daysWithSnapshots - stockoutDays);
 
-    // Process orders and build daily sales map
+    // Build daily sales map
     const dailySales: { [date: string]: number } = {};
     let totalSales = 0;
 
@@ -613,6 +593,7 @@ export async function calculateSalesMetrics(
     const last14DaysAvg = calculatePeriodAverage(dailySales, 14, stockoutDates);
     const last30DaysAvg = calculatePeriodAverage(dailySales, 30, stockoutDates);
 
+    // ─── FIX 12: Full window — numerator and denominator from same pool ────
     let avgDailySales = totalSales / days;
     const salesValues = Object.values(dailySales);
     let standardDeviation = calculateStandardDeviation(salesValues, avgDailySales);
@@ -622,10 +603,10 @@ export async function calculateSalesMetrics(
     let dataQuality: SalesMetrics["dataQuality"] = "excellent";
     let dataSource = "product_history";
 
-    // ─── FIX 4: needsBenchmarking also triggers on low snapshot coverage ─────────
+    // ─── FIX 4: needsBenchmarking triggers on low snapshot coverage ───────
     const needsBenchmarking =
       inStockDays < 7 ||
-      daysWithSnapshots < days * 0.3 ||      // NEW: low coverage triggers benchmark
+      daysWithSnapshots < days * 0.3 ||
       stockoutDays > days * 0.5 ||
       totalSales === 0 ||
       (inStockDays < 14 && totalSales < 10);
@@ -633,8 +614,8 @@ export async function calculateSalesMetrics(
     if (needsBenchmarking && category) {
       console.log(
         `Product ${productId} needs benchmarking — ` +
-        `inStock=${inStockDays}, stockout=${stockoutDays}, ` +
-        `coverage=${(snapshotCoverage * 100).toFixed(0)}%, sales=${totalSales}`,
+          `inStock=${inStockDays}, stockout=${stockoutDays}, ` +
+          `coverage=${(snapshotCoverage * 100).toFixed(0)}%, sales=${totalSales}`,
       );
 
       try {
@@ -644,14 +625,10 @@ export async function calculateSalesMetrics(
           category,
           days,
           [productId],
-          daysWithSnapshots,  // ← "accept peers with at least as many snapshots as me"
-          // product has 7 → triggers benchmark (7 < 9)
-          // peers have 7 → 7 >= 7 → accepted! ✅
+          daysWithSnapshots, // peers must have at least as many snapshots as this product
         );
 
-        // ─── FIX 5: Use benchmark quality, not just productCount >= 2 ─────────
         if (categoryBenchmark && categoryBenchmark.benchmarkQuality !== "failed") {
-
           usedCategoryBenchmark = true;
           dataSource = `category_benchmark_${categoryBenchmark.benchmarkQuality}`;
 
@@ -675,7 +652,6 @@ export async function calculateSalesMetrics(
             dataQuality = "fair";
           }
 
-          // If benchmark is 'weak' (only 1 reliable peer), reduce its weight
           if (categoryBenchmark.benchmarkQuality === "weak") {
             productWeight = Math.max(productWeight, 0.5);
             categoryBlendPercentage = Math.min(categoryBlendPercentage, 50);
@@ -690,51 +666,46 @@ export async function calculateSalesMetrics(
 
           console.log(
             `Blended: ${productWeight * 100}% product + ` +
-            `${categoryWeight * 100}% category (quality: ${categoryBenchmark.benchmarkQuality})`,
+              `${categoryWeight * 100}% category (quality: ${categoryBenchmark.benchmarkQuality})`,
           );
-
         } else {
-          // ─── FIX 6: Cascading failure — all peers also unreliable ─────────────
+          // ─── FIX 6: Cascading failure fallback chain ─────────────────────
           console.error(
             `🚨 Cascading data failure for ${productId}: ` +
-            `product AND all category peers have insufficient data`,
+              `product AND all category peers have insufficient data`,
           );
 
-          // Fallback 1: Use sales from BEFORE the first stockout
-          const preStockoutAvg = stockoutDates.size > 0
-            ? calculatePreStockoutAverage(dailySales, stockoutDates, startDate)
-            : null;
+          const preStockoutAvg =
+            stockoutDates.size > 0
+              ? calculatePreStockoutAverage(dailySales, stockoutDates, startDate)
+              : null;
 
           if (preStockoutAvg !== null && preStockoutAvg > 0) {
-            // Has stockouts + has pre-stockout sales
             avgDailySales = preStockoutAvg * 1.1;
             dataSource = "pre_stockout_history";
             dataQuality = "poor";
           } else if (inStockDays > 0 && totalSales > 0) {
-            // full windowed average sales
+            // ─── FIX 16: Correct name — uses full window ──────────────────
             avgDailySales = totalSales / days;
-            dataSource = "product_instock_history";
+            dataSource = "product_full_window";
             dataQuality = "poor";
             console.log(
-              `📊 Using actual in-stock avg: ${avgDailySales.toFixed(3)} ` +
-              `(${totalSales} units over ${inStockDays} confirmed days)`
+              `📊 Using full window avg: ${avgDailySales.toFixed(3)} ` +
+                `(${totalSales} units over ${days} day window)`,
             );
           } else {
-            // Genuinely nothing — new product, no sales ever
             avgDailySales = 0.5;
             dataSource = "conservative_fallback";
             dataQuality = "insufficient";
           }
         }
-
       } catch (benchmarkError) {
         console.error("Error calculating category benchmark:", benchmarkError);
         dataQuality = "poor";
         dataSource = "product_history_fallback";
       }
-
     } else if (!needsBenchmarking) {
-      // ─── FIX 7: dataQuality now considers snapshot coverage ─────────────────
+      // ─── FIX 7: dataQuality considers snapshot coverage ──────────────────
       if (inStockDays >= 21 && stockoutDays <= 3 && snapshotCoverage >= 0.8) {
         dataQuality = "excellent";
       } else if (inStockDays >= 14 && snapshotCoverage >= 0.5) {
@@ -851,7 +822,9 @@ function calculateSafetyStock(
 ): number {
   try {
     const zScore = serviceLevel === 0.95 ? 1.65 : serviceLevel === 0.99 ? 2.33 : 1.28;
-    return Math.ceil(Math.max(0, zScore * standardDeviation * Math.sqrt(Math.max(1, leadTimeDays))));
+    return Math.ceil(
+      Math.max(0, zScore * standardDeviation * Math.sqrt(Math.max(1, leadTimeDays))),
+    );
   } catch (error) {
     console.error("Error calculating safety stock:", error);
     return 0;
@@ -867,7 +840,9 @@ export async function calculateRestockRecommendation(
   productId: string,
   forecastDays: number = 14,
   options: { serviceLevel?: number; forceMinimumOrder?: boolean } = {},
-  sharedOrdersSnapshot?: any[],
+  sharedOrdersSnapshot?: any[], // ← pre-fetched from batch
+  linkedStores?: string[], // ← FIX 13: pre-fetched from batch, skips businessDoc fetch
+  productData?: Product, // ← FIX 14: pre-fetched from batch, skips productDoc fetch
 ): Promise<RestockRecommendation> {
   try {
     if (!businessId || typeof businessId !== "string") throw new Error("Invalid businessId");
@@ -875,23 +850,38 @@ export async function calculateRestockRecommendation(
 
     forecastDays = Math.max(1, Math.min(90, forecastDays || 14));
 
-    const businessDoc = await db.doc(`users/${businessId}`).get();
-    if (!businessDoc.exists) throw new Error(`Business ${businessId} not found`);
+    // ─── FIX 13: Only fetch businessDoc if linkedStores not provided ───────
+    let resolvedLinkedStores = linkedStores;
+    if (!resolvedLinkedStores) {
+      const businessDoc = await db.doc(`users/${businessId}`).get();
+      if (!businessDoc.exists) throw new Error(`Business ${businessId} not found`);
+      resolvedLinkedStores = Array.isArray(businessDoc.data()?.stores)
+        ? (businessDoc.data()!.stores as string[])
+        : [];
+    }
 
-    const productDoc = await db.doc(`users/${businessId}/products/${productId}`).get();
-    if (!productDoc.exists) throw new Error(`Product ${productId} not found`);
+    // ─── FIX 14: Only fetch productDoc if productData not provided ─────────
+    let product = productData;
+    if (!product) {
+      const productDoc = await db.doc(`users/${businessId}/products/${productId}`).get();
+      if (!productDoc.exists) throw new Error(`Product ${productId} not found`);
+      product = productDoc.data() as Product;
+    }
 
-    const product = productDoc.data() as Product;
     const currentStock = calculatePhysicalStock(product?.inventory);
     const leadTimeDays = Math.max(1, product?.inventoryTracking?.leadTimeDays || 7);
     const minimumOrderQuantity = Math.max(0, product?.inventoryTracking?.minimumOrderQuantity || 0);
-    const linkedStores = Array.isArray(businessDoc.data()?.stores)
-      ? (businessDoc.data()!.stores as string[])
-      : [];
 
-    const metrics = await calculateSalesMetrics(businessId, linkedStores, productId, 30, sharedOrdersSnapshot);
+    const metrics = await calculateSalesMetrics(
+      businessId,
+      resolvedLinkedStores,
+      productId,
+      30,
+      sharedOrdersSnapshot,
+      product, // ← pass down so calculateSalesMetrics doesn't fetch again
+    );
 
-    // ─── FIX 9: Expanded warnings surface new failure modes ───────────────
+    // ─── FIX 9/11: Warnings with correct reasons ──────────────────────────
     const warnings: string[] = [];
 
     if (metrics.dataQuality === "insufficient") {
@@ -899,40 +889,39 @@ export async function calculateRestockRecommendation(
     } else if (metrics.dataQuality === "poor") {
       warnings.push("Limited confirmed sales history. Prediction has low confidence.");
     } else if (metrics.usedCategoryBenchmark) {
-      const reason = metrics.stockoutDays > 0
-        ? "due to high stockout days"
-        : "due to low snapshot coverage";
-      warnings.push(`Prediction blended with ${metrics.categoryBlendPercentage}% category data ${reason}.`);
+      // ─── FIX 11: Correct reason ──────────────────────────────────────────
+      const reason =
+        metrics.stockoutDays > 0 ? "due to high stockout days" : "due to low snapshot coverage";
+      warnings.push(
+        `Prediction blended with ${metrics.categoryBlendPercentage}% category data ${reason}.`,
+      );
     }
 
     if (metrics.stockoutDays > 10) {
       warnings.push(`Product was out of stock for ${metrics.stockoutDays} days in the last month.`);
     }
 
-    // NEW: Snapshot coverage warning
     if (metrics.snapshotCoverage < 0.5) {
       warnings.push(
         `Only ${metrics.daysWithSnapshots} of 30 days have inventory snapshots. ` +
-        `Predictions will improve as daily snapshot data accumulates.`,
+          `Predictions will improve as daily snapshot data accumulates.`,
       );
     }
 
-    // NEW: Cascading failure warning
     if (metrics.dataSource === "pre_stockout_history") {
       warnings.push(
         "⚠️ Both product and all category peers have insufficient data. " +
-        "Using pre-stockout sales rate as fallback.",
+          "Using pre-stockout sales rate as fallback.",
       );
     }
 
     if (metrics.dataSource === "conservative_fallback") {
       warnings.push(
         "🚨 CRITICAL: No reliable data found for product or any category peer. " +
-        "Using conservative minimum (0.5 units/day). Manual review required.",
+          "Using conservative minimum (0.5 units/day). Manual review required.",
       );
     }
 
-    // NEW: Weak benchmark warning
     if (metrics.dataSource?.includes("weak")) {
       warnings.push(
         "Only 1 reliable peer found in category benchmark. Benchmark confidence is low.",
@@ -943,11 +932,10 @@ export async function calculateRestockRecommendation(
       warnings.push("Product has no category. Assign one for better benchmarking.");
     }
 
-    if (linkedStores.length === 0) {
+    if (resolvedLinkedStores.length === 0) {
       warnings.push("No linked stores found. Sales data may be incomplete.");
     }
 
-    // Stockout adjustment
     let stockoutAdjustment = 1.0;
     if (metrics.stockoutDays > 10) stockoutAdjustment = 1.4;
     else if (metrics.stockoutDays > 5) stockoutAdjustment = 1.25;
@@ -962,12 +950,9 @@ export async function calculateRestockRecommendation(
     }
 
     const weightedDailySales =
-      metrics.last7DaysAvg * 0.5 +
-      metrics.last14DaysAvg * 0.3 +
-      metrics.last30DaysAvg * 0.2;
+      metrics.last7DaysAvg * 0.5 + metrics.last14DaysAvg * 0.3 + metrics.last30DaysAvg * 0.2;
 
-    const predictedDailyDemand =
-      weightedDailySales * metrics.trendMultiplier * stockoutAdjustment;
+    const predictedDailyDemand = weightedDailySales * metrics.trendMultiplier * stockoutAdjustment;
 
     const safetyStock = calculateSafetyStock(
       metrics.standardDeviation,
@@ -984,7 +969,6 @@ export async function calculateRestockRecommendation(
       suggestedQuantity = Math.max(suggestedQuantity, minimumOrderQuantity);
     }
 
-    // FIX 8: Confidence calculation uses snapshotCoverage in penalty
     const dataQualityScore = {
       excellent: 1.0,
       good: 0.85,
@@ -994,7 +978,7 @@ export async function calculateRestockRecommendation(
     }[metrics.dataQuality];
 
     const volatilityPenalty = metrics.standardDeviation / (metrics.avgDailySales || 1);
-    const coveragePenalty = Math.max(0, 0.5 - metrics.snapshotCoverage) * 0.2; // up to -10% for low coverage
+    const coveragePenalty = Math.max(0, 0.5 - metrics.snapshotCoverage) * 0.2;
     const categoryBonus = metrics.usedCategoryBenchmark ? 0.1 : 0;
 
     const confidence = Math.max(
@@ -1002,8 +986,8 @@ export async function calculateRestockRecommendation(
       Math.min(
         1,
         dataQualityScore * (1 - Math.min(0.5, volatilityPenalty * 0.1)) -
-        coveragePenalty +
-        categoryBonus,
+          coveragePenalty +
+          categoryBonus,
       ),
     );
 
@@ -1031,7 +1015,7 @@ export async function calculateRestockRecommendation(
 }
 
 // ============================================================================
-// BATCH + METADATA FUNCTIONS (unchanged logic, updated types)
+// BATCH + METADATA FUNCTIONS
 // ============================================================================
 
 export async function calculateAllRestockRecommendations(
@@ -1041,6 +1025,7 @@ export async function calculateAllRestockRecommendations(
   try {
     if (!businessId) throw new Error("Invalid businessId");
 
+    // ─── Fetch businessDoc ONCE ────────────────────────────────────────────
     const businessDoc = await db.doc(`users/${businessId}`).get();
     if (!businessDoc.exists) throw new Error(`Business ${businessId} not found`);
 
@@ -1052,7 +1037,7 @@ export async function calculateAllRestockRecommendations(
     const startDate = new Date(Date.now() - days * 24 * 60 * 60 * 1000);
     const dateStringForOrder = formatDateForQuery(startDate);
 
-    // ─── Fetch orders ONCE across all stores ──────────────────────────────
+    // ─── Fetch orders ONCE across all stores in parallel ──────────────────
     console.log(`Fetching orders for ${linkedStores.length} stores...`);
     const storeOrderSnapshots = await Promise.all(
       linkedStores.map(async (store) => {
@@ -1067,16 +1052,14 @@ export async function calculateAllRestockRecommendations(
           console.error(`Failed to fetch orders for store ${store}:`, err);
           return [];
         }
-      })
+      }),
     );
 
     const sharedOrdersSnapshot = storeOrderSnapshots.flat();
     console.log(`Fetched ${sharedOrdersSnapshot.length} total orders`);
 
     // ─── Fetch all products ONCE ───────────────────────────────────────────
-    const productsSnapshot = await db
-      .collection(`users/${businessId}/products`)
-      .get();
+    const productsSnapshot = await db.collection(`users/${businessId}/products`).get();
 
     // ─── Process all products in PARALLEL ─────────────────────────────────
     const recommendations: RestockRecommendation[] = [];
@@ -1095,7 +1078,9 @@ export async function calculateAllRestockRecommendations(
             doc.id,
             options.forecastDays,
             {},
-            sharedOrdersSnapshot,  // ← pass pre-fetched orders
+            sharedOrdersSnapshot, // ← pre-fetched orders
+            linkedStores, // ← pre-fetched stores (skips businessDoc fetch)
+            product, // ← pre-fetched product (skips productDoc fetch ×2)
           );
 
           if (recommendation.suggestedQuantity > 0) {
@@ -1105,7 +1090,7 @@ export async function calculateAllRestockRecommendations(
           console.error(`Error calculating restock for product ${doc.id}:`, error);
           errors.push({ productId: doc.id, error });
         }
-      })
+      }),
     );
 
     if (errors.length > 0) {

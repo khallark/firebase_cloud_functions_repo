@@ -8,3 +8,6 @@ export * from "./migrateRefundedAmounts";
 export * from "./migrateProductsOnShopify";
 export * from "./migrateBlockedStock";
 export * from "./migrateInventorySync";
+export * from "./checkWarehouseInventoryDiffs";
+export * from "./func";
+export * from "./inventorySnapshotOfADate";

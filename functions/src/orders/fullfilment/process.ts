@@ -560,12 +560,16 @@ async function fulfillOrderOnShopify(
           tracking_info: {
             number: String(awb) || "",
             company: courier,
-            url:
-              String(courier) === "Delhivery"
-                ? `https://www.delhivery.com/track-v2/package/${awb}`
-                : String(courier) === "Shiprocket"
-                  ? `https://shiprocket.co/tracking/${awb}`
-                  : `https://www.xpressbees.com/shipment/tracking?awbNo=${awb}`,
+            url: (() => {
+              if (String(courier) === "Delhivery")
+                return `https://www.delhivery.com/track-v2/package/${awb}`;
+              if (String(courier) === "Shiprocket") return `https://shiprocket.co/tracking/${awb}`;
+              if (String(courier) === "Xpressbees")
+                return `https://www.xpressbees.com/shipment/tracking?awbNo=${awb}`;
+              if (String(courier) === "Blue Dart")
+                return `https://bluedart.com/tracking?pasteThisAWB=${awb}`;
+              return "https://www.google.com";
+            })(),
           },
           notify_customer: false,
         },

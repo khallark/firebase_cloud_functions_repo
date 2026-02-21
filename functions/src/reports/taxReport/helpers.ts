@@ -14,6 +14,8 @@ interface SalesRow {
   dateOfBill: string;
   customerName: string;
   state: string;
+  courier: string;
+  paymentGateway: string;
   itemName: string;
   itemQty: number;
   finalStatus: string;
@@ -29,11 +31,33 @@ interface SalesRow {
   sgst: number;
   cgst: number;
   vendor: string;
+  stateAmountDue: number;
+  courierAmountDue: number;
+  paymentGatewayAmountDue: number;
 }
 
-interface SalesReturnRow extends SalesRow {
-  dateOfReturn: string;
+interface SalesReturnRow {
+  srNo: number;
+  billNo: string;
+  dateOfBill: string;
+  customerName: string;
+  state: string;
+  itemName: string;
+  itemQty: number;
   finalStatus: string;
+  awb: string;
+  mrp: number;
+  discountLinewise: number;
+  proportionateShippingPrice: number;
+  salePrice: number;
+  hsn: string;
+  taxRate: number;
+  taxable: number;
+  igst: number;
+  sgst: number;
+  cgst: number;
+  vendor: string;
+  dateOfReturn: string;
   refundAmount: number;
 }
 
@@ -237,12 +261,48 @@ async function processSalesOrders(
         const taxable = calculateTaxable(salePrice, productInfo.taxRate);
         const taxes = calculateTaxes(taxable, productInfo.taxRate, state);
 
+        const customStatus = String(order.customStatus || "");
+        const totalOutstanding = Number(order.raw.total_outstanding || 0);
+        const totalPrice = Number(order.raw.total_price || 0);
+        const proportionateOutstanding =
+          totalMRP > 0 ? Number(((totalOutstanding * mrp) / totalMRP).toFixed(2)) : 0;
+        const proportionateAmountPaid =
+          totalMRP > 0
+            ? Number((((totalPrice - totalOutstanding) * mrp) / totalMRP).toFixed(2))
+            : 0;
+
+        const STATE_AMOUNT_DUE_STATUSES = new Set([
+          "New",
+          "Confirmed",
+          "Ready To Dispatch",
+          "DTO Refunded",
+        ]);
+        const COURIER_AMOUNT_DUE_STATUSES = new Set([
+          "Dispatched",
+          "In Transit",
+          "Out For Delivery",
+          "Delivered",
+          "RTO In Transit",
+          "RTO Delivered",
+          "DTO Requested",
+          "DTO Booked",
+          "DTO In Transit",
+          "DTO Delivered",
+          "Pending Refunds",
+          "Lost",
+          "Closed",
+          "RTO Processed",
+          "RTO Closed",
+        ]);
+
         salesRows.push({
           srNo: srNo++,
           billNo: String(order.name || ""),
           dateOfBill: formatDate(order.createdAt),
           customerName: String(customerName),
           state: state,
+          courier: String(order.courierProvider || "-"),
+          paymentGateway: String((order.raw.payment_gateway_names || [])[0] || "-"),
           itemName: String(item.name || ""),
           itemQty: itemQty,
           finalStatus: String(order.customStatus || ""),
@@ -258,6 +318,13 @@ async function processSalesOrders(
           sgst: taxes.sgst,
           cgst: taxes.cgst,
           vendor: String(item.vendor || ""),
+          stateAmountDue: STATE_AMOUNT_DUE_STATUSES.has(customStatus)
+            ? proportionateOutstanding
+            : 0,
+          courierAmountDue: COURIER_AMOUNT_DUE_STATUSES.has(customStatus)
+            ? proportionateOutstanding
+            : 0,
+          paymentGatewayAmountDue: proportionateAmountPaid,
         });
       } catch (error) {
         console.error(`Error processing item in order ${order.name}:`, error);
@@ -640,6 +707,8 @@ async function createExcelWorkbook(
     { header: "Date of Bill", key: "dateOfBill", width: 15 },
     { header: "Name of customer", key: "customerName", width: 25 },
     { header: "State", key: "state", width: 20 },
+    { header: "Courier", key: "courier", width: 20 }, // NEW
+    { header: "Payment Gateway", key: "paymentGateway", width: 22 }, // NEW
     { header: "Item Name", key: "itemName", width: 30 },
     { header: "Item Qty", key: "itemQty", width: 10 },
     { header: "Final Status", key: "finalStatus", width: 20 },
@@ -655,13 +724,16 @@ async function createExcelWorkbook(
     { header: "SGST", key: "sgst", width: 12 },
     { header: "CGST", key: "cgst", width: 12 },
     { header: "Vendor", key: "vendor", width: 20 },
+    { header: "State Amount Due", key: "stateAmountDue", width: 20 }, // NEW
+    { header: "Courier Amount Due", key: "courierAmountDue", width: 20 }, // NEW
+    { header: "Payment Gateway Amount Due", key: "paymentGatewayAmountDue", width: 25 }, // NEW
   ];
 
   salesRows.forEach((row) => salesSheet.addRow(row));
 
   // Style header with all borders
   const salesHeaderRow = salesSheet.getRow(1);
-  for (let col = 1; col <= 19; col++) {
+  for (let col = 1; col <= 25; col++) {
     const cell = salesHeaderRow.getCell(col);
     cell.font = { bold: true, color: { argb: "FFFFFFFF" } };
     cell.fill = {
@@ -680,7 +752,7 @@ async function createExcelWorkbook(
 
   // Add side borders to all data rows
   for (let row = 2; row <= salesRows.length + 1; row++) {
-    for (let col = 1; col <= 19; col++) {
+    for (let col = 1; col <= 25; col++) {
       const cell = salesSheet.getCell(row, col);
       cell.border = {
         left: { style: "thin" },

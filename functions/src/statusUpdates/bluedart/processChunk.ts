@@ -275,8 +275,25 @@ function prepareBlueDartOrderUpdates(orders: any[], shipments: any[]): OrderUpda
     //
     const newStatus = determineNewBlueDartStatus(rawStatusType);
     if (!newStatus) continue; // unrecognised code → skip
+    if (order.customStatus === "RTO Processed") {
+      if (newStatus === "RTO Delivered") {
+        updates.push({
+          ref: order.ref,
+          data: {
+            customStatus: "RTO Closed",
+            lastStatusUpdate: FieldValue.serverTimestamp(),
+            customStatusesLogs: FieldValue.arrayUnion({
+              status: "RTO Closed",
+              createdAt: Timestamp.now(),
+              remarks:
+                "This order was finally updated by the courier to 'RTO Delivered', and was shifted from 'RTO Processed' to 'RTO Closed'.",
+            }),
+          },
+        });
+      }
+      continue;
+    }
     if (newStatus === order.customStatus) continue; // no change → skip
-
     updates.push({
       ref: order.ref,
       data: {

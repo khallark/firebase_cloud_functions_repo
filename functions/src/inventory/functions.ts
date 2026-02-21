@@ -302,7 +302,7 @@ export const getRestockRecommendation = onRequest(
 export const getAllRestockRecommendations = onRequest(
   {
     cors: true,
-    timeoutSeconds: 540,
+    timeoutSeconds: 3600,
     secrets: [ENQUEUE_FUNCTION_SECRET],
     memory: "1GiB", // More memory for batch processing
   },
