@@ -1,11 +1,97 @@
 import { onRequest } from "firebase-functions/v2/https";
-import { db } from "../firebaseAdmin";
+import { db, storage } from "../firebaseAdmin";
+import ExcelJS from "exceljs";
+import { randomUUID } from "crypto";
 
 interface MappedVariant {
   productId: string;
   storeId: string;
   variantId: number;
   variantSku: string;
+}
+
+interface SnapshotRow {
+  productSku: string;
+  stock: number;
+  blockedStock: number | null;
+  variantSku: string | null;
+  price: number | null;
+}
+
+async function buildExcelBuffer(rows: SnapshotRow[], date: string): Promise<Buffer> {
+  const workbook = new ExcelJS.Workbook();
+  workbook.creator = "Majime";
+  workbook.created = new Date();
+
+  const ws = workbook.addWorksheet("Closing Stock");
+
+  ws.columns = [
+    { header: "Product SKU", key: "productSku", width: 22 },
+    { header: "Stock", key: "stock", width: 12 },
+    { header: "Blocked Stock", key: "blockedStock", width: 16 },
+    { header: "Variant SKU", key: "variantSku", width: 22 },
+    { header: "Price", key: "price", width: 14 },
+  ];
+
+  // Header styling
+  const headerRow = ws.getRow(1);
+  headerRow.font = { bold: true, name: "Arial", size: 11 };
+  headerRow.fill = { type: "pattern", pattern: "solid", fgColor: { argb: "FFD9E1F2" } };
+  headerRow.alignment = { horizontal: "center", vertical: "middle" };
+  headerRow.height = 20;
+
+  const numFmt = '#,##0.00;(#,##0.00);"-"';
+
+  for (const row of rows) {
+    const excelRow = ws.addRow([
+      row.productSku,
+      row.stock,
+      row.blockedStock,
+      row.variantSku,
+      row.price,
+    ]);
+    excelRow.font = { name: "Arial", size: 10 };
+    excelRow.alignment = { vertical: "middle" };
+    // Numeric columns: Stock(B), Blocked Stock(C), Price(E)
+    [2, 3, 5].forEach((col) => (excelRow.getCell(col).numFmt = numFmt));
+  }
+
+  // Thin borders on all cells
+  for (let r = 1; r <= ws.rowCount; r++) {
+    for (let c = 1; c <= 5; c++) {
+      ws.getRow(r).getCell(c).border = {
+        top: { style: "thin" },
+        left: { style: "thin" },
+        bottom: { style: "thin" },
+        right: { style: "thin" },
+      };
+    }
+  }
+
+  // Add a note with the report date in cell G1
+  ws.getCell("G1").value = `Date: ${date}`;
+  ws.getCell("G1").font = { name: "Arial", size: 10, italic: true };
+
+  return Buffer.from(await workbook.xlsx.writeBuffer());
+}
+
+async function uploadToStorage(buffer: Buffer, businessId: string, date: string): Promise<string> {
+  const uniqueId = randomUUID();
+  const filename = `closing_stock_${date}_${uniqueId}.xlsx`;
+  const storagePath = `closingStock/${businessId}/${filename}`;
+
+  const bucket = storage.bucket();
+  const file = bucket.file(storagePath);
+
+  await file.save(buffer, {
+    metadata: {
+      contentType: "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+    },
+  });
+
+  await file.makePublic();
+
+  return `https://storage.googleapis.com/${bucket.name}/${storagePath}`;
 }
 
 export const inventorySnapshotOfADate = onRequest(
@@ -16,11 +102,29 @@ export const inventorySnapshotOfADate = onRequest(
   },
   async (req, res) => {
     try {
+      // ── 1. Validate input ────────────────────────────────────────────────
+      const { businessId, date } = req.body as {
+        businessId?: string;
+        date?: string;
+      };
+
+      if (!businessId || !date) {
+        res.status(400).json({ error: "businessId and date are required." });
+        return;
+      }
+
+      if (!/^\d{4}-\d{2}-\d{2}$/.test(date)) {
+        res.status(400).json({ error: "date must be in yyyy-mm-dd format." });
+        return;
+      }
+
+      // ── 2. Fetch snapshots ───────────────────────────────────────────────
       const snap = await db
-        .collection("users/2yEGCC8AffNxDoTZEqhAkCRgxNl2/inventory_snapshots")
-        .where("date", "==", "2026-02-17")
+        .collection(`users/${businessId}/inventory_snapshots`)
+        .where("date", "==", date)
         .get();
 
+      // ── 3. Enrich each snapshot with variant SKU + price ─────────────────
       const result = await Promise.all(
         snap.docs.map(async (doc) => {
           const data = doc.data();
@@ -39,7 +143,6 @@ export const inventorySnapshotOfADate = onRequest(
 
               if (productDoc.exists) {
                 const variants: { id: number; price: number }[] = productDoc.data()?.variants ?? [];
-
                 const matchedVariant = variants.find((v) => v.id === targetVariant.variantId);
                 price = matchedVariant?.price ?? null;
               }
@@ -57,13 +160,17 @@ export const inventorySnapshotOfADate = onRequest(
             blockedStock: data?.exactDocState?.inventory?.blockedStock ?? null,
             variantSku,
             price,
-          };
+          } satisfies SnapshotRow;
         }),
       );
 
       result.sort((a, b) => a.productSku.localeCompare(b.productSku));
 
-      res.status(200).json({ result });
+      // ── 4. Build Excel & upload ──────────────────────────────────────────
+      const buffer = await buildExcelBuffer(result, date);
+      const downloadUrl = await uploadToStorage(buffer, businessId, date);
+
+      res.status(200).json({ downloadUrl });
     } catch (error) {
       console.error("Error fetching inventory snapshots:", error);
       res.status(500).json({ error: "Internal server error" });

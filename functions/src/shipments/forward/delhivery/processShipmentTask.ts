@@ -210,6 +210,34 @@ export const processShipmentTask = onRequest(
         return;
       }
 
+      // Check if order is not not picked up yet
+      if (!order?.pickupReady) {
+        const failure = await handleJobFailure({
+          businessId,
+          shop,
+          batchRef,
+          jobRef,
+          jobId,
+          errorCode: "ORDER_NOT_PICKED_UP_YET",
+          errorMessage: `Order is not picked up from the warehouse yet, pick the order items first.`,
+          isRetryable: false,
+        });
+
+        if (failure.shouldReturnFailure) {
+          res.status(failure.statusCode).json({
+            ok: false,
+            reason: failure.reason,
+            code: "ORDER_NOT_PICKED_UP_YET",
+          });
+        } else {
+          res.status(failure.statusCode).json({
+            ok: true,
+            action: failure.reason,
+          });
+        }
+        return;
+      }
+
       // Allocate AWB
       awb = await allocateAwb(businessId);
 

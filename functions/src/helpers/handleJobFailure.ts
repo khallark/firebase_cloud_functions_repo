@@ -59,6 +59,7 @@ export async function handleJobFailure(params: {
     const isExceptionError =
       errorCode === "INSUFFICIENT_BALANCE" ||
       errorCode === "ORDER_ALREADY_SHIPPED" ||
+      errorCode === "ORDER_NOT_PICKED_UP_YET" ||
       errorCode === "NOT_AUTHORIZED_TO_PROCESS_THIS_ORDER" ||
       errorCode === "ORDER_NOT_FOUND" ||
       errorCode === "COURIER_SELECTION_FAILED";

@@ -1,9 +1,16 @@
 // import { QueryDocumentSnapshot } from "firebase-admin/firestore";
 import { db } from "../firebaseAdmin";
-import { ENQUEUE_FUNCTION_SECRET, SHARED_STORE_ID, SHARED_STORE_ID_2 } from "../config";
+import { SHARED_STORE_ID, SHARED_STORE_ID_2 } from "../config";
 import { onRequest } from "firebase-functions/v2/https";
+import { QueryDocumentSnapshot, Timestamp } from "firebase-admin/firestore";
 // import { requireHeaderSecret, sleep } from "../helpers";
 // import { MigrationStats } from "./commons";
+
+interface StatusLog {
+  status: string;
+  createdAt: Timestamp;
+  [key: string]: unknown;
+}
 
 // async function migrateCancelledOrders(accountId: string): Promise<{
 //   scanned: number;
@@ -77,35 +84,71 @@ export const migrateCancelledOrdersStatus = onRequest(
     cors: true,
     timeoutSeconds: 540,
     memory: "1GiB",
-    secrets: [ENQUEUE_FUNCTION_SECRET],
   },
   async (req, res) => {
     try {
-      console.log(req);
-      const store1snapshot = await db
-        .collection(`accounts/${SHARED_STORE_ID}/orders`)
-        .where("customStatus", "==", "Cancelled")
-        .where("pickupReady", "==", true)
-        .get();
+      const [store1snapshot, store2snapshot] = await Promise.all([
+        db
+          .collection(`accounts/${SHARED_STORE_ID}/orders`)
+          .where("customStatus", "==", "Cancelled")
+          .get(),
+        db
+          .collection(`accounts/${SHARED_STORE_ID_2}/orders`)
+          .where("customStatus", "==", "Cancelled")
+          .get(),
+      ]);
 
-      console.log(`orders for ${SHARED_STORE_ID}:`);
-      for (const doc of store1snapshot.docs) {
-        console.log(doc.data()?.orderId || "N/A");
-      }
+      const batch = db.batch();
+      const ordersWithNoLog: { name: string; storeId: string }[] = [];
+      let batchCount = 0;
+      const batches = [batch];
 
-      const store2snapshot = await db
-        .collection(`accounts/${SHARED_STORE_ID_2}/orders`)
-        .where("customStatus", "==", "Cancelled")
-        .where("pickupReady", "==", true)
-        .get();
+      const processDoc = (
+        doc: QueryDocumentSnapshot,
+        storeId: string
+      ) => {
+        const data = doc.data();
 
-      console.log(`orders for ${SHARED_STORE_ID_2}:`);
-      for (const doc of store2snapshot.docs) {
-        console.log(doc.data()?.orderId || "N/A");
+        // Already has lastStatusUpdate, nothing to do
+        if (data.lastStatusUpdate) return;
+
+        const logs: StatusLog[] = data.customStatusesLogs ?? [];
+        const cancelledLog = logs.find((log) => log.status === "Cancelled");
+
+        if (!cancelledLog) {
+          // No cancelled log found — collect for reporting
+          ordersWithNoLog.push({
+            name: data.name ?? doc.id,
+            storeId,
+          });
+          return;
+        }
+
+        // Firestore batch has a 500 op limit — create new batch if needed
+        if (batchCount > 0 && batchCount % 499 === 0) {
+          batches.push(db.batch());
+        }
+
+        const currentBatch = batches[batches.length - 1];
+        currentBatch.update(doc.ref, {
+          lastStatusUpdate: cancelledLog.createdAt,
+        });
+        batchCount++;
+      };
+
+      for (const doc of store1snapshot.docs) processDoc(doc, SHARED_STORE_ID);
+      for (const doc of store2snapshot.docs) processDoc(doc, SHARED_STORE_ID_2);
+
+      // Commit all batches sequentially
+      for (const b of batches) {
+        await b.commit();
       }
 
       res.status(200).json({
         success: true,
+        updatedCount: batchCount,
+        ordersWithNoCancelledLog: ordersWithNoLog,
+        noLogCount: ordersWithNoLog.length,
       });
     } catch (error: any) {
       console.error("Error:", error.message);
@@ -115,100 +158,5 @@ export const migrateCancelledOrdersStatus = onRequest(
         error: error.message,
       });
     }
-    // try {
-    //   console.log(req);
-    //   const productsColl = await db.collection("users/2yEGCC8AffNxDoTZEqhAkCRgxNl2/products").get();
-    //   let resp: any;
-    //   for (const doc of productsColl.docs) {
-    //     const coll = await db
-    //       .collection("users/2yEGCC8AffNxDoTZEqhAkCRgxNl2/upcs")
-    //       .where("productId", "==", doc.data()?.sku)
-    //       .get();
-    //     if (Number(doc.data().inventory.inwardAddition) !== coll.docs.length) {
-    //       resp = {
-    //         ...resp,
-    //         [doc.data()?.sku]: Number(doc.data().inventory.inwardAddition) - coll.docs.length,
-    //       };
-    //     }
-    //   }
-    //   // console.log(coll.docs.length);
-    //   res.status(200).json(resp);
-    // } catch (error: any) {
-    //   console.error(error.message);
-    //   res.status(200).json({
-    //     success: false,
-    //   });
-    // }
-    // try {
-    //   // Add secret protection
-    //   requireHeaderSecret(req, "x-api-key", ENQUEUE_FUNCTION_SECRET.value() || "");
-
-    //   console.log("🚀 Starting Cancelled Orders Status Migration...\n");
-
-    //   const stats: MigrationStats = {
-    //     accountsProcessed: 0,
-    //     ordersScanned: 0,
-    //     ordersUpdated: 0,
-    //     ordersSkipped: 0,
-    //     errors: 0,
-    //   };
-
-    //   try {
-    //     // Get all accounts
-    //     const accountsSnapshot = await db.collection("accounts").get();
-    //     console.log(`Found ${accountsSnapshot.size} accounts to process\n`);
-
-    //     // Process each account
-    //     for (const accountDoc of accountsSnapshot.docs) {
-    //       const accountId = accountDoc.id;
-    //       console.log(`\n📦 Processing account: ${accountId}`);
-
-    //       try {
-    //         const accountStats = await migrateCancelledOrders(accountId);
-    //         stats.accountsProcessed++;
-    //         stats.ordersScanned += accountStats.scanned;
-    //         stats.ordersUpdated += accountStats.updated;
-    //         stats.ordersSkipped += accountStats.skipped;
-
-    //         console.log(
-    //           `  ✅ Account completed: ${accountStats.updated} updated, ${accountStats.skipped} skipped`,
-    //         );
-    //       } catch (error) {
-    //         stats.errors++;
-    //         console.error(`  ❌ Error processing account ${accountId}:`, error);
-    //       }
-
-    //       // Small delay between accounts to avoid rate limits
-    //       await sleep(100);
-    //     }
-
-    //     // Print final summary
-    //     console.log("\n" + "=".repeat(60));
-    //     console.log("📊 MIGRATION SUMMARY");
-    //     console.log("=".repeat(60));
-    //     console.log(`Accounts processed: ${stats.accountsProcessed}`);
-    //     console.log(`Orders scanned:     ${stats.ordersScanned}`);
-    //     console.log(`Orders updated:     ${stats.ordersUpdated}`);
-    //     console.log(`Orders skipped:     ${stats.ordersSkipped}`);
-    //     console.log(`Errors:             ${stats.errors}`);
-    //     console.log("=".repeat(60));
-    //     console.log("✨ Migration completed!\n");
-
-    //     res.json({
-    //       success: true,
-    //       summary: stats,
-    //       message: "Cancelled orders migration completed successfully",
-    //     });
-    //   } catch (error) {
-    //     console.error("\n❌ Migration failed:", error);
-    //     res.status(500).json({
-    //       success: false,
-    //       error: error instanceof Error ? error.message : String(error),
-    //       stats,
-    //     });
-    //   }
-    // } catch (authError) {
-    //   res.status(401).json({ error: `Unauthorized ${authError}` });
-    // }
-  },
+  }
 );

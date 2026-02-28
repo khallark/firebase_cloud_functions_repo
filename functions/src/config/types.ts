@@ -180,7 +180,7 @@ export type UPC =
       orderId: string | null;
 
       grnRef: string | null;
-      
+
       putAway: "none" | "outbound" | null;
 
       productId: string;

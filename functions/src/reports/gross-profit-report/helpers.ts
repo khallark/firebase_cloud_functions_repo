@@ -1,0 +1,349 @@
+// ─── Types ────────────────────────────────────────────────────────────────────
+
+import { Timestamp } from "firebase-admin/firestore";
+import { db, storage } from "../../firebaseAdmin";
+import ExcelJS from "exceljs";
+import { randomUUID } from "crypto";
+
+export interface MetricRow {
+  type: string;
+  qty: number;
+  taxable: number;
+  igst: number;
+  cgst: number;
+  sgst: number;
+  net: number;
+}
+
+// ─── Tax Helpers ──────────────────────────────────────────────────────────────
+
+const TAX_RATE = 0.05;
+
+/**
+ * Reverse-calculates taxable amount and splits tax into IGST or CGST/SGST
+ * depending on whether the state is Punjab.
+ */
+function reverseCalculateTax(
+  netAmount: number,
+  isPunjab: boolean,
+): { taxable: number; igst: number; cgst: number; sgst: number } {
+  const taxable = netAmount / (1 + TAX_RATE);
+  const totalTax = netAmount - taxable;
+  return {
+    taxable: round2(taxable),
+    igst: isPunjab ? 0 : round2(totalTax),
+    cgst: isPunjab ? round2(totalTax / 2) : 0,
+    sgst: isPunjab ? round2(totalTax / 2) : 0,
+  };
+}
+
+function round2(n: number): number {
+  return Math.round(n * 100) / 100;
+}
+
+// ─── Metric Calculators ───────────────────────────────────────────────────────
+
+/**
+ * Calculates Sale (or Sale Return) metric across all stores.
+ * If `isReturn` is true, applies the customStatus filter for returns.
+ */
+export async function calcSaleMetric(
+  storeIds: string[],
+  formattedStartDate: string,
+  formattedEndDate: string,
+  isReturn: boolean,
+): Promise<MetricRow> {
+  let totalQty = 0;
+  let totalNet = 0;
+  let totalTaxable = 0;
+  let totalIgst = 0;
+  let totalCgst = 0;
+  let totalSgst = 0;
+
+  const RETURN_STATUSES = [
+    "RTO Closed",
+    "RTO Processed",
+    "Pending Refunds",
+    "DTO Refunded",
+    "Lost",
+    "Cancellation Requested",
+    "Cancelled",
+  ];
+
+  const startTs = Timestamp.fromDate(new Date(formattedStartDate));
+  const endTs = Timestamp.fromDate(new Date(formattedEndDate));
+
+  for (const storeId of storeIds) {
+    const baseQuery = db.collection("accounts").doc(storeId).collection("orders");
+
+    const query = isReturn
+      ? baseQuery
+        .where("lastStatusUpdate", ">=", startTs)
+        .where("lastStatusUpdate", "<=", endTs)
+        .where("customStatus", "in", RETURN_STATUSES)
+      : baseQuery
+        .where("createdAt", ">=", formattedStartDate)
+        .where("createdAt", "<=", formattedEndDate)
+
+    const snapshot = await query.get();
+
+    const a: Record<string, string[]> = {};
+    for (const doc of snapshot.docs) {
+      const order = doc.data();
+      // in-memory vendor exclusion (replaces the not-in Firestore filter)
+      const vendors: string[] = order.vendors ?? [];
+      if (
+        vendors.length === 1 &&
+        (vendors.includes("ENDORA") || vendors.includes("STYLE 05"))
+      ) continue;
+      if (!a[order.customStatus]) a[order.customStatus] = [];
+      a[order.customStatus].push(order.name);
+      const netPrice = Number(order?.raw?.total_price ?? 0);
+      const isPunjab = order?.raw?.shipping_address?.province === "Punjab";
+
+      const tax = reverseCalculateTax(netPrice, isPunjab);
+
+      totalQty += order?.raw?.line_items?.length ?? 1;
+      totalNet += netPrice;
+      totalTaxable += tax.taxable;
+      totalIgst += tax.igst;
+      totalCgst += tax.cgst;
+      totalSgst += tax.sgst;
+    }
+    if (isReturn) {
+      for (const [status, names] of Object.entries(a)) {
+        console.log(status, ":", names.join(","));
+      }
+    }
+  }
+
+  // Sale Return values are stored as negatives in the report
+  const sign = isReturn ? -1 : 1;
+  return {
+    type: isReturn ? "Sale Return" : "Sale",
+    qty: sign * totalQty,
+    taxable: round2(sign * totalTaxable),
+    igst: round2(sign * totalIgst),
+    cgst: round2(sign * totalCgst),
+    sgst: round2(sign * totalSgst),
+    net: round2(sign * totalNet),
+  };
+}
+
+/**
+ * Calculates Purchase metric from GRNs (all assumed Punjab).
+ */
+export async function calcPurchaseMetric(
+  businessId: string,
+  startDate: string,
+  endDate: string,
+): Promise<MetricRow> {
+  const startTs = Timestamp.fromDate(new Date(`${startDate}T00:00:00+05:30`));
+  const endTs = Timestamp.fromDate(new Date(`${endDate}T23:59:59+05:30`));
+
+  const snapshot = await db
+    .collection("users")
+    .doc(businessId)
+    .collection("grns")
+    .where("createdAt", ">=", startTs)
+    .where("createdAt", "<=", endTs)
+    .get();
+
+  let totalQty = 0;
+  let totalNet = 0;
+
+  for (const doc of snapshot.docs) {
+    const grn = doc.data();
+    totalQty += Number(grn.totalReceivedQty ?? 0);
+    totalNet += Number(grn.totalReceivedValue ?? 0);
+  }
+
+  // Purchase is Punjab and stored as negative
+  const tax = reverseCalculateTax(totalNet, true);
+  return {
+    type: "Purchase",
+    qty: -totalQty,
+    taxable: round2(-tax.taxable),
+    igst: 0,
+    cgst: round2(-tax.cgst),
+    sgst: round2(-tax.sgst),
+    net: round2(-totalNet),
+  };
+}
+
+/**
+ * Calculates Opening or Closing Stock from inventory snapshots (all Punjab).
+ * For Opening Stock → use (startDate - 1 day).
+ * For Closing Stock → use endDate.
+ */
+export async function calcStockMetric(
+  businessId: string,
+  date: string,
+  isOpening: boolean,
+): Promise<MetricRow> {
+  let snapshotDate = date;
+
+  if (isOpening) {
+    const d = new Date(`${date}T00:00:00`);
+    d.setDate(d.getDate() - 1);
+    snapshotDate = d.toISOString().split("T")[0];
+  }
+
+  const snapshot = await db
+    .collection("users")
+    .doc(businessId)
+    .collection("inventory_snapshots")
+    .where("date", "==", snapshotDate)
+    .get();
+
+  let totalQty = 0;
+  for (const doc of snapshot.docs) {
+    totalQty +=
+      Number(doc.data().stockLevel ?? 0) -
+      Number(doc.data().exactDocState.inventory.blockedStock ?? 0);
+  }
+
+  const ASSUMED_COGS = 762;
+  const totalNet = totalQty * ASSUMED_COGS;
+  const tax = reverseCalculateTax(totalNet, true);
+
+  // Opening Stock is negative, Closing Stock is positive
+  const sign = isOpening ? -1 : 1;
+  return {
+    type: isOpening ? "Opening Stock" : "Closing Stock",
+    qty: sign * totalQty,
+    taxable: round2(sign * tax.taxable),
+    igst: 0,
+    cgst: round2(sign * tax.cgst),
+    sgst: round2(sign * tax.sgst),
+    net: round2(sign * totalNet),
+  };
+}
+
+/**
+ * Calculates Gross Profit row: Sale + SaleReturn + Purchase + OpeningStock + ClosingStock
+ * (signs are already applied, so it's a straight sum).
+ */
+export function calcGrossProfit(rows: MetricRow[]): MetricRow {
+  const sum = (key: keyof MetricRow) =>
+    round2(rows.reduce((acc, r) => acc + (r[key] as number), 0));
+
+  return {
+    type: "Gross Profit",
+    qty: sum("qty"),
+    taxable: sum("taxable"),
+    igst: sum("igst"),
+    cgst: sum("cgst"),
+    sgst: sum("sgst"),
+    net: sum("net"),
+  };
+}
+
+// ─── Excel Builder ────────────────────────────────────────────────────────────
+
+export function buildExcel(rows: MetricRow[]): ExcelJS.Workbook {
+  const workbook = new ExcelJS.Workbook();
+  workbook.creator = "Majime";
+  workbook.created = new Date();
+
+  const ws = workbook.addWorksheet("Gross Profit Report");
+
+  // Column definitions
+  ws.columns = [
+    { header: "Type", key: "type", width: 18 },
+    { header: "Qty", key: "qty", width: 12 },
+    { header: "Taxable Amount", key: "taxable", width: 18 },
+    { header: "IGST", key: "igst", width: 14 },
+    { header: "CGST", key: "cgst", width: 14 },
+    { header: "SGST", key: "sgst", width: 14 },
+    { header: "Net Amount", key: "net", width: 16 },
+  ];
+
+  // Style header row
+  const headerRow = ws.getRow(1);
+  headerRow.font = { bold: true, name: "Arial", size: 11 };
+  headerRow.fill = {
+    type: "pattern",
+    pattern: "solid",
+    fgColor: { argb: "FFD9E1F2" },
+  };
+  headerRow.alignment = { horizontal: "center", vertical: "middle" };
+  headerRow.height = 20;
+
+  const numFmt = '#,##0.00;(#,##0.00);"-"';
+
+  // Data rows
+  for (const row of rows) {
+    const excelRow = ws.addRow([
+      row.type,
+      row.qty,
+      row.taxable,
+      row.igst,
+      row.cgst,
+      row.sgst,
+      row.net,
+    ]);
+
+    excelRow.font = { name: "Arial", size: 10 };
+    excelRow.alignment = { vertical: "middle" };
+
+    // Apply number format to numeric columns (B–G)
+    for (let col = 2; col <= 7; col++) {
+      excelRow.getCell(col).numFmt = numFmt;
+    }
+
+    // Highlight Gross Profit row
+    if (row.type === "Gross Profit") {
+      excelRow.font = { name: "Arial", size: 10, bold: true };
+      excelRow.fill = {
+        type: "pattern",
+        pattern: "solid",
+        fgColor: { argb: "FFE2EFDA" },
+      };
+    }
+  }
+
+  // Borders on all cells
+  const totalRows = ws.rowCount;
+  for (let r = 1; r <= totalRows; r++) {
+    for (let c = 1; c <= 7; c++) {
+      ws.getRow(r).getCell(c).border = {
+        top: { style: "thin" },
+        left: { style: "thin" },
+        bottom: { style: "thin" },
+        right: { style: "thin" },
+      };
+    }
+  }
+
+  return workbook;
+}
+
+// ─── Storage Upload ───────────────────────────────────────────────────────────
+
+export async function uploadToStorage(
+  workbook: ExcelJS.Workbook,
+  businessId: string,
+  startDate: string,
+  endDate: string,
+): Promise<string> {
+  const uniqueSuffix = `${Date.now()}_${randomUUID()}`;
+
+  const filename = `gross_profit_${startDate}_to_${endDate}_${uniqueSuffix}.xlsx`;
+  const storagePath = `gross_profit_reports/${businessId}/${filename}`;
+
+  const buffer = await workbook.xlsx.writeBuffer();
+
+  const bucket = storage.bucket();
+  const file = bucket.file(storagePath);
+
+  await file.save(Buffer.from(buffer), {
+    metadata: {
+      contentType: "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+    },
+  });
+
+  await file.makePublic();
+
+  return `https://storage.googleapis.com/${bucket.name}/${storagePath}`;
+}

@@ -1,18 +1,17 @@
 import { onRequest } from "firebase-functions/v2/https";
 import { ENQUEUE_FUNCTION_SECRET } from "../../config";
 import { requireHeaderSecret } from "../../helpers";
-import { sendSharedStoreOrdersExcelWhatsAppMessage } from "../../services";
+// import { sendSharedStoreOrdersExcelWhatsAppMessage } from "../../services";
 import ExcelJS from "exceljs";
 import { db, storage } from "../../firebaseAdmin";
+import { SHARED_STORE_IDS } from "../../config";
 
-const SHARED_STORE_ID = "nfkjgp-sv.myshopify.com";
-
-interface GenerateExcelPayload {
-  phoneNumbers?: string[];
-}
+// interface GenerateExcelPayload {
+//   phoneNumbers?: string[];
+// }
 
 /**
- * Generates Excel file of all orders from shared store and sends download link
+ * Generates Excel file of all orders from shared stores and sends download link
  */
 export const generateSharedStoreOrdersExcel = onRequest(
   {
@@ -31,62 +30,88 @@ export const generateSharedStoreOrdersExcel = onRequest(
         return;
       }
 
-      const { phoneNumbers = ["8950188819", "9132326000", "9779752241"] } = (req.body ||
-        {}) as GenerateExcelPayload;
+      // const { phoneNumbers = ["8950188819", "9132326000", "9779752241"] } = (req.body ||
+        // {}) as GenerateExcelPayload;
 
-      console.log("🚀 Starting Excel generation for shared store...");
-      console.log(`📱 Will send to: ${phoneNumbers.join(", ")}`);
+      console.log("🚀 Starting Excel generation for shared stores...");
+      console.log(`🏪 Stores: ${SHARED_STORE_IDS.join(", ")}`);
+      // console.log(`📱 Will send to: ${phoneNumbers.join(", ")}`);
 
-      // Get shared store data
-      const shopDoc = await db.collection("accounts").doc(SHARED_STORE_ID).get();
-      if (!shopDoc.exists) {
-        res.status(404).json({ error: "shared_store_not_found" });
+      // Fetch shop docs and orders from all shared stores in parallel
+      const storeResults = await Promise.all(
+        SHARED_STORE_IDS.map(async (storeId) => {
+          const [shopDoc, ordersSnapshot] = await Promise.all([
+            db.collection("accounts").doc(storeId).get(),
+            db.collection("accounts").doc(storeId).collection("orders").get(),
+          ]);
+
+          if (!shopDoc.exists) {
+            console.warn(`⚠️ Store not found: ${storeId}, skipping...`);
+            return { storeId, shopData: null, orders: [] };
+          }
+
+          console.log(`✅ Store ${storeId}: fetched ${ordersSnapshot.size} orders`);
+          return {
+            storeId,
+            shopData: shopDoc.data() as any,
+            orders: ordersSnapshot.docs,
+          };
+        }),
+      );
+
+      // Use the first valid store's shopData for the WhatsApp message
+      const primaryShopData = storeResults.find((r) => r.shopData !== null)?.shopData;
+      if (!primaryShopData) {
+        res.status(404).json({ error: "no_valid_stores_found" });
         return;
       }
 
-      const shopData = shopDoc.data() as any;
-
-      // Fetch all orders from shared store
-      console.log("📦 Fetching orders from shared store...");
-      const ordersSnapshot = await db
-        .collection("accounts")
-        .doc(SHARED_STORE_ID)
-        .collection("orders")
-        .get();
-
-      if (ordersSnapshot.empty) {
+      const totalOrderCount = storeResults.reduce((sum, r) => sum + r.orders.length, 0);
+      if (totalOrderCount === 0) {
         res.status(400).json({ error: "no_orders_found" });
         return;
       }
 
-      console.log(`Found ${ordersSnapshot.size} orders`);
+      console.log(`📦 Total orders across all stores: ${totalOrderCount}`);
 
-      // Process orders into Excel rows
+      // Helper functions
+      const formatDate = (timestamp: any) => {
+        if (!timestamp) return "N/A";
+        const date = timestamp.toDate ? timestamp.toDate() : new Date(timestamp);
+        return date.toLocaleDateString("en-GB");
+      };
+
+      const formatAddress = (address: any) => {
+        if (!address) return "N/A";
+        const parts = [
+          address.address1,
+          address.address2,
+          address.city,
+          address.province,
+          address.zip,
+          address.country,
+        ].filter(Boolean);
+        return parts.join(", ") || "N/A";
+      };
+
+      const getTimestamp = (timestamp: any): number => {
+        if (!timestamp) return 0;
+        if (timestamp.toDate) return timestamp.toDate().getTime();
+        return new Date(timestamp).getTime();
+      };
+
+      // Collect all orders across stores with their storeId, then sort by createdAt
+      const allOrders = storeResults
+        .flatMap(({ storeId, orders }) =>
+          orders.map((doc) => ({ storeId, order: doc.data() })),
+        )
+        .sort((a, b) => getTimestamp(a.order.createdAt) - getTimestamp(b.order.createdAt));
+
+      // Process sorted orders into Excel rows
       const excelData: any[] = [];
 
-      ordersSnapshot.docs.forEach((doc) => {
-        const order = doc.data();
+      allOrders.forEach(({ storeId, order }) => {
         const items = order.raw?.line_items || [];
-
-        // Helper functions
-        const formatDate = (timestamp: any) => {
-          if (!timestamp) return "N/A";
-          const date = timestamp.toDate ? timestamp.toDate() : new Date(timestamp);
-          return date.toLocaleDateString("en-GB");
-        };
-
-        const formatAddress = (address: any) => {
-          if (!address) return "N/A";
-          const parts = [
-            address.address1,
-            address.address2,
-            address.city,
-            address.province,
-            address.zip,
-            address.country,
-          ].filter(Boolean);
-          return parts.join(", ") || "N/A";
-        };
 
         const customerName =
           order.raw.customer?.first_name && order.raw.customer?.last_name
@@ -94,23 +119,18 @@ export const generateSharedStoreOrdersExcel = onRequest(
             : order.raw.billing_address?.name || order.raw.shipping_address?.name || "N/A";
 
         const paymentStatus = order.raw.financial_status;
-
         const payment_gateway_names: string[] = order.raw.payment_gateway_names;
 
-        // Calculate total order value for proportional distribution
         const orderTotal =
           Number(order.raw.current_subtotal_price || order.raw.subtotal_price) ||
           items.reduce((sum: number, item: any) => {
             return sum + Number(item.price) * Number(item.quantity);
           }, 0);
 
-        // Create a row for each line item
         items.forEach((item: any) => {
-          // Calculate proportional share for this item
           const itemTotal = Number(item.price) * Number(item.quantity);
           const proportion = orderTotal > 0 ? itemTotal / orderTotal : 0;
 
-          // Calculate proportional refunded amount
           const refundedAmount = order?.refundedAmount;
           let itemRefundedAmount: string | number = "Not refunded";
 
@@ -122,6 +142,7 @@ export const generateSharedStoreOrdersExcel = onRequest(
           }
 
           excelData.push({
+            "Store ID": storeId,
             "Order name": order.name,
             "Order date": formatDate(order.createdAt),
             Status: String(order.customStatus).toUpperCase(),
@@ -143,9 +164,7 @@ export const generateSharedStoreOrdersExcel = onRequest(
             "Item Price": Number(item.price).toFixed(),
             "Total Order Price": Number(order.raw.total_price).toFixed(2),
             "Total Discount": Number(order.raw.total_discounts || 0).toFixed(2),
-            "Proportionate Discount": Number(item.discount_allocations?.[0]?.amount || 0).toFixed(
-              2,
-            ),
+            "Proportionate Discount": Number(item.discount_allocations?.[0]?.amount || 0).toFixed(2),
             "Credits Used": payment_gateway_names.includes("shopify_store_credit")
               ? (Number(order.raw.total_price) - Number(order.raw.total_outstanding)).toFixed(2)
               : 0,
@@ -171,11 +190,9 @@ export const generateSharedStoreOrdersExcel = onRequest(
       const workbook = new ExcelJS.Workbook();
       const worksheet = workbook.addWorksheet("Orders");
 
-      // Define columns from the first data row
       if (excelData.length > 0) {
         const headers = Object.keys(excelData[0]);
 
-        // Set up columns with headers
         worksheet.columns = headers.map((header) => ({
           header: header,
           key: header,
@@ -188,15 +205,12 @@ export const generateSharedStoreOrdersExcel = onRequest(
           ),
         }));
 
-        // Make header row bold
         worksheet.getRow(1).font = { bold: true };
 
-        // Add all data rows
         excelData.forEach((row) => {
           worksheet.addRow(row);
         });
 
-        // Apply borders to all cells
         worksheet.eachRow((row) => {
           row.eachCell((cell) => {
             cell.border = {
@@ -208,66 +222,61 @@ export const generateSharedStoreOrdersExcel = onRequest(
           });
         });
 
-        // Freeze the header row
         worksheet.views = [{ state: "frozen", ySplit: 1 }];
       }
 
       // Upload to Firebase Storage
       const date = new Date().toLocaleDateString("en-GB").replace(/\//g, "-");
-      const uniqueId = Date.now(); // Timestamp-based unique ID
+      const uniqueId = Date.now();
       const fileName = `Shared_Store_Orders_${date}_${uniqueId}.xlsx`;
       const filePath = `shared_store_orders/${fileName}`;
 
       const bucket = storage.bucket();
       const file = bucket.file(filePath);
 
-      // Create write stream
       const writeStream = file.createWriteStream({
         metadata: {
           contentType: "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
           metadata: {
             generatedAt: new Date().toISOString(),
-            shop: SHARED_STORE_ID,
-            totalOrders: ordersSnapshot.size,
+            stores: SHARED_STORE_IDS.join(","),
+            totalOrders: totalOrderCount,
             totalRows: excelData.length,
           },
         },
       });
 
-      // Write Excel directly to stream
       await workbook.xlsx.write(writeStream);
 
-      // Wait for stream to finish
       await new Promise((resolve, reject) => {
         writeStream.on("finish", resolve);
         writeStream.on("error", reject);
       });
 
-      // Make the file publicly accessible and get download URL
       await file.makePublic();
       const downloadUrl = `https://storage.googleapis.com/${bucket.name}/${filePath}`;
 
       console.log(`✅ Excel file generated successfully`);
-      console.log(`📊 Total Orders: ${ordersSnapshot.size}, Total Rows: ${excelData.length}`);
+      console.log(`📊 Total Orders: ${totalOrderCount}, Total Rows: ${excelData.length}`);
       console.log(`📄 Download URL: ${downloadUrl}`);
 
-      // Send WhatsApp messages to all phone numbers
-      const messagePromises = phoneNumbers.map((phone) =>
-        sendSharedStoreOrdersExcelWhatsAppMessage(shopData, downloadUrl, phone),
-      );
+      // const messagePromises = phoneNumbers.map((phone) =>
+        // sendSharedStoreOrdersExcelWhatsAppMessage(primaryShopData, downloadUrl, phone),
+      // );
 
-      await Promise.allSettled(messagePromises);
+      // await Promise.allSettled(messagePromises);
 
-      console.log(`📱 WhatsApp messages sent to ${phoneNumbers.length} numbers`);
+      // console.log(`📱 WhatsApp messages sent to ${phoneNumbers.length} numbers`);
 
       res.json({
         success: true,
         message: "Excel generated and sent successfully",
         downloadUrl,
         stats: {
-          totalOrders: ordersSnapshot.size,
+          totalOrders: totalOrderCount,
           totalRows: excelData.length,
-          sentTo: phoneNumbers,
+          // sentTo: phoneNumbers,
+          stores: SHARED_STORE_IDS,
         },
       });
     } catch (error) {

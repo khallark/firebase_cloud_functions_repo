@@ -257,6 +257,7 @@ function prepareBlueDartOrderUpdates(orders: any[], shipments: any[]): OrderUpda
     //                                ScanGroupType
     //
     const rawStatusType = shipment.StatusType; // e.g. "PU"
+    // const rawScanType = shipment.Status;
     // ---------------------------------------------------------------------
 
     // ---------------------------------------------------------------------
@@ -269,7 +270,7 @@ function prepareBlueDartOrderUpdates(orders: any[], shipments: any[]): OrderUpda
     //   IT  → "In Transit"                 (in transit toward destination)
     //   OD  → "Out For Delivery"           (last-mile out for delivery)
     //   DL  → "Delivered"                  (delivered to consignee)
-    //   RTO → "RTO In Transit"             (return to origin — in transit)
+    //   RT → "RTO In Transit"             (return to origin — in transit)
     //         or "RTO Delivered"           (returned to origin — delivered)
     //   LS  → "Lost"                       (shipment marked lost)
     //

@@ -447,7 +447,7 @@ export const onShelfWritten = onDocumentWritten(
         if (!placements.empty) {
           console.warn(
             `Shelf ${shelfId} soft deleted with products on it. ` +
-            `This should be blocked at API level.`,
+              `This should be blocked at API level.`,
           );
         }
 
@@ -660,7 +660,7 @@ export const onRackWritten = onDocumentWritten(
         if (!shelves.empty) {
           console.warn(
             `Rack ${rackId} soft deleted with shelves on it. ` +
-            `This should be blocked at API level.`,
+              `This should be blocked at API level.`,
           );
         }
 
@@ -852,7 +852,7 @@ export const onZoneWritten = onDocumentWritten(
         if (!racks.empty) {
           console.warn(
             `Zone ${zoneId} soft deleted with racks in it. ` +
-            `This should be blocked at API level.`,
+              `This should be blocked at API level.`,
           );
         }
 
@@ -982,7 +982,7 @@ export const onWarehouseWritten = onDocumentWritten(
         if (!zones.empty) {
           console.warn(
             `Warehouse ${warehouseId} soft deleted with zones in it. ` +
-            `This should be blocked at API level.`,
+              `This should be blocked at API level.`,
           );
         }
       }

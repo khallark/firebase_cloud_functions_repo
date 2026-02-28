@@ -147,7 +147,9 @@ export const dailyInventorySnapshot = onSchedule(
 
         for (const productDoc of productsSnapshot.docs) {
           try {
-            await createInventorySnapshot(businessDoc.id, productDoc, variantSalesMap, today);
+            // if(productDoc.id === "ALPHAHUMANTSHIRT-S-CORE") {
+              await createInventorySnapshot(businessDoc.id, productDoc, variantSalesMap, today);
+            // }
           } catch (err) {
             console.error(`Snapshot failed for product ${productDoc.id}`, err);
           }
