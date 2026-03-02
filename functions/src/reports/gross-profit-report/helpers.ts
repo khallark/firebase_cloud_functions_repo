@@ -65,7 +65,7 @@ export async function calcSaleMetric(
     "RTO Processed",
     "Pending Refunds",
     "DTO Refunded",
-    "Lost",
+    // "Lost",
     "Cancellation Requested",
     "Cancelled",
   ];
@@ -78,12 +78,12 @@ export async function calcSaleMetric(
 
     const query = isReturn
       ? baseQuery
-        .where("lastStatusUpdate", ">=", startTs)
-        .where("lastStatusUpdate", "<=", endTs)
-        .where("customStatus", "in", RETURN_STATUSES)
+          .where("lastStatusUpdate", ">=", startTs)
+          .where("lastStatusUpdate", "<=", endTs)
+          .where("customStatus", "in", RETURN_STATUSES)
       : baseQuery
-        .where("createdAt", ">=", formattedStartDate)
-        .where("createdAt", "<=", formattedEndDate)
+          .where("createdAt", ">=", formattedStartDate)
+          .where("createdAt", "<=", formattedEndDate);
 
     const snapshot = await query.get();
 
@@ -92,18 +92,24 @@ export async function calcSaleMetric(
       const order = doc.data();
       // in-memory vendor exclusion (replaces the not-in Firestore filter)
       const vendors: string[] = order.vendors ?? [];
-      if (
-        vendors.length === 1 &&
-        (vendors.includes("ENDORA") || vendors.includes("STYLE 05"))
-      ) continue;
+      if (vendors.length === 1 && (vendors.includes("ENDORA") || vendors.includes("STYLE 05")))
+        continue;
       if (!a[order.customStatus]) a[order.customStatus] = [];
       a[order.customStatus].push(order.name);
       const netPrice = Number(order?.raw?.total_price ?? 0);
       const isPunjab = order?.raw?.shipping_address?.province === "Punjab";
 
       const tax = reverseCalculateTax(netPrice, isPunjab);
+      const numItems = ["Pending Refunds", "DTO Refunded"].includes(order.customStatus)
+        ? order?.raw?.line_items
+            ?.filter((item: any) => item?.qc_status === "QC Pass")
+            ?.reduce((sum: number, item: any) => sum + Number(item?.quantity ?? 0), 0)
+        : order?.raw?.line_items?.reduce(
+            (sum: number, item: any) => sum + Number(item?.quantity ?? 0),
+            0,
+          );
 
-      totalQty += order?.raw?.line_items?.length ?? 1;
+      totalQty += numItems;
       totalNet += netPrice;
       totalTaxable += tax.taxable;
       totalIgst += tax.igst;

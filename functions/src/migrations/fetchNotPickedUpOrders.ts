@@ -19,7 +19,23 @@ export const fetchNotPickedUpOrders = onRequest(
   async (req, res) => {
     try {
       const snapshots = await Promise.all(
-        STORE_IDS.map((storeId) => db.collection(`accounts/${storeId}/orders`).where("customStatus", "in", ["Dispatched", "In Transit", "Out For Delivery", "Delivered", "RTO In Transit", "RTO Delivered", "DTO Requested", "DTO Booked", "DTO In Transit", "DTO Delivered"]).get())
+        STORE_IDS.map((storeId) =>
+          db
+            .collection(`accounts/${storeId}/orders`)
+            .where("customStatus", "in", [
+              "Dispatched",
+              "In Transit",
+              "Out For Delivery",
+              "Delivered",
+              "RTO In Transit",
+              "RTO Delivered",
+              "DTO Requested",
+              "DTO Booked",
+              "DTO In Transit",
+              "DTO Delivered",
+            ])
+            .get(),
+        ),
       );
 
       const seenOrderIds = new Set<string>();
@@ -50,5 +66,5 @@ export const fetchNotPickedUpOrders = onRequest(
       console.error("Error fetching not-picked-up orders:", error);
       res.status(500).json({ error: "Internal server error" });
     }
-  }
+  },
 );

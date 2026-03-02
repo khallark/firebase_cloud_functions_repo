@@ -15,3 +15,4 @@ export * from "./initializeUpcLogsAndGrnField";
 export * from "./diffProductImages";
 export * from "./fetchNeverPickedUpRefundOrders";
 export * from "./fetchNotPickedUpOrders";
+export * from "./syncLastStatusUpdate";

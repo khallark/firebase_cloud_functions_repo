@@ -1,13 +1,11 @@
 import { onRequest } from "firebase-functions/https";
 import { db } from "../../firebaseAdmin";
 import {
-  buildExcel,
   calcGrossProfit,
   calcPurchaseMetric,
   calcSaleMetric,
   calcStockMetric,
   MetricRow,
-  uploadToStorage,
 } from "./helpers";
 import { Timestamp } from "firebase-admin/firestore";
 
@@ -82,33 +80,33 @@ export const grossProfitReport = onRequest(
       ];
 
       // ── 4. Build Excel ─────────────────────────────────────────────────────
-      const workbook = buildExcel(allRows);
+      // const workbook = buildExcel(allRows);
 
       // ── 5. Upload to Firebase Storage ──────────────────────────────────────
-      const downloadUrl = await uploadToStorage(workbook, businessId, startDate, endDate);
+      // const downloadUrl = await uploadToStorage(workbook, businessId, startDate, endDate);
 
-      const businessDocRef = db.collection('users').doc(businessId);
+      const businessDocRef = db.collection("users").doc(businessId);
 
       // ── 6. Write to Firestore (same pattern as generateTableData)
       await businessDocRef.update({
-        'grossProfitData.loading': false,
-        'grossProfitData.lastUpdated': Timestamp.now(),
-        'grossProfitData.startDate': startDate,
-        'grossProfitData.endDate': endDate,
-        'grossProfitData.rows': allRows,
-        'grossProfitData.downloadUrl': downloadUrl,
-        'grossProfitData.error': null,
+        "grossProfitData.loading": false,
+        "grossProfitData.lastUpdated": Timestamp.now(),
+        "grossProfitData.startDate": startDate,
+        "grossProfitData.endDate": endDate,
+        "grossProfitData.rows": allRows,
+        "grossProfitData.downloadUrl": null,
+        "grossProfitData.error": null,
       });
 
       res.status(200).json({ success: true });
     } catch (error: unknown) {
       const { businessId } = req.body as { businessId: string };
       console.error("[grossProfitReport] Unhandled error:", error);
-      const businessDocRef = db.collection('users').doc(businessId);
+      const businessDocRef = db.collection("users").doc(businessId);
       await businessDocRef.update({
-        'grossProfitData.loading': false,
-        'grossProfitData.error': error instanceof Error ? error.message : 'Unknown error',
-        'grossProfitData.lastUpdated': Timestamp.now(),
+        "grossProfitData.loading": false,
+        "grossProfitData.error": error instanceof Error ? error.message : "Unknown error",
+        "grossProfitData.lastUpdated": Timestamp.now(),
       });
       res.status(500).json({
         error: "Internal server error.",

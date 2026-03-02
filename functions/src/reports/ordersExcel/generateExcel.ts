@@ -31,7 +31,7 @@ export const generateSharedStoreOrdersExcel = onRequest(
       }
 
       // const { phoneNumbers = ["8950188819", "9132326000", "9779752241"] } = (req.body ||
-        // {}) as GenerateExcelPayload;
+      // {}) as GenerateExcelPayload;
 
       console.log("🚀 Starting Excel generation for shared stores...");
       console.log(`🏪 Stores: ${SHARED_STORE_IDS.join(", ")}`);
@@ -102,9 +102,7 @@ export const generateSharedStoreOrdersExcel = onRequest(
 
       // Collect all orders across stores with their storeId, then sort by createdAt
       const allOrders = storeResults
-        .flatMap(({ storeId, orders }) =>
-          orders.map((doc) => ({ storeId, order: doc.data() })),
-        )
+        .flatMap(({ storeId, orders }) => orders.map((doc) => ({ storeId, order: doc.data() })))
         .sort((a, b) => getTimestamp(a.order.createdAt) - getTimestamp(b.order.createdAt));
 
       // Process sorted orders into Excel rows
@@ -164,7 +162,9 @@ export const generateSharedStoreOrdersExcel = onRequest(
             "Item Price": Number(item.price).toFixed(),
             "Total Order Price": Number(order.raw.total_price).toFixed(2),
             "Total Discount": Number(order.raw.total_discounts || 0).toFixed(2),
-            "Proportionate Discount": Number(item.discount_allocations?.[0]?.amount || 0).toFixed(2),
+            "Proportionate Discount": Number(item.discount_allocations?.[0]?.amount || 0).toFixed(
+              2,
+            ),
             "Credits Used": payment_gateway_names.includes("shopify_store_credit")
               ? (Number(order.raw.total_price) - Number(order.raw.total_outstanding)).toFixed(2)
               : 0,
@@ -261,7 +261,7 @@ export const generateSharedStoreOrdersExcel = onRequest(
       console.log(`📄 Download URL: ${downloadUrl}`);
 
       // const messagePromises = phoneNumbers.map((phone) =>
-        // sendSharedStoreOrdersExcelWhatsAppMessage(primaryShopData, downloadUrl, phone),
+      // sendSharedStoreOrdersExcelWhatsAppMessage(primaryShopData, downloadUrl, phone),
       // );
 
       // await Promise.allSettled(messagePromises);

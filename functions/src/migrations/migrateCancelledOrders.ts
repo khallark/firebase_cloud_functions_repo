@@ -103,10 +103,7 @@ export const migrateCancelledOrdersStatus = onRequest(
       let batchCount = 0;
       const batches = [batch];
 
-      const processDoc = (
-        doc: QueryDocumentSnapshot,
-        storeId: string
-      ) => {
+      const processDoc = (doc: QueryDocumentSnapshot, storeId: string) => {
         const data = doc.data();
 
         // Already has lastStatusUpdate, nothing to do
@@ -158,5 +155,5 @@ export const migrateCancelledOrdersStatus = onRequest(
         error: error.message,
       });
     }
-  }
+  },
 );
