@@ -87,7 +87,7 @@ const DISPATCHED_STATUSES = [
   "DTO In Transit",
   "DTO Delivered",
 ];
-const END_STATUSES = ["RTO Processed", "RTO Closed", "Pending Refunds", "DTO Refunded"];
+const END_STATUSES = ["RTO Closed", "Pending Refunds", "DTO Refunded"];
 
 const mapToInventoryStatus = (customStatus: string | undefined): InventoryStatus => {
   if (!customStatus) return "Exception";
@@ -281,7 +281,6 @@ const updateBlockedStock = async (
 //   "DTO Refunded": 0,
 //   Lost: 0,
 //   Closed: 0,
-//   "RTO Processed": 0,
 //   "RTO Closed": 0,
 //   "Cancellation Requested": 0,
 //   Cancelled: 0,

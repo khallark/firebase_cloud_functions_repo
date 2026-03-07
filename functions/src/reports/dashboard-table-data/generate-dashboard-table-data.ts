@@ -11,10 +11,9 @@ const STATUS_CATEGORIES = {
   pendingDispatch: ["New", "Confirmed", "Ready To Dispatch"],
   returns: [
     "RTO Delivered",
-    "RTO Processed",
     "RTO Closed",
     "DTO Delivered",
-    "Pending Refund",
+    "Pending Refunds",
     "DTO Refunded",
     "Lost",
   ],

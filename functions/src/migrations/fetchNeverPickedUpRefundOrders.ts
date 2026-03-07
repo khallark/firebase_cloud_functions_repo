@@ -2,7 +2,7 @@ import { onRequest } from "firebase-functions/v2/https";
 import { db } from "../firebaseAdmin";
 import { SHARED_STORE_ID, SHARED_STORE_ID_2 } from "../config";
 
-const TARGET_STATUSES = ["Pending Refunds", "DTO Refunded", "RTO Processed", "RTO Closed"];
+const TARGET_STATUSES = ["Pending Refunds", "DTO Refunded", "RTO Closed"];
 const STORE_IDS = [SHARED_STORE_ID, SHARED_STORE_ID_2];
 
 interface LineItem {

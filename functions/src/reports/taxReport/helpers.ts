@@ -291,7 +291,6 @@ async function processSalesOrders(
           "Pending Refunds",
           "Lost",
           "Closed",
-          "RTO Processed",
           "RTO Closed",
         ]);
 

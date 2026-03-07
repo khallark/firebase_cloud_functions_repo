@@ -62,7 +62,6 @@ export async function calcSaleMetric(
 
   const RETURN_STATUSES = [
     "RTO Closed",
-    "RTO Processed",
     "Pending Refunds",
     "DTO Refunded",
     // "Lost",

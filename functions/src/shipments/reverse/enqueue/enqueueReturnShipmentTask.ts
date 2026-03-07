@@ -110,9 +110,9 @@ export const enqueueReturnShipmentTasks = onRequest(
       const writer = db.bulkWriter();
       const taskPromises: Promise<any>[] = [];
 
-      const taskUrl = process.env.RETURN_TASK_TARGET_URL_1;
+      const taskUrl = process.env.RETURN_TASK_TARGET_URL_2;
       if (!taskUrl) {
-        throw new Error("RETURN_TASK_TARGET_URL_1 not configured");
+        throw new Error("RETURN_TASK_TARGET_URL_2 not configured");
       }
 
       for (const o of orderIds) {

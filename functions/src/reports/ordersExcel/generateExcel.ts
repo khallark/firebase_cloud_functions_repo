@@ -1,6 +1,6 @@
 import { onRequest } from "firebase-functions/v2/https";
-import { ENQUEUE_FUNCTION_SECRET } from "../../config";
-import { requireHeaderSecret } from "../../helpers";
+// import { ENQUEUE_FUNCTION_SECRET } from "../../config";
+// import { requireHeaderSecret } from "../../helpers";
 // import { sendSharedStoreOrdersExcelWhatsAppMessage } from "../../services";
 import ExcelJS from "exceljs";
 import { db, storage } from "../../firebaseAdmin";
@@ -18,12 +18,12 @@ export const generateSharedStoreOrdersExcel = onRequest(
     cors: true,
     timeoutSeconds: 540,
     memory: "2GiB",
-    secrets: [ENQUEUE_FUNCTION_SECRET],
+    // secrets: [ENQUEUE_FUNCTION_SECRET],
   },
   async (req, res) => {
     try {
       // Validate secret
-      requireHeaderSecret(req, "x-api-key", ENQUEUE_FUNCTION_SECRET.value() || "");
+      // requireHeaderSecret(req, "x-api-key", ENQUEUE_FUNCTION_SECRET.value() || "");
 
       if (req.method !== "POST") {
         res.status(405).json({ error: "method_not_allowed" });
@@ -42,7 +42,7 @@ export const generateSharedStoreOrdersExcel = onRequest(
         SHARED_STORE_IDS.map(async (storeId) => {
           const [shopDoc, ordersSnapshot] = await Promise.all([
             db.collection("accounts").doc(storeId).get(),
-            db.collection("accounts").doc(storeId).collection("orders").get(),
+            db.collection("accounts").doc(storeId).collection("orders").where("vendors", "array-contains", "ENDORA").get(),
           ]);
 
           if (!shopDoc.exists) {

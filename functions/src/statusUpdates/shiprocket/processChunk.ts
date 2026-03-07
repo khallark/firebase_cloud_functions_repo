@@ -204,24 +204,6 @@ function prepareShiprocketOrderUpdates(orders: any[], trackingData: any): OrderU
 
     const newStatus = determineNewShiprocketStatus(currentStatus);
     if (!newStatus) continue;
-    if (order.customStatus === "RTO Processed") {
-      if (newStatus === "RTO Delivered") {
-        updates.push({
-          ref: order.ref,
-          data: {
-            customStatus: "RTO Closed",
-            lastStatusUpdate: FieldValue.serverTimestamp(),
-            customStatusesLogs: FieldValue.arrayUnion({
-              status: "RTO Closed",
-              createdAt: Timestamp.now(),
-              remarks:
-                "This order was finally updated by the courier to 'RTO Delivered', and was shifted from 'RTO Processed' to 'RTO Closed'.",
-            }),
-          },
-        });
-      }
-      continue;
-    }
     if (newStatus === order.customStatus) continue;
 
     updates.push({
