@@ -4,9 +4,18 @@ import { onSchedule } from "firebase-functions/v2/scheduler";
 import { FieldValue, Timestamp } from "firebase-admin/firestore";
 import { db } from "../../firebaseAdmin";
 import {
-  Lot, LotStage, Order, DraftLotInput, MaterialReservation,
-  RawMaterial, FinishedGood, LotStageHistory,
-  BOMEntry, StageName, MaterialTransaction, MaterialTransactionType,
+  Lot,
+  LotStage,
+  Order,
+  DraftLotInput,
+  MaterialReservation,
+  RawMaterial,
+  FinishedGood,
+  LotStageHistory,
+  BOMEntry,
+  StageName,
+  MaterialTransaction,
+  MaterialTransactionType,
 } from "../types";
 import { requireHeaderSecret } from "../../helpers";
 import { ENQUEUE_FUNCTION_SECRET } from "../../config";
@@ -62,7 +71,7 @@ async function buildLotsAndReservations(
   buyerName: string,
   shipDate: Timestamp,
   createdBy: string,
-  lotInputs: DraftLotInput[]
+  lotInputs: DraftLotInput[],
 ): Promise<{ lotDocs: Lot[]; reservationDocs: MaterialReservation[] }> {
   const lotDocs: Lot[] = [];
   const reservationDocs: MaterialReservation[] = [];
@@ -111,7 +120,8 @@ async function buildLotsAndReservations(
       updatedAt: Timestamp.now(),
     });
 
-    const bomSnap = await db.collection(`users/${businessId}/bom`)
+    const bomSnap = await db
+      .collection(`users/${businessId}/bom`)
       .where("productId", "==", lotInput.productId)
       .where("isActive", "==", true)
       .get();
@@ -146,7 +156,7 @@ async function buildLotsAndReservations(
 // Shared stock check — used by both createOrder and confirmOrder
 async function checkStockShortfalls(
   businessId: string,
-  reservationDocs: MaterialReservation[]
+  reservationDocs: MaterialReservation[],
 ): Promise<string[]> {
   const materialTotals: Record<string, number> = {};
   for (const r of reservationDocs) {
@@ -156,7 +166,10 @@ async function checkStockShortfalls(
   const shortfalls: string[] = [];
   for (const [materialId, required] of Object.entries(materialTotals)) {
     const matDoc = await db.doc(`users/${businessId}/raw_materials/${materialId}`).get();
-    if (!matDoc.exists) { shortfalls.push(materialId); continue; }
+    if (!matDoc.exists) {
+      shortfalls.push(materialId);
+      continue;
+    }
     const mat = matDoc.data() as RawMaterial;
     if (mat.availableStock < required) {
       shortfalls.push(`${mat.name} (need ${required} ${mat.unit}, have ${mat.availableStock})`);
@@ -176,7 +189,7 @@ interface SaveDraftOrderPayload {
   buyerId: string;
   buyerName: string;
   buyerContact: string;
-  shipDate: string;               // ISO string
+  shipDate: string; // ISO string
   deliveryAddress: string;
   note?: string;
   createdBy: string;
@@ -187,7 +200,7 @@ export const saveDraftOrder = onRequest(
   {
     secrets: [ENQUEUE_FUNCTION_SECRET],
     cors: true,
-    timeoutSeconds: 60,   // single doc write — no lots, no reservations
+    timeoutSeconds: 60, // single doc write — no lots, no reservations
     memory: "128MiB",
   },
   async (req, res) => {
@@ -199,8 +212,15 @@ export const saveDraftOrder = onRequest(
 
     try {
       const {
-        businessId, buyerId, buyerName, buyerContact,
-        shipDate, deliveryAddress, note, createdBy, lots,
+        businessId,
+        buyerId,
+        buyerName,
+        buyerContact,
+        shipDate,
+        deliveryAddress,
+        note,
+        createdBy,
+        lots,
       } = req.body as SaveDraftOrderPayload;
 
       const orderNumber = await generateOrderNumber(businessId);
@@ -228,12 +248,11 @@ export const saveDraftOrder = onRequest(
       } satisfies Order);
 
       res.status(200).json({ orderId, orderNumber });
-
     } catch (error) {
       console.error("saveDraftOrder error:", error);
       res.status(500).json({ error: "internal", message: (error as Error).message });
     }
-  }
+  },
 );
 
 // ----------------------------------------------------------------------------
@@ -251,7 +270,7 @@ export const confirmOrder = onRequest(
   {
     secrets: [ENQUEUE_FUNCTION_SECRET],
     cors: true,
-    timeoutSeconds: 540,  // BOM fetches + stock checks + batch write — same as createOrder
+    timeoutSeconds: 540, // BOM fetches + stock checks + batch write — same as createOrder
     memory: "256MiB",
   },
   async (req, res) => {
@@ -262,8 +281,12 @@ export const confirmOrder = onRequest(
     }
 
     try {
-      const { businessId, orderId, confirmedBy, lots: incomingLots } =
-        req.body as ConfirmOrderPayload;
+      const {
+        businessId,
+        orderId,
+        confirmedBy,
+        lots: incomingLots,
+      } = req.body as ConfirmOrderPayload;
 
       const orderRef = db.doc(`users/${businessId}/orders/${orderId}`);
       const orderDoc = await orderRef.get();
@@ -294,9 +317,14 @@ export const confirmOrder = onRequest(
       await orderRef.update({ status: "CONFIRMED", updatedAt: Timestamp.now() });
 
       const { lotDocs, reservationDocs } = await buildLotsAndReservations(
-        businessId, orderId, order.orderNumber,
-        order.buyerId, order.buyerName, order.shipDate,
-        confirmedBy, lotInputs
+        businessId,
+        orderId,
+        order.orderNumber,
+        order.buyerId,
+        order.buyerName,
+        order.shipDate,
+        confirmedBy,
+        lotInputs,
       );
 
       const shortfalls = await checkStockShortfalls(businessId, reservationDocs);
@@ -318,7 +346,10 @@ export const confirmOrder = onRequest(
       }
 
       for (const reservation of reservationDocs) {
-        batch.set(db.doc(`users/${businessId}/material_reservations/${reservation.id}`), reservation);
+        batch.set(
+          db.doc(`users/${businessId}/material_reservations/${reservation.id}`),
+          reservation,
+        );
         batch.update(db.doc(`users/${businessId}/raw_materials/${reservation.materialId}`), {
           reservedStock: FieldValue.increment(reservation.quantityRequired),
           availableStock: FieldValue.increment(-reservation.quantityRequired),
@@ -338,12 +369,11 @@ export const confirmOrder = onRequest(
 
       await batch.commit();
       res.status(200).json({ success: true, lotCount: lotDocs.length });
-
     } catch (error) {
       console.error("confirmOrder error:", error);
       res.status(500).json({ error: "internal", message: (error as Error).message });
     }
-  }
+  },
 );
 
 // ----------------------------------------------------------------------------
@@ -353,7 +383,7 @@ interface CreateOrderPayload {
   buyerId: string;
   buyerName: string;
   buyerContact: string;
-  shipDate: string;               // ISO string
+  shipDate: string; // ISO string
   deliveryAddress: string;
   note?: string;
   createdBy: string;
@@ -364,7 +394,7 @@ export const createOrder = onRequest(
   {
     secrets: [ENQUEUE_FUNCTION_SECRET],
     cors: true,
-    timeoutSeconds: 540,  // sequential BOM fetches + stock checks per lot + batch write
+    timeoutSeconds: 540, // sequential BOM fetches + stock checks per lot + batch write
     memory: "256MiB",
   },
   async (req, res) => {
@@ -376,8 +406,15 @@ export const createOrder = onRequest(
 
     try {
       const {
-        businessId, buyerId, buyerName, buyerContact,
-        shipDate, deliveryAddress, note, createdBy, lots,
+        businessId,
+        buyerId,
+        buyerName,
+        buyerContact,
+        shipDate,
+        deliveryAddress,
+        note,
+        createdBy,
+        lots,
       } = req.body as CreateOrderPayload;
 
       const orderNumber = await generateOrderNumber(businessId);
@@ -385,9 +422,14 @@ export const createOrder = onRequest(
       const shipTimestamp = Timestamp.fromDate(new Date(shipDate));
 
       const { lotDocs, reservationDocs } = await buildLotsAndReservations(
-        businessId, orderId, orderNumber,
-        buyerId, buyerName, shipTimestamp,
-        createdBy, lots
+        businessId,
+        orderId,
+        orderNumber,
+        buyerId,
+        buyerName,
+        shipTimestamp,
+        createdBy,
+        lots,
       );
 
       const shortfalls = await checkStockShortfalls(businessId, reservationDocs);
@@ -429,7 +471,10 @@ export const createOrder = onRequest(
       }
 
       for (const reservation of reservationDocs) {
-        batch.set(db.doc(`users/${businessId}/material_reservations/${reservation.id}`), reservation);
+        batch.set(
+          db.doc(`users/${businessId}/material_reservations/${reservation.id}`),
+          reservation,
+        );
         batch.update(db.doc(`users/${businessId}/raw_materials/${reservation.materialId}`), {
           reservedStock: FieldValue.increment(reservation.quantityRequired),
           availableStock: FieldValue.increment(-reservation.quantityRequired),
@@ -439,12 +484,11 @@ export const createOrder = onRequest(
 
       await batch.commit();
       res.status(200).json({ orderId, orderNumber, lotCount: lotDocs.length });
-
     } catch (error) {
       console.error("createOrder error:", error);
       res.status(500).json({ error: "internal", message: (error as Error).message });
     }
-  }
+  },
 );
 
 // ----------------------------------------------------------------------------
@@ -453,7 +497,7 @@ export const cancelOrder = onRequest(
   {
     secrets: [ENQUEUE_FUNCTION_SECRET],
     cors: true,
-    timeoutSeconds: 540,  // multiple lots, each with multiple reservations
+    timeoutSeconds: 540, // multiple lots, each with multiple reservations
     memory: "256MiB",
   },
   async (req, res) => {
@@ -493,11 +537,12 @@ export const cancelOrder = onRequest(
       }
 
       // Fetch all cancellable lots (skip already cancelled/completed)
-      const lotsSnap = await db.collection(`users/${businessId}/lots`)
+      const lotsSnap = await db
+        .collection(`users/${businessId}/lots`)
         .where("orderId", "==", orderId)
         .get();
 
-      const cancellableLots = lotsSnap.docs.filter(d => {
+      const cancellableLots = lotsSnap.docs.filter((d) => {
         const s = (d.data() as Lot).status;
         return s !== "CANCELLED" && s !== "COMPLETED";
       });
@@ -513,7 +558,8 @@ export const cancelOrder = onRequest(
           updatedAt: now,
         });
 
-        const reservationsSnap = await db.collection(`users/${businessId}/material_reservations`)
+        const reservationsSnap = await db
+          .collection(`users/${businessId}/material_reservations`)
           .where("lotId", "==", lotDoc.id)
           .where("status", "==", "RESERVED")
           .get();
@@ -556,12 +602,11 @@ export const cancelOrder = onRequest(
 
       await batch.commit();
       res.status(200).json({ success: true, lotsCancelled: cancellableLots.length });
-
     } catch (error) {
       console.error("cancelOrder error:", error);
       res.status(500).json({ error: "internal", message: (error as Error).message });
     }
-  }
+  },
 );
 
 // ============================================================================
@@ -580,7 +625,7 @@ export const advanceLotStage = onRequest(
   {
     secrets: [ENQUEUE_FUNCTION_SECRET],
     cors: true,
-    timeoutSeconds: 120,  // transaction + reservation reads inside
+    timeoutSeconds: 120, // transaction + reservation reads inside
     memory: "128MiB",
   },
   async (req, res) => {
@@ -609,7 +654,8 @@ export const advanceLotStage = onRequest(
         const now = Timestamp.now();
 
         const updatedStages = lot.stages.map((s, i) => {
-          if (i === currentIndex) return { ...s, status: "COMPLETED", actualDate: now, completedBy, note: note ?? null };
+          if (i === currentIndex)
+            return { ...s, status: "COMPLETED", actualDate: now, completedBy, note: note ?? null };
           if (i === currentIndex + 1) return { ...s, status: "IN_PROGRESS" };
           return s;
         });
@@ -642,7 +688,8 @@ export const advanceLotStage = onRequest(
           note: note ?? null,
         } satisfies LotStageHistory);
 
-        const reservationsSnap = await db.collection(`users/${businessId}/material_reservations`)
+        const reservationsSnap = await db
+          .collection(`users/${businessId}/material_reservations`)
           .where("lotId", "==", lotId)
           .where("consumedAtStage", "==", currentStage.stage)
           .where("status", "==", "RESERVED")
@@ -692,7 +739,6 @@ export const advanceLotStage = onRequest(
       });
 
       res.status(200).json({ success: true });
-
     } catch (error) {
       const message = (error as Error).message;
       if (message === "lot_not_found") {
@@ -704,7 +750,7 @@ export const advanceLotStage = onRequest(
         res.status(500).json({ error: "internal", message });
       }
     }
-  }
+  },
 );
 
 // ----------------------------------------------------------------------------
@@ -713,7 +759,7 @@ export const setLotStageBlocked = onRequest(
   {
     secrets: [ENQUEUE_FUNCTION_SECRET],
     cors: true,
-    timeoutSeconds: 60,   // single read + single update
+    timeoutSeconds: 60, // single read + single update
     memory: "128MiB",
   },
   async (req, res) => {
@@ -725,7 +771,10 @@ export const setLotStageBlocked = onRequest(
 
     try {
       const { businessId, lotId, blocked, reason } = req.body as {
-        businessId: string; lotId: string; blocked: boolean; reason?: string;
+        businessId: string;
+        lotId: string;
+        blocked: boolean;
+        reason?: string;
       };
 
       const lotRef = db.doc(`users/${businessId}/lots/${lotId}`);
@@ -740,11 +789,12 @@ export const setLotStageBlocked = onRequest(
       const currentIndex = lot.currentSequence - 1;
 
       const updatedStages = lot.stages.map((s, i) => {
-        if (i === currentIndex) return {
-          ...s,
-          status: blocked ? "BLOCKED" : "IN_PROGRESS",
-          note: reason ?? s.note,
-        };
+        if (i === currentIndex)
+          return {
+            ...s,
+            status: blocked ? "BLOCKED" : "IN_PROGRESS",
+            note: reason ?? s.note,
+          };
         return s;
       });
 
@@ -754,12 +804,11 @@ export const setLotStageBlocked = onRequest(
       });
 
       res.status(200).json({ success: true });
-
     } catch (error) {
       console.error("setLotStageBlocked error:", error);
       res.status(500).json({ error: "internal", message: (error as Error).message });
     }
-  }
+  },
 );
 
 // ----------------------------------------------------------------------------
@@ -768,7 +817,7 @@ export const cancelLot = onRequest(
   {
     secrets: [ENQUEUE_FUNCTION_SECRET],
     cors: true,
-    timeoutSeconds: 120,  // reservation query + writes per material
+    timeoutSeconds: 120, // reservation query + writes per material
     memory: "128MiB",
   },
   async (req, res) => {
@@ -803,7 +852,8 @@ export const cancelLot = onRequest(
           updatedAt: now,
         });
 
-        const reservationsSnap = await db.collection(`users/${businessId}/material_reservations`)
+        const reservationsSnap = await db
+          .collection(`users/${businessId}/material_reservations`)
           .where("lotId", "==", lotId)
           .where("status", "==", "RESERVED")
           .get();
@@ -839,7 +889,6 @@ export const cancelLot = onRequest(
       });
 
       res.status(200).json({ success: true });
-
     } catch (error) {
       const message = (error as Error).message;
       if (message === "lot_not_found") {
@@ -853,7 +902,7 @@ export const cancelLot = onRequest(
         res.status(500).json({ error: "internal", message });
       }
     }
-  }
+  },
 );
 
 // ============================================================================
@@ -865,7 +914,7 @@ interface AddStockPayload {
   businessId: string;
   materialId: string;
   quantity: number;
-  referenceId: string;    // PO number, GRN number, supplier invoice, etc.
+  referenceId: string; // PO number, GRN number, supplier invoice, etc.
   note?: string;
   createdBy: string;
 }
@@ -928,7 +977,6 @@ export const addStock = onRequest(
       });
 
       res.status(200).json({ success: true });
-
     } catch (error) {
       const message = (error as Error).message;
       if (message === "material_not_found") {
@@ -938,7 +986,7 @@ export const addStock = onRequest(
         res.status(500).json({ error: "internal", message });
       }
     }
-  }
+  },
 );
 
 // ----------------------------------------------------------------------------
@@ -946,8 +994,8 @@ export const addStock = onRequest(
 interface AdjustStockPayload {
   businessId: string;
   materialId: string;
-  quantity: number;       // positive = add, negative = remove
-  note: string;           // required for adjustments — must explain why
+  quantity: number; // positive = add, negative = remove
+  note: string; // required for adjustments — must explain why
   createdBy: string;
 }
 
@@ -966,8 +1014,7 @@ export const adjustStock = onRequest(
     }
 
     try {
-      const { businessId, materialId, quantity, note, createdBy } =
-        req.body as AdjustStockPayload;
+      const { businessId, materialId, quantity, note, createdBy } = req.body as AdjustStockPayload;
 
       if (quantity === 0) {
         res.status(400).json({ error: "quantity_cannot_be_zero" });
@@ -1014,7 +1061,6 @@ export const adjustStock = onRequest(
       });
 
       res.status(200).json({ success: true });
-
     } catch (error) {
       const message = (error as Error).message;
       if (message === "material_not_found") {
@@ -1026,7 +1072,7 @@ export const adjustStock = onRequest(
         res.status(500).json({ error: "internal", message });
       }
     }
-  }
+  },
 );
 
 // ============================================================================
@@ -1044,7 +1090,8 @@ export const syncOrderStatsOnLotChange = onDocumentWritten(
     const orderId = after?.orderId ?? before?.orderId;
     if (!orderId) return;
 
-    const lotsSnap = await db.collection(`users/${businessId}/lots`)
+    const lotsSnap = await db
+      .collection(`users/${businessId}/lots`)
       .where("orderId", "==", orderId)
       .get();
 
@@ -1068,13 +1115,13 @@ export const syncOrderStatsOnLotChange = onDocumentWritten(
       status: allCompleted ? "COMPLETED" : "IN_PRODUCTION",
       updatedAt: Timestamp.now(),
     });
-  }
+  },
 );
 
 // ----------------------------------------------------------------------------
 
 export const recomputeLotDelays = onSchedule(
-  { schedule: "0 3 * * *", timeZone: "Asia/Kolkata" },  // 3 UTC = 9 IST
+  { schedule: "0 3 * * *", timeZone: "Asia/Kolkata" }, // 3 UTC = 9 IST
   async () => {
     const CHUNK = 100;
     const businessSnap = await db.collection("users").get();
@@ -1084,7 +1131,8 @@ export const recomputeLotDelays = onSchedule(
       let lastDoc: FirebaseFirestore.QueryDocumentSnapshot | undefined;
 
       do {
-        let query = db.collection(`users/${businessId}/lots`)
+        let query = db
+          .collection(`users/${businessId}/lots`)
           .where("status", "==", "ACTIVE")
           .limit(CHUNK);
 
@@ -1107,7 +1155,7 @@ export const recomputeLotDelays = onSchedule(
         if (snap.size < CHUNK) break;
       } while (true);
     }
-  }
+  },
 );
 
 // ============================================================================
@@ -1119,7 +1167,7 @@ export const getOrderDashboard = onRequest(
   {
     secrets: [ENQUEUE_FUNCTION_SECRET],
     cors: true,
-    timeoutSeconds: 60,   // two parallel reads + in-memory grouping
+    timeoutSeconds: 60, // two parallel reads + in-memory grouping
     memory: "128MiB",
   },
   async (req, res) => {
@@ -1142,7 +1190,7 @@ export const getOrderDashboard = onRequest(
         return;
       }
 
-      const lots = lotsSnap.docs.map(d => d.data() as Lot);
+      const lots = lotsSnap.docs.map((d) => d.data() as Lot);
 
       const byStage: Record<string, Lot[]> = {};
       for (const lot of lots) {
@@ -1150,7 +1198,7 @@ export const getOrderDashboard = onRequest(
         byStage[lot.currentStage].push(lot);
       }
 
-      const tnaSummary = lots.map(lot => ({
+      const tnaSummary = lots.map((lot) => ({
         lotNumber: lot.lotNumber,
         productName: lot.productName,
         color: lot.color,
@@ -1158,7 +1206,7 @@ export const getOrderDashboard = onRequest(
         currentStage: lot.currentStage,
         isDelayed: lot.isDelayed,
         delayDays: lot.delayDays,
-        stages: lot.stages.map(s => ({
+        stages: lot.stages.map((s) => ({
           stage: s.stage,
           status: s.status,
           plannedDate: s.plannedDate,
@@ -1171,12 +1219,11 @@ export const getOrderDashboard = onRequest(
         lotsByStage: byStage,
         tnaSummary,
         totalLots: lots.length,
-        lotsDelayed: lots.filter(l => l.isDelayed).length,
+        lotsDelayed: lots.filter((l) => l.isDelayed).length,
       });
-
     } catch (error) {
       console.error("getOrderDashboard error:", error);
       res.status(500).json({ error: "internal", message: (error as Error).message });
     }
-  }
+  },
 );

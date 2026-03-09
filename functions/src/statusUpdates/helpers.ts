@@ -72,18 +72,18 @@ export function determineNewXpressbeesStatus(currentStatus: string): string | nu
 //
 // @param statusType  Short code from Blue Dart, e.g. "PU", "IT", "DL"
 // @param rawStatus   Human-readable status string (kept for logging / fallback)
-export function determineNewBlueDartStatus(statusType: string): string | null {
+export function determineNewBlueDartStatus(statusType: string, order: any): string | null {
   if (!statusType) return null;
 
   switch (statusType.toUpperCase()) {
     case "IT":
-      return "In Transit";
+      return order?.awb_reverse ? "DTO In Transit" : "In Transit";
 
     case "OD":
       return "Out For Delivery";
 
     case "DL":
-      return "Delivered";
+      return order?.awb_reverse ? "DTO Delivered" : "Delivered";
 
     // case "UD":
     //   return "Undelivered";

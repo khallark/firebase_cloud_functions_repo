@@ -274,7 +274,7 @@ function prepareBlueDartOrderUpdates(orders: any[], shipments: any[]): OrderUpda
     //         or "RTO Delivered"           (returned to origin — delivered)
     //   LS  → "Lost"                       (shipment marked lost)
     //
-    const newStatus = determineNewBlueDartStatus(rawStatusType);
+    const newStatus = determineNewBlueDartStatus(rawStatusType, order);
     if (!newStatus) continue; // unrecognised code → skip
     if (newStatus === order.customStatus) continue; // no change → skip
     updates.push({
