@@ -4,7 +4,7 @@ import { onSchedule } from "firebase-functions/v2/scheduler";
 import { FieldValue, Timestamp } from "firebase-admin/firestore";
 import { db } from "../../firebaseAdmin";
 import {
-  Lot, LotStage, Order, MaterialReservation,
+  Lot, LotStage, Order, DraftLotInput, MaterialReservation,
   RawMaterial, FinishedGood, LotStageHistory,
   BOMEntry, StageName, MaterialTransaction, MaterialTransactionType,
 } from "../types";
@@ -53,10 +53,300 @@ function computeDelayStatus(stages: LotStage[]): { isDelayed: boolean; delayDays
   return { isDelayed: maxDelay > 0, delayDays: maxDelay };
 }
 
+// Shared lot-building logic — used by both createOrder and confirmOrder
+async function buildLotsAndReservations(
+  businessId: string,
+  orderId: string,
+  orderNumber: string,
+  buyerId: string,
+  buyerName: string,
+  shipDate: Timestamp,
+  createdBy: string,
+  lotInputs: DraftLotInput[]
+): Promise<{ lotDocs: Lot[]; reservationDocs: MaterialReservation[] }> {
+  const lotDocs: Lot[] = [];
+  const reservationDocs: MaterialReservation[] = [];
+
+  for (const lotInput of lotInputs) {
+    const lotNumber = await generateLotNumber(businessId);
+    const lotId = db.collection(`${businessId}/lots`).doc().id;
+
+    const builtStages: LotStage[] = lotInput.stages.map((s, i) => ({
+      sequence: i + 1,
+      stage: s.stage,
+      plannedDate: Timestamp.fromDate(new Date(s.plannedDate)),
+      actualDate: null,
+      status: i === 0 ? "IN_PROGRESS" : "PENDING",
+      isOutsourced: s.isOutsourced,
+      outsourceVendorName: s.outsourceVendorName ?? null,
+      outsourceSentAt: null,
+      outsourceReturnedAt: null,
+      completedBy: null,
+      note: null,
+    }));
+
+    lotDocs.push({
+      id: lotId,
+      lotNumber,
+      orderId,
+      orderNumber,
+      buyerId,
+      buyerName,
+      productId: lotInput.productId,
+      productName: lotInput.productName,
+      productSku: lotInput.productSku,
+      color: lotInput.color,
+      size: lotInput.size ?? null,
+      quantity: lotInput.quantity,
+      stages: builtStages,
+      currentStage: builtStages[0].stage,
+      currentSequence: 1,
+      totalStages: builtStages.length,
+      shipDate,
+      isDelayed: false,
+      delayDays: 0,
+      status: "ACTIVE",
+      createdBy,
+      createdAt: Timestamp.now(),
+      updatedAt: Timestamp.now(),
+    });
+
+    const bomSnap = await db.collection(`${businessId}/bom`)
+      .where("productId", "==", lotInput.productId)
+      .where("isActive", "==", true)
+      .get();
+
+    for (const bomDoc of bomSnap.docs) {
+      const bom = bomDoc.data() as BOMEntry;
+      const reservationId = db.collection(`${businessId}/material_reservations`).doc().id;
+      const qtyRequired = lotInput.quantity * bom.quantityPerPiece * (1 + bom.wastagePercent / 100);
+
+      reservationDocs.push({
+        id: reservationId,
+        lotId,
+        lotNumber,
+        orderId,
+        orderNumber,
+        materialId: bom.materialId,
+        materialName: bom.materialName,
+        materialUnit: bom.materialUnit,
+        quantityRequired: Math.ceil(qtyRequired * 100) / 100,
+        quantityConsumed: 0,
+        consumedAtStage: bom.consumedAtStage,
+        status: "RESERVED",
+        createdAt: Timestamp.now(),
+        updatedAt: Timestamp.now(),
+      });
+    }
+  }
+
+  return { lotDocs, reservationDocs };
+}
+
+// Shared stock check — used by both createOrder and confirmOrder
+async function checkStockShortfalls(
+  businessId: string,
+  reservationDocs: MaterialReservation[]
+): Promise<string[]> {
+  const materialTotals: Record<string, number> = {};
+  for (const r of reservationDocs) {
+    materialTotals[r.materialId] = (materialTotals[r.materialId] ?? 0) + r.quantityRequired;
+  }
+
+  const shortfalls: string[] = [];
+  for (const [materialId, required] of Object.entries(materialTotals)) {
+    const matDoc = await db.doc(`${businessId}/raw_materials/${materialId}`).get();
+    if (!matDoc.exists) { shortfalls.push(materialId); continue; }
+    const mat = matDoc.data() as RawMaterial;
+    if (mat.availableStock < required) {
+      shortfalls.push(`${mat.name} (need ${required} ${mat.unit}, have ${mat.availableStock})`);
+    }
+  }
+
+  return shortfalls;
+}
+
 // ============================================================================
 // ORDER LIFECYCLE
-// createOrder → cancelOrder
+// saveDraftOrder → confirmOrder → createOrder → cancelOrder
 // ============================================================================
+
+interface SaveDraftOrderPayload {
+  businessId: string;
+  buyerId: string;
+  buyerName: string;
+  buyerContact: string;
+  shipDate: string;               // ISO string
+  deliveryAddress: string;
+  note?: string;
+  createdBy: string;
+  lots: DraftLotInput[];
+}
+
+export const saveDraftOrder = onRequest(
+  {
+    secrets: [ENQUEUE_FUNCTION_SECRET],
+    cors: true,
+    timeoutSeconds: 60,   // single doc write — no lots, no reservations
+    memory: "128MiB",
+  },
+  async (req, res) => {
+    requireHeaderSecret(req, "x-api-key", ENQUEUE_FUNCTION_SECRET.value() || "");
+    if (req.method !== "POST") {
+      res.status(405).json({ error: "method_not_allowed" });
+      return;
+    }
+
+    try {
+      const {
+        businessId, buyerId, buyerName, buyerContact,
+        shipDate, deliveryAddress, note, createdBy, lots,
+      } = req.body as SaveDraftOrderPayload;
+
+      const orderNumber = await generateOrderNumber(businessId);
+      const orderId = db.collection(`${businessId}/orders`).doc().id;
+
+      await db.doc(`${businessId}/orders/${orderId}`).set({
+        id: orderId,
+        orderNumber,
+        buyerId,
+        buyerName,
+        buyerContact,
+        shipDate: Timestamp.fromDate(new Date(shipDate)),
+        deliveryAddress,
+        draftLots: lots,
+        totalLots: 0,
+        totalQuantity: 0,
+        lotsCompleted: 0,
+        lotsInProduction: 0,
+        lotsDelayed: 0,
+        status: "DRAFT",
+        note: note ?? null,
+        createdBy,
+        createdAt: Timestamp.now(),
+        updatedAt: Timestamp.now(),
+      } satisfies Order);
+
+      res.status(200).json({ orderId, orderNumber });
+
+    } catch (error) {
+      console.error("saveDraftOrder error:", error);
+      res.status(500).json({ error: "internal", message: (error as Error).message });
+    }
+  }
+);
+
+// ----------------------------------------------------------------------------
+
+interface ConfirmOrderPayload {
+  businessId: string;
+  orderId: string;
+  confirmedBy: string;
+  // Optional — pass updated lots if changes were made during review.
+  // If omitted, the draftLots stored on the order doc are used.
+  lots?: DraftLotInput[];
+}
+
+export const confirmOrder = onRequest(
+  {
+    secrets: [ENQUEUE_FUNCTION_SECRET],
+    cors: true,
+    timeoutSeconds: 540,  // BOM fetches + stock checks + batch write — same as createOrder
+    memory: "256MiB",
+  },
+  async (req, res) => {
+    requireHeaderSecret(req, "x-api-key", ENQUEUE_FUNCTION_SECRET.value() || "");
+    if (req.method !== "POST") {
+      res.status(405).json({ error: "method_not_allowed" });
+      return;
+    }
+
+    try {
+      const { businessId, orderId, confirmedBy, lots: incomingLots } =
+        req.body as ConfirmOrderPayload;
+
+      const orderRef = db.doc(`${businessId}/orders/${orderId}`);
+      const orderDoc = await orderRef.get();
+
+      if (!orderDoc.exists) {
+        res.status(404).json({ error: "order_not_found" });
+        return;
+      }
+
+      const order = orderDoc.data() as Order;
+
+      if (order.status !== "DRAFT") {
+        res.status(400).json({
+          error: "order_not_draft",
+          message: `Order is currently ${order.status}. Only DRAFT orders can be confirmed.`,
+        });
+        return;
+      }
+
+      const lotInputs = incomingLots ?? order.draftLots;
+
+      if (!lotInputs || lotInputs.length === 0) {
+        res.status(400).json({ error: "no_lots_defined" });
+        return;
+      }
+
+      // Flip to CONFIRMED immediately so the UI reflects the in-progress state
+      await orderRef.update({ status: "CONFIRMED", updatedAt: Timestamp.now() });
+
+      const { lotDocs, reservationDocs } = await buildLotsAndReservations(
+        businessId, orderId, order.orderNumber,
+        order.buyerId, order.buyerName, order.shipDate,
+        confirmedBy, lotInputs
+      );
+
+      const shortfalls = await checkStockShortfalls(businessId, reservationDocs);
+
+      if (shortfalls.length > 0) {
+        // Roll back to DRAFT — order remains editable
+        await orderRef.update({ status: "DRAFT", updatedAt: Timestamp.now() });
+        res.status(400).json({
+          error: "insufficient_stock",
+          message: `Insufficient raw material stock: ${shortfalls.join(", ")}`,
+        });
+        return;
+      }
+
+      const batch = db.batch();
+
+      for (const lot of lotDocs) {
+        batch.set(db.doc(`${businessId}/lots/${lot.id}`), lot);
+      }
+
+      for (const reservation of reservationDocs) {
+        batch.set(db.doc(`${businessId}/material_reservations/${reservation.id}`), reservation);
+        batch.update(db.doc(`${businessId}/raw_materials/${reservation.materialId}`), {
+          reservedStock: FieldValue.increment(reservation.quantityRequired),
+          availableStock: FieldValue.increment(-reservation.quantityRequired),
+          updatedAt: Timestamp.now(),
+        });
+      }
+
+      // Lots created — clear draftLots, flip to IN_PRODUCTION
+      batch.update(orderRef, {
+        status: "IN_PRODUCTION",
+        draftLots: null,
+        totalLots: lotDocs.length,
+        totalQuantity: lotDocs.reduce((s, l) => s + l.quantity, 0),
+        lotsInProduction: lotDocs.length,
+        updatedAt: Timestamp.now(),
+      });
+
+      await batch.commit();
+      res.status(200).json({ success: true, lotCount: lotDocs.length });
+
+    } catch (error) {
+      console.error("confirmOrder error:", error);
+      res.status(500).json({ error: "internal", message: (error as Error).message });
+    }
+  }
+);
+
+// ----------------------------------------------------------------------------
 
 interface CreateOrderPayload {
   businessId: string;
@@ -67,20 +357,7 @@ interface CreateOrderPayload {
   deliveryAddress: string;
   note?: string;
   createdBy: string;
-  lots: Array<{
-    productId: string;
-    productName: string;
-    productSku: string;
-    color: string;
-    size?: string;
-    quantity: number;
-    stages: Array<{
-      stage: StageName;
-      plannedDate: string;        // ISO string
-      isOutsourced: boolean;
-      outsourceVendorName?: string;
-    }>;
-  }>;
+  lots: DraftLotInput[];
 }
 
 export const createOrder = onRequest(
@@ -107,102 +384,13 @@ export const createOrder = onRequest(
       const orderId = db.collection(`${businessId}/orders`).doc().id;
       const shipTimestamp = Timestamp.fromDate(new Date(shipDate));
 
-      // --- Build lot docs + reservation docs in memory first ---
+      const { lotDocs, reservationDocs } = await buildLotsAndReservations(
+        businessId, orderId, orderNumber,
+        buyerId, buyerName, shipTimestamp,
+        createdBy, lots
+      );
 
-      const lotDocs: Lot[] = [];
-      const reservationDocs: MaterialReservation[] = [];
-
-      for (const lotInput of lots) {
-        const lotNumber = await generateLotNumber(businessId);
-        const lotId = db.collection(`${businessId}/lots`).doc().id;
-
-        const builtStages: LotStage[] = lotInput.stages.map((s, i) => ({
-          sequence: i + 1,
-          stage: s.stage,
-          plannedDate: Timestamp.fromDate(new Date(s.plannedDate)),
-          actualDate: null,
-          status: i === 0 ? "IN_PROGRESS" : "PENDING",
-          isOutsourced: s.isOutsourced,
-          outsourceVendorName: s.outsourceVendorName ?? null,
-          outsourceSentAt: null,
-          outsourceReturnedAt: null,
-          completedBy: null,
-          note: null,
-        }));
-
-        const lot: Lot = {
-          id: lotId,
-          lotNumber,
-          orderId,
-          orderNumber,
-          buyerId,
-          buyerName,
-          productId: lotInput.productId,
-          productName: lotInput.productName,
-          productSku: lotInput.productSku,
-          color: lotInput.color,
-          size: lotInput.size ?? null,
-          quantity: lotInput.quantity,
-          stages: builtStages,
-          currentStage: builtStages[0].stage,
-          currentSequence: 1,
-          totalStages: builtStages.length,
-          shipDate: shipTimestamp,
-          isDelayed: false,
-          delayDays: 0,
-          status: "ACTIVE",
-          createdBy,
-          createdAt: Timestamp.now(),
-          updatedAt: Timestamp.now(),
-        };
-
-        lotDocs.push(lot);
-
-        // --- Fetch BOM for this product and build reservations ---
-        const bomSnap = await db.collection(`${businessId}/bom`)
-          .where("productId", "==", lotInput.productId)
-          .where("isActive", "==", true)
-          .get();
-
-        for (const bomDoc of bomSnap.docs) {
-          const bom = bomDoc.data() as BOMEntry;
-          const reservationId = db.collection(`${businessId}/material_reservations`).doc().id;
-          const qtyRequired = lotInput.quantity * bom.quantityPerPiece * (1 + bom.wastagePercent / 100);
-
-          reservationDocs.push({
-            id: reservationId,
-            lotId,
-            lotNumber,
-            orderId,
-            orderNumber,
-            materialId: bom.materialId,
-            materialName: bom.materialName,
-            materialUnit: bom.materialUnit,
-            quantityRequired: Math.ceil(qtyRequired * 100) / 100,
-            quantityConsumed: 0,
-            consumedAtStage: bom.consumedAtStage,
-            status: "RESERVED",
-            createdAt: Timestamp.now(),
-            updatedAt: Timestamp.now(),
-          });
-        }
-      }
-
-      // --- Check material availability before committing ---
-      const materialTotals: Record<string, number> = {};
-      for (const r of reservationDocs) {
-        materialTotals[r.materialId] = (materialTotals[r.materialId] ?? 0) + r.quantityRequired;
-      }
-
-      const shortfalls: string[] = [];
-      for (const [materialId, required] of Object.entries(materialTotals)) {
-        const matDoc = await db.doc(`${businessId}/raw_materials/${materialId}`).get();
-        if (!matDoc.exists) { shortfalls.push(materialId); continue; }
-        const mat = matDoc.data() as RawMaterial;
-        if (mat.availableStock < required) {
-          shortfalls.push(`${mat.name} (need ${required} ${mat.unit}, have ${mat.availableStock})`);
-        }
-      }
+      const shortfalls = await checkStockShortfalls(businessId, reservationDocs);
 
       if (shortfalls.length > 0) {
         res.status(400).json({
@@ -212,7 +400,6 @@ export const createOrder = onRequest(
         return;
       }
 
-      // --- Commit everything in a batch ---
       const batch = db.batch();
 
       const orderRef = db.doc(`${businessId}/orders/${orderId}`);
@@ -224,6 +411,7 @@ export const createOrder = onRequest(
         buyerContact,
         shipDate: shipTimestamp,
         deliveryAddress,
+        draftLots: null,
         totalLots: lotDocs.length,
         totalQuantity: lotDocs.reduce((s, l) => s + l.quantity, 0),
         lotsCompleted: 0,
@@ -294,6 +482,13 @@ export const cancelOrder = onRequest(
       const order = orderDoc.data() as Order;
       if (order.status === "CANCELLED") {
         res.status(400).json({ error: "order_already_cancelled" });
+        return;
+      }
+
+      // DRAFT orders have no lots or reservations — just flip the status
+      if (order.status === "DRAFT") {
+        await orderRef.update({ status: "CANCELLED", updatedAt: Timestamp.now() });
+        res.status(200).json({ success: true, lotsCancelled: 0 });
         return;
       }
 
