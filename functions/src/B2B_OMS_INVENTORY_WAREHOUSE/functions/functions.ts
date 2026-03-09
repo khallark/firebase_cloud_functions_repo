@@ -16,7 +16,7 @@ import { ENQUEUE_FUNCTION_SECRET } from "../../config";
 // ============================================================================
 
 async function generateLotNumber(businessId: string): Promise<string> {
-  const counterRef = db.doc(`${businessId}/counters/lots`);
+  const counterRef = db.doc(`users/${businessId}/counters/lots`);
   const result = await db.runTransaction(async (tx) => {
     const doc = await tx.get(counterRef);
     const current = doc.exists ? (doc.data()!.count as number) : 800;
@@ -27,7 +27,7 @@ async function generateLotNumber(businessId: string): Promise<string> {
 }
 
 async function generateOrderNumber(businessId: string): Promise<string> {
-  const counterRef = db.doc(`${businessId}/counters/orders`);
+  const counterRef = db.doc(`users/${businessId}/counters/orders`);
   const result = await db.runTransaction(async (tx) => {
     const doc = await tx.get(counterRef);
     const current = doc.exists ? (doc.data()!.count as number) : 0;
@@ -69,7 +69,7 @@ async function buildLotsAndReservations(
 
   for (const lotInput of lotInputs) {
     const lotNumber = await generateLotNumber(businessId);
-    const lotId = db.collection(`${businessId}/lots`).doc().id;
+    const lotId = db.collection(`users/${businessId}/lots`).doc().id;
 
     const builtStages: LotStage[] = lotInput.stages.map((s, i) => ({
       sequence: i + 1,
@@ -111,14 +111,14 @@ async function buildLotsAndReservations(
       updatedAt: Timestamp.now(),
     });
 
-    const bomSnap = await db.collection(`${businessId}/bom`)
+    const bomSnap = await db.collection(`users/${businessId}/bom`)
       .where("productId", "==", lotInput.productId)
       .where("isActive", "==", true)
       .get();
 
     for (const bomDoc of bomSnap.docs) {
       const bom = bomDoc.data() as BOMEntry;
-      const reservationId = db.collection(`${businessId}/material_reservations`).doc().id;
+      const reservationId = db.collection(`users/${businessId}/material_reservations`).doc().id;
       const qtyRequired = lotInput.quantity * bom.quantityPerPiece * (1 + bom.wastagePercent / 100);
 
       reservationDocs.push({
@@ -155,7 +155,7 @@ async function checkStockShortfalls(
 
   const shortfalls: string[] = [];
   for (const [materialId, required] of Object.entries(materialTotals)) {
-    const matDoc = await db.doc(`${businessId}/raw_materials/${materialId}`).get();
+    const matDoc = await db.doc(`users/${businessId}/raw_materials/${materialId}`).get();
     if (!matDoc.exists) { shortfalls.push(materialId); continue; }
     const mat = matDoc.data() as RawMaterial;
     if (mat.availableStock < required) {
@@ -204,9 +204,9 @@ export const saveDraftOrder = onRequest(
       } = req.body as SaveDraftOrderPayload;
 
       const orderNumber = await generateOrderNumber(businessId);
-      const orderId = db.collection(`${businessId}/orders`).doc().id;
+      const orderId = db.collection(`users/${businessId}/orders`).doc().id;
 
-      await db.doc(`${businessId}/orders/${orderId}`).set({
+      await db.doc(`users/${businessId}/orders/${orderId}`).set({
         id: orderId,
         orderNumber,
         buyerId,
@@ -265,7 +265,7 @@ export const confirmOrder = onRequest(
       const { businessId, orderId, confirmedBy, lots: incomingLots } =
         req.body as ConfirmOrderPayload;
 
-      const orderRef = db.doc(`${businessId}/orders/${orderId}`);
+      const orderRef = db.doc(`users/${businessId}/orders/${orderId}`);
       const orderDoc = await orderRef.get();
 
       if (!orderDoc.exists) {
@@ -314,12 +314,12 @@ export const confirmOrder = onRequest(
       const batch = db.batch();
 
       for (const lot of lotDocs) {
-        batch.set(db.doc(`${businessId}/lots/${lot.id}`), lot);
+        batch.set(db.doc(`users/${businessId}/lots/${lot.id}`), lot);
       }
 
       for (const reservation of reservationDocs) {
-        batch.set(db.doc(`${businessId}/material_reservations/${reservation.id}`), reservation);
-        batch.update(db.doc(`${businessId}/raw_materials/${reservation.materialId}`), {
+        batch.set(db.doc(`users/${businessId}/material_reservations/${reservation.id}`), reservation);
+        batch.update(db.doc(`users/${businessId}/raw_materials/${reservation.materialId}`), {
           reservedStock: FieldValue.increment(reservation.quantityRequired),
           availableStock: FieldValue.increment(-reservation.quantityRequired),
           updatedAt: Timestamp.now(),
@@ -381,7 +381,7 @@ export const createOrder = onRequest(
       } = req.body as CreateOrderPayload;
 
       const orderNumber = await generateOrderNumber(businessId);
-      const orderId = db.collection(`${businessId}/orders`).doc().id;
+      const orderId = db.collection(`users/${businessId}/orders`).doc().id;
       const shipTimestamp = Timestamp.fromDate(new Date(shipDate));
 
       const { lotDocs, reservationDocs } = await buildLotsAndReservations(
@@ -402,7 +402,7 @@ export const createOrder = onRequest(
 
       const batch = db.batch();
 
-      const orderRef = db.doc(`${businessId}/orders/${orderId}`);
+      const orderRef = db.doc(`users/${businessId}/orders/${orderId}`);
       batch.set(orderRef, {
         id: orderId,
         orderNumber,
@@ -425,12 +425,12 @@ export const createOrder = onRequest(
       } satisfies Order);
 
       for (const lot of lotDocs) {
-        batch.set(db.doc(`${businessId}/lots/${lot.id}`), lot);
+        batch.set(db.doc(`users/${businessId}/lots/${lot.id}`), lot);
       }
 
       for (const reservation of reservationDocs) {
-        batch.set(db.doc(`${businessId}/material_reservations/${reservation.id}`), reservation);
-        batch.update(db.doc(`${businessId}/raw_materials/${reservation.materialId}`), {
+        batch.set(db.doc(`users/${businessId}/material_reservations/${reservation.id}`), reservation);
+        batch.update(db.doc(`users/${businessId}/raw_materials/${reservation.materialId}`), {
           reservedStock: FieldValue.increment(reservation.quantityRequired),
           availableStock: FieldValue.increment(-reservation.quantityRequired),
           updatedAt: Timestamp.now(),
@@ -471,7 +471,7 @@ export const cancelOrder = onRequest(
         reason: string;
       };
 
-      const orderRef = db.doc(`${businessId}/orders/${orderId}`);
+      const orderRef = db.doc(`users/${businessId}/orders/${orderId}`);
       const orderDoc = await orderRef.get();
 
       if (!orderDoc.exists) {
@@ -493,7 +493,7 @@ export const cancelOrder = onRequest(
       }
 
       // Fetch all cancellable lots (skip already cancelled/completed)
-      const lotsSnap = await db.collection(`${businessId}/lots`)
+      const lotsSnap = await db.collection(`users/${businessId}/lots`)
         .where("orderId", "==", orderId)
         .get();
 
@@ -513,7 +513,7 @@ export const cancelOrder = onRequest(
           updatedAt: now,
         });
 
-        const reservationsSnap = await db.collection(`${businessId}/material_reservations`)
+        const reservationsSnap = await db.collection(`users/${businessId}/material_reservations`)
           .where("lotId", "==", lotDoc.id)
           .where("status", "==", "RESERVED")
           .get();
@@ -526,13 +526,13 @@ export const cancelOrder = onRequest(
             updatedAt: now,
           });
 
-          batch.update(db.doc(`${businessId}/raw_materials/${reservation.materialId}`), {
+          batch.update(db.doc(`users/${businessId}/raw_materials/${reservation.materialId}`), {
             reservedStock: FieldValue.increment(-reservation.quantityRequired),
             availableStock: FieldValue.increment(reservation.quantityRequired),
             updatedAt: now,
           });
 
-          const txRef = db.collection(`${businessId}/material_transactions`).doc();
+          const txRef = db.collection(`users/${businessId}/material_transactions`).doc();
           batch.set(txRef, {
             id: txRef.id,
             materialId: reservation.materialId,
@@ -593,7 +593,7 @@ export const advanceLotStage = onRequest(
     try {
       const { businessId, lotId, completedBy, note } = req.body as AdvanceLotStagePayload;
 
-      const lotRef = db.doc(`${businessId}/lots/${lotId}`);
+      const lotRef = db.doc(`users/${businessId}/lots/${lotId}`);
 
       await db.runTransaction(async (tx) => {
         const lotDoc = await tx.get(lotRef);
@@ -627,7 +627,7 @@ export const advanceLotStage = onRequest(
           updatedAt: now,
         });
 
-        const historyRef = db.collection(`${businessId}/lot_stage_history`).doc();
+        const historyRef = db.collection(`users/${businessId}/lot_stage_history`).doc();
         tx.set(historyRef, {
           id: historyRef.id,
           lotId,
@@ -642,7 +642,7 @@ export const advanceLotStage = onRequest(
           note: note ?? null,
         } satisfies LotStageHistory);
 
-        const reservationsSnap = await db.collection(`${businessId}/material_reservations`)
+        const reservationsSnap = await db.collection(`users/${businessId}/material_reservations`)
           .where("lotId", "==", lotId)
           .where("consumedAtStage", "==", currentStage.stage)
           .where("status", "==", "RESERVED")
@@ -655,7 +655,7 @@ export const advanceLotStage = onRequest(
             status: "CONSUMED",
             updatedAt: now,
           });
-          tx.update(db.doc(`${businessId}/raw_materials/${reservation.materialId}`), {
+          tx.update(db.doc(`users/${businessId}/raw_materials/${reservation.materialId}`), {
             reservedStock: FieldValue.increment(-reservation.quantityRequired),
             totalStock: FieldValue.increment(-reservation.quantityRequired),
             updatedAt: now,
@@ -663,7 +663,7 @@ export const advanceLotStage = onRequest(
         }
 
         if (isLastStage) {
-          const fgRef = db.collection(`${businessId}/finished_goods`).doc();
+          const fgRef = db.collection(`users/${businessId}/finished_goods`).doc();
           tx.set(fgRef, {
             id: fgRef.id,
             lotId,
@@ -728,7 +728,7 @@ export const setLotStageBlocked = onRequest(
         businessId: string; lotId: string; blocked: boolean; reason?: string;
       };
 
-      const lotRef = db.doc(`${businessId}/lots/${lotId}`);
+      const lotRef = db.doc(`users/${businessId}/lots/${lotId}`);
       const lotDoc = await lotRef.get();
 
       if (!lotDoc.exists) {
@@ -786,7 +786,7 @@ export const cancelLot = onRequest(
         reason: string;
       };
 
-      const lotRef = db.doc(`${businessId}/lots/${lotId}`);
+      const lotRef = db.doc(`users/${businessId}/lots/${lotId}`);
 
       await db.runTransaction(async (tx) => {
         const lotDoc = await tx.get(lotRef);
@@ -803,7 +803,7 @@ export const cancelLot = onRequest(
           updatedAt: now,
         });
 
-        const reservationsSnap = await db.collection(`${businessId}/material_reservations`)
+        const reservationsSnap = await db.collection(`users/${businessId}/material_reservations`)
           .where("lotId", "==", lotId)
           .where("status", "==", "RESERVED")
           .get();
@@ -816,13 +816,13 @@ export const cancelLot = onRequest(
             updatedAt: now,
           });
 
-          tx.update(db.doc(`${businessId}/raw_materials/${reservation.materialId}`), {
+          tx.update(db.doc(`users/${businessId}/raw_materials/${reservation.materialId}`), {
             reservedStock: FieldValue.increment(-reservation.quantityRequired),
             availableStock: FieldValue.increment(reservation.quantityRequired),
             updatedAt: now,
           });
 
-          const txRef = db.collection(`${businessId}/material_transactions`).doc();
+          const txRef = db.collection(`users/${businessId}/material_transactions`).doc();
           tx.set(txRef, {
             id: txRef.id,
             materialId: reservation.materialId,
@@ -893,7 +893,7 @@ export const addStock = onRequest(
         return;
       }
 
-      const materialRef = db.doc(`${businessId}/raw_materials/${materialId}`);
+      const materialRef = db.doc(`users/${businessId}/raw_materials/${materialId}`);
 
       await db.runTransaction(async (tx) => {
         const matDoc = await tx.get(materialRef);
@@ -910,7 +910,7 @@ export const addStock = onRequest(
           updatedAt: now,
         });
 
-        const txRef = db.collection(`${businessId}/material_transactions`).doc();
+        const txRef = db.collection(`users/${businessId}/material_transactions`).doc();
         tx.set(txRef, {
           id: txRef.id,
           materialId,
@@ -974,7 +974,7 @@ export const adjustStock = onRequest(
         return;
       }
 
-      const materialRef = db.doc(`${businessId}/raw_materials/${materialId}`);
+      const materialRef = db.doc(`users/${businessId}/raw_materials/${materialId}`);
 
       await db.runTransaction(async (tx) => {
         const matDoc = await tx.get(materialRef);
@@ -996,7 +996,7 @@ export const adjustStock = onRequest(
           updatedAt: now,
         });
 
-        const txRef = db.collection(`${businessId}/material_transactions`).doc();
+        const txRef = db.collection(`users/${businessId}/material_transactions`).doc();
         tx.set(txRef, {
           id: txRef.id,
           materialId,
@@ -1044,7 +1044,7 @@ export const syncOrderStatsOnLotChange = onDocumentWritten(
     const orderId = after?.orderId ?? before?.orderId;
     if (!orderId) return;
 
-    const lotsSnap = await db.collection(`${businessId}/lots`)
+    const lotsSnap = await db.collection(`users/${businessId}/lots`)
       .where("orderId", "==", orderId)
       .get();
 
@@ -1061,7 +1061,7 @@ export const syncOrderStatsOnLotChange = onDocumentWritten(
 
     const allCompleted = lotsCompleted === lotsSnap.size;
 
-    await db.doc(`${businessId}/orders/${orderId}`).update({
+    await db.doc(`users/${businessId}/orders/${orderId}`).update({
       lotsCompleted,
       lotsInProduction,
       lotsDelayed,
@@ -1084,7 +1084,7 @@ export const recomputeLotDelays = onSchedule(
       let lastDoc: FirebaseFirestore.QueryDocumentSnapshot | undefined;
 
       do {
-        let query = db.collection(`${businessId}/lots`)
+        let query = db.collection(`users/${businessId}/lots`)
           .where("status", "==", "ACTIVE")
           .limit(CHUNK);
 
@@ -1133,8 +1133,8 @@ export const getOrderDashboard = onRequest(
       const { businessId, orderId } = req.body as { businessId: string; orderId: string };
 
       const [orderDoc, lotsSnap] = await Promise.all([
-        db.doc(`${businessId}/orders/${orderId}`).get(),
-        db.collection(`${businessId}/lots`).where("orderId", "==", orderId).get(),
+        db.doc(`users/${businessId}/orders/${orderId}`).get(),
+        db.collection(`users/${businessId}/lots`).where("orderId", "==", orderId).get(),
       ]);
 
       if (!orderDoc.exists) {
