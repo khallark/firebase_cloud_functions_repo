@@ -42,12 +42,7 @@ export const generateSharedStoreOrdersExcel = onRequest(
         SHARED_STORE_IDS.map(async (storeId) => {
           const [shopDoc, ordersSnapshot] = await Promise.all([
             db.collection("accounts").doc(storeId).get(),
-            db
-              .collection("accounts")
-              .doc(storeId)
-              .collection("orders")
-              .where("vendors", "array-contains", "ENDORA")
-              .get(),
+            db.collection("accounts").doc(storeId).collection("orders").get(),
           ]);
 
           if (!shopDoc.exists) {
@@ -164,6 +159,7 @@ export const generateSharedStoreOrdersExcel = onRequest(
             "Item title": item.title,
             "Item SKU": item.sku || "N/A",
             "Item Quantity": item.quantity,
+            "Total Outstanding": Number(order.raw.total_outstanding ?? 0),
             "Item Price": Number(item.price).toFixed(),
             "Total Order Price": Number(order.raw.total_price).toFixed(2),
             "Total Discount": Number(order.raw.total_discounts || 0).toFixed(2),

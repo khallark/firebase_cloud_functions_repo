@@ -29,35 +29,6 @@ const STATUS_CATEGORIES = {
   delivered: ["Closed", "Delivered"],
 };
 
-// All status labels for display purposes
-// const STATUS_LABELS: Record<string, string> = {
-//   // Cancellations
-//   "Cancellation Requested": "Cancellation Requested",
-//   Cancelled: "Cancelled",
-//   // Pending Dispatch
-//   New: "New",
-//   Confirmed: "Confirmed",
-//   "Ready To Dispatch": "Ready To Dispatch",
-//   // Returns
-//   "RTO Delivered": "RTO Delivered",
-//   "RTO Closed": "RTO Closed",
-//   "RTO In Transit": "RTO In Transit",
-//   "DTO Delivered": "DTO Delivered",
-//   "Pending Refund": "Pending Refund",
-//   "DTO Refunded": "DTO Refunded",
-//   Lost: "Lost",
-//   // In Transit
-//   Dispatched: "Dispatched",
-//   "In Transit": "In Transit",
-//   "Out For Delivery": "Out For Delivery",
-//   "DTO Requested": "DTO Requested",
-//   "DTO Booked": "DTO Booked",
-//   "DTO In Transit": "DTO In Transit",
-//   // Delivered
-//   Closed: "Closed",
-//   Delivered: "Delivered",
-// };
-
 interface TableRowData {
   orderCount: number;
   itemCount: number;

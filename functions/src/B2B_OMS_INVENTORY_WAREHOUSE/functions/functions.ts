@@ -1,6 +1,6 @@
 import { onRequest } from "firebase-functions/v2/https";
 import { onDocumentWritten } from "firebase-functions/v2/firestore";
-import { onSchedule } from "firebase-functions/v2/scheduler";
+// import { onSchedule } from "firebase-functions/v2/scheduler";
 import { FieldValue, Timestamp } from "firebase-admin/firestore";
 import { db } from "../../firebaseAdmin";
 import {
@@ -13,7 +13,6 @@ import {
   FinishedGood,
   LotStageHistory,
   BOMEntry,
-  StageName,
   MaterialTransaction,
   MaterialTransactionType,
 } from "../types";
@@ -1120,43 +1119,43 @@ export const syncOrderStatsOnLotChange = onDocumentWritten(
 
 // ----------------------------------------------------------------------------
 
-export const recomputeLotDelays = onSchedule(
-  { schedule: "0 3 * * *", timeZone: "Asia/Kolkata" }, // 3 UTC = 9 IST
-  async () => {
-    const CHUNK = 100;
-    const businessSnap = await db.collection("users").get();
+// export const recomputeLotDelays = onSchedule(
+//   { schedule: "0 3 * * *", timeZone: "Asia/Kolkata" }, // 3 UTC = 9 IST
+//   async () => {
+//     const CHUNK = 100;
+//     const businessSnap = await db.collection("users").get();
 
-    for (const bizDoc of businessSnap.docs) {
-      const businessId = bizDoc.id;
-      let lastDoc: FirebaseFirestore.QueryDocumentSnapshot | undefined;
+//     for (const bizDoc of businessSnap.docs) {
+//       const businessId = bizDoc.id;
+//       let lastDoc: QueryDocumentSnapshot | undefined;
 
-      do {
-        let query = db
-          .collection(`users/${businessId}/lots`)
-          .where("status", "==", "ACTIVE")
-          .limit(CHUNK);
+//       do {
+//         let query = db
+//           .collection(`users/${businessId}/lots`)
+//           .where("status", "==", "ACTIVE")
+//           .limit(CHUNK);
 
-        if (lastDoc) query = query.startAfter(lastDoc);
+//         if (lastDoc) query = query.startAfter(lastDoc);
 
-        const snap = await query.get();
-        if (snap.empty) break;
+//         const snap = await query.get();
+//         if (snap.empty) break;
 
-        const batch = db.batch();
-        for (const doc of snap.docs) {
-          const lot = doc.data() as Lot;
-          const { isDelayed, delayDays } = computeDelayStatus(lot.stages);
-          if (lot.isDelayed !== isDelayed || lot.delayDays !== delayDays) {
-            batch.update(doc.ref, { isDelayed, delayDays, updatedAt: Timestamp.now() });
-          }
-        }
-        await batch.commit();
+//         const batch = db.batch();
+//         for (const doc of snap.docs) {
+//           const lot = doc.data() as Lot;
+//           const { isDelayed, delayDays } = computeDelayStatus(lot.stages);
+//           if (lot.isDelayed !== isDelayed || lot.delayDays !== delayDays) {
+//             batch.update(doc.ref, { isDelayed, delayDays, updatedAt: Timestamp.now() });
+//           }
+//         }
+//         await batch.commit();
 
-        lastDoc = snap.docs[snap.docs.length - 1];
-        if (snap.size < CHUNK) break;
-      } while (true);
-    }
-  },
-);
+//         lastDoc = snap.docs[snap.docs.length - 1];
+//         if (snap.size < CHUNK) break;
+//       } while (true);
+//     }
+//   },
+// );
 
 // ============================================================================
 // READ / QUERY

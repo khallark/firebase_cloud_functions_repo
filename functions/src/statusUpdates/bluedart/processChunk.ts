@@ -226,8 +226,6 @@ async function fetchAndProcessBlueDartBatch(
 function prepareBlueDartOrderUpdates(orders: any[], shipments: any[]): OrderUpdate[] {
   const updates: OrderUpdate[] = [];
 
-  // Index every order by its AWB (forward & reverse) so we can match
-  // Blue Dart's WaybillNo back to the right order in O(1).
   const ordersByAwb = new Map<string, any>();
   for (const order of orders) {
     if (order.awb) ordersByAwb.set(order.awb, order);
@@ -235,61 +233,50 @@ function prepareBlueDartOrderUpdates(orders: any[], shipments: any[]): OrderUpda
   }
 
   for (const shipment of shipments) {
-    // Blue Dart identifies a shipment by WaybillNo (== the AWB we sent)
     const waybillNo = shipment.WaybillNo;
     if (!waybillNo) continue;
 
     const order = ordersByAwb.get(waybillNo);
     if (!order) continue;
 
-    // ---------------------------------------------------------------------
-    // TODO: Raw status extraction
-    // Will be uncommented once Blue Dart's live status values are mapped.
-    //
-    // Blue Dart returns the following fields on each Shipment object:
-    //   shipment.Status         — human-readable, e.g. "PICKUP HAS BEEN REGISTERED"
-    //   shipment.StatusType     — short code used for logic, e.g. "PU", "IT", "OD", "DL"
-    //   shipment.StatusDate     — e.g. "02 February 2026"
-    //   shipment.StatusTime     — e.g. "15:33"
-    //   shipment.Scans[]        — full scan history; each entry contains:
-    //                                ScanType, ScannedLocation, ScanCode,
-    //                                ScanDate, Scan (description), ScanTime,
-    //                                ScanGroupType
-    //
-    const rawStatusType = shipment.StatusType; // e.g. "PU"
-    // const rawScanType = shipment.Status;
-    // ---------------------------------------------------------------------
+    const rawStatusType = shipment.StatusType;
 
-    // ---------------------------------------------------------------------
-    // TODO: Status determination via determineNewBlueDartStatus()
-    // Will be uncommented once the StatusType mapping below is confirmed
-    // against real shipments and added to helpers.ts.
-    //
-    // Candidate StatusType → app-status mapping (needs live-data validation):
-    //   PU  → "Ready To Dispatch"          (pickup registered)
-    //   IT  → "In Transit"                 (in transit toward destination)
-    //   OD  → "Out For Delivery"           (last-mile out for delivery)
-    //   DL  → "Delivered"                  (delivered to consignee)
-    //   RT → "RTO In Transit"             (return to origin — in transit)
-    //         or "RTO Delivered"           (returned to origin — delivered)
-    //   LS  → "Lost"                       (shipment marked lost)
-    //
     const newStatus = determineNewBlueDartStatus(rawStatusType, order);
-    if (!newStatus) continue; // unrecognised code → skip
-    if (newStatus === order.customStatus) continue; // no change → skip
-    updates.push({
-      ref: order.ref,
-      data: {
-        customStatus: newStatus,
-        lastStatusUpdate: FieldValue.serverTimestamp(),
-        customStatusesLogs: FieldValue.arrayUnion({
-          status: newStatus,
-          createdAt: Timestamp.now(),
-          remarks: getStatusRemarks(newStatus),
-        }),
-      },
-    });
-    // ---------------------------------------------------------------------
+    if (!newStatus) continue;
+    if (newStatus === order.customStatus) continue;
+
+    const updateData: any = {
+      customStatus: newStatus,
+      lastStatusUpdate: FieldValue.serverTimestamp(),
+      customStatusesLogs: FieldValue.arrayUnion({
+        status: newStatus,
+        createdAt: Timestamp.now(),
+        remarks: getStatusRemarks(newStatus),
+      }),
+    };
+
+    if (newStatus === "Delivered") {
+      const scans: any[] = Array.isArray(shipment.Scans) ? shipment.Scans : [];
+      const dlScans = scans
+        .map((s: any) => s.ScanDetail)
+        .filter((s: any) => s?.ScanType === "DL" && s.ScanDate && s.ScanTime);
+
+      let bluedartdeliveredtime: Timestamp | null = null;
+      for (const scan of dlScans) {
+        const parsed = new Date(`${scan.ScanDate} ${scan.ScanTime}`);
+        if (!isNaN(parsed.getTime())) {
+          if (!bluedartdeliveredtime || parsed.getTime() > bluedartdeliveredtime.toMillis()) {
+            bluedartdeliveredtime = Timestamp.fromDate(parsed);
+          }
+        }
+      }
+
+      if (bluedartdeliveredtime) {
+        updateData.bluedartdeliveredtime = bluedartdeliveredtime;
+      }
+    }
+
+    updates.push({ ref: order.ref, data: updateData });
   }
 
   return updates;
