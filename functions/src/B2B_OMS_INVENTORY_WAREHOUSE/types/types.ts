@@ -24,7 +24,7 @@ export type StageName =
   | "PACKING";
 
 // ============================================================================
-// STAGE CONFIG  (/{businessId}/production_stage_config/{stageId})
+// STAGE CONFIG  (users/{businessId}/production_stage_config/{stageId})
 // Seed data — defines available stages for the business.
 // Lots copy the stage NAME only, not the ID. Loose coupling.
 // ============================================================================
@@ -41,7 +41,7 @@ export interface ProductionStageConfig {
 }
 
 // ============================================================================
-// BUYER  (/{businessId}/buyers/{buyerId})
+// BUYER  (users/{businessId}/buyers/{buyerId})
 // ============================================================================
 
 export interface Buyer {
@@ -58,7 +58,7 @@ export interface Buyer {
 }
 
 // ============================================================================
-// PRODUCT  (/{businessId}/products/{productId})
+// PRODUCT  (users/{businessId}/b2bProducts/{productId})
 // The finished garment SKU — not raw material.
 // ============================================================================
 
@@ -75,7 +75,7 @@ export interface Product {
 }
 
 // ============================================================================
-// BOM (Bill of Materials)  (/{businessId}/bom/{bomId})
+// BOM (Bill of Materials)  (users/{businessId}/bom/{bomId})
 // One doc per product-material combination.
 // Flat — query by productId to get all materials for a product.
 // ============================================================================
@@ -97,7 +97,7 @@ export interface BOMEntry {
 }
 
 // ============================================================================
-// RAW MATERIAL  (/{businessId}/raw_materials/{materialId})
+// RAW MATERIAL  (users/{businessId}/raw_materials/{materialId})
 // ============================================================================
 
 export interface RawMaterial {
@@ -117,7 +117,7 @@ export interface RawMaterial {
 }
 
 // ============================================================================
-// MATERIAL RESERVATION  (/{businessId}/material_reservations/{reservationId})
+// MATERIAL RESERVATION  (users/{businessId}/material_reservations/{reservationId})
 // Created when a lot is confirmed. One doc per lot-material combination.
 // ============================================================================
 
@@ -139,7 +139,7 @@ export interface MaterialReservation {
 }
 
 // ============================================================================
-// MATERIAL TRANSACTION  (/{businessId}/material_transactions/{txId})
+// MATERIAL TRANSACTION  (users/{businessId}/material_transactions/{txId})
 // Audit log for every raw material stock movement.
 // ============================================================================
 
@@ -178,7 +178,7 @@ export interface LotStage {
 }
 
 // ============================================================================
-// LOT  (/{businessId}/lots/{lotId})
+// LOT  (users/{businessId}/lots/{lotId})
 // Core production unit. Each lot = one batch of one SKU/color moving
 // through its own defined stage pipeline.
 // ============================================================================
@@ -244,7 +244,7 @@ export interface DraftLotInput {
 }
 
 // ============================================================================
-// ORDER  (/{businessId}/orders/{orderId})
+// ORDER  (users/{businessId}/orders/{orderId})
 // Parent of lots. Buyer-facing entity.
 // ============================================================================
 
@@ -278,7 +278,7 @@ export interface Order {
 }
 
 // ============================================================================
-// FINISHED GOODS  (/{businessId}/finished_goods/{finishedGoodId})
+// FINISHED GOODS  (users/{businessId}/finished_goods/{finishedGoodId})
 // Created when a lot's final stage (PACKING) is marked complete.
 // Ready for dispatch.
 // ============================================================================
@@ -309,7 +309,7 @@ export interface FinishedGood {
 }
 
 // ============================================================================
-// LOT STAGE HISTORY  (/{businessId}/lot_stage_history/{historyId})
+// LOT STAGE HISTORY  (users/{businessId}/lot_stage_history/{historyId})
 // Immutable audit log — one doc written every time a lot moves stages.
 // Separate from the lot doc so the lot stays lean.
 // ============================================================================

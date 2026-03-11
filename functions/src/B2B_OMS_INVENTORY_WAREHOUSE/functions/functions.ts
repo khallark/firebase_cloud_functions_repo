@@ -194,6 +194,14 @@
  *   Writes: users/{businessId}/raw_materials/{materialId}
  *           users/{businessId}/material_transactions/{txId}
  *
+ * --- MaterialTransaction types and where each is written ---
+ *
+ *   PURCHASE     → addStock
+ *   RESERVATION  → createOrder, confirmOrder  (stock locked for a lot)
+ *   CONSUMPTION  → advanceLotStage            (stock physically used up)
+ *   RETURN       → cancelOrder, cancelLot     (reserved stock released back)
+ *   ADJUSTMENT   → adjustStock
+ *
  * =============================================================================
  * SECTION 5 — DISPATCH
  * =============================================================================
@@ -563,7 +571,7 @@ export const createProduct = onRequest(
         defaultStages: StageName[];
       };
 
-      const productId = db.collection(`users/${businessId}/products`).doc().id;
+      const productId = db.collection(`users/${businessId}/b2bProducts`).doc().id;
       const now = Timestamp.now();
 
       await db.doc(`users/${businessId}/b2bProducts/${productId}`).set({
@@ -1217,6 +1225,19 @@ export const confirmOrder = onRequest(
           availableStock: FieldValue.increment(-reservation.quantityRequired),
           updatedAt: Timestamp.now(),
         });
+        const txRef = db.collection(`users/${businessId}/material_transactions`).doc();
+        batch.set(txRef, {
+          id: txRef.id,
+          materialId: reservation.materialId,
+          materialName: reservation.materialName,
+          type: "RESERVATION" as MaterialTransactionType,
+          quantity: reservation.quantityRequired,
+          referenceId: orderId,
+          referenceType: "LOT",
+          note: `Stock reserved for Lot ${reservation.lotNumber} (Order ${order.orderNumber})`,
+          createdBy: confirmedBy,
+          createdAt: Timestamp.now(),
+        } satisfies Omit<MaterialTransaction, "stockBefore" | "stockAfter">);
       }
 
       batch.update(orderRef, {
@@ -1341,6 +1362,19 @@ export const createOrder = onRequest(
           availableStock: FieldValue.increment(-reservation.quantityRequired),
           updatedAt: Timestamp.now(),
         });
+        const txRef = db.collection(`users/${businessId}/material_transactions`).doc();
+        batch.set(txRef, {
+          id: txRef.id,
+          materialId: reservation.materialId,
+          materialName: reservation.materialName,
+          type: "RESERVATION" as MaterialTransactionType,
+          quantity: reservation.quantityRequired,
+          referenceId: orderId,
+          referenceType: "LOT",
+          note: `Stock reserved for Lot ${reservation.lotNumber} (Order ${orderNumber})`,
+          createdBy: createdBy,
+          createdAt: Timestamp.now(),
+        } satisfies Omit<MaterialTransaction, "stockBefore" | "stockAfter">);
       }
 
       await batch.commit();
@@ -1561,6 +1595,19 @@ export const advanceLotStage = onRequest(
             totalStock: FieldValue.increment(-reservation.quantityRequired),
             updatedAt: now,
           });
+          const txRef = db.collection(`users/${businessId}/material_transactions`).doc();
+          tx.set(txRef, {
+            id: txRef.id,
+            materialId: reservation.materialId,
+            materialName: reservation.materialName,
+            type: "CONSUMPTION" as MaterialTransactionType,
+            quantity: reservation.quantityRequired,
+            referenceId: lotId,
+            referenceType: "LOT",
+            note: `Consumed at stage ${currentStage.stage} — Lot ${lot.lotNumber}`,
+            createdBy: completedBy,
+            createdAt: now,
+          } satisfies Omit<MaterialTransaction, "stockBefore" | "stockAfter">);
         }
 
         if (isLastStage) {
