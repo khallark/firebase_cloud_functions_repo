@@ -2046,7 +2046,18 @@ export const dispatchFinishedGood = onRequest(
 
 // ============================================================================
 // SECTION 6 — BACKGROUND (TRIGGERS + SCHEDULED)
-// syncOrderStatsOnLotChange → recomputeLotDelays
+//
+// Triggers on lots/:
+//   syncOrderStatsOnLotChange            → re-aggregates order stats on every lot write
+//   appendLotStageHistoryOnStageAdvance  → writes LotStageHistory when currentSequence changes
+//   createFinishedGoodOnLotCompleted     → creates finished_goods doc when lot → COMPLETED
+//
+// Trigger on material_reservations/:
+//   syncMaterialStockOnReservationChange → keeps reservedStock / availableStock / totalStock
+//                                          in sync on every reservation status change
+//
+// Scheduled:
+//   recomputeLotDelays                   → daily 9am IST, recomputes isDelayed/delayDays
 // ============================================================================
 
 export const syncOrderStatsOnLotChange = onDocumentWritten(
@@ -2088,6 +2099,148 @@ export const syncOrderStatsOnLotChange = onDocumentWritten(
 );
 
 // ----------------------------------------------------------------------------
+
+// ----------------------------------------------------------------------------
+
+export const appendLotStageHistoryOnStageAdvance = onDocumentWritten(
+  "users/{businessId}/lots/{lotId}",
+  async (event) => {
+    const businessId = event.params.businessId;
+    const lotId = event.params.lotId;
+
+    const before = event.data?.before?.data() as Lot | undefined;
+    const after = event.data?.after?.data() as Lot | undefined;
+
+    // Only fire when currentSequence advances
+    if (!before || !after) return;
+    if (after.currentSequence === before.currentSequence) return;
+
+    // The stage that was just completed is at before.currentSequence - 1 (0-based)
+    const completedStage = after.stages[before.currentSequence - 1];
+    if (!completedStage) return;
+
+    const historyRef = db.collection(`users/${businessId}/lot_stage_history`).doc();
+    await historyRef.set({
+      id: historyRef.id,
+      lotId,
+      lotNumber: after.lotNumber,
+      orderId: after.orderId,
+      fromStage: before.currentStage,
+      toStage: after.currentStage,
+      fromSequence: before.currentSequence,
+      toSequence: after.currentSequence,
+      movedBy: completedStage.completedBy ?? null,
+      movedAt: completedStage.actualDate ?? Timestamp.now(),
+      note: completedStage.note ?? null,
+    } satisfies LotStageHistory);
+  },
+);
+
+// ----------------------------------------------------------------------------
+
+export const createFinishedGoodOnLotCompleted = onDocumentWritten(
+  "users/{businessId}/lots/{lotId}",
+  async (event) => {
+    const businessId = event.params.businessId;
+    const lotId = event.params.lotId;
+
+    const before = event.data?.before?.data() as Lot | undefined;
+    const after = event.data?.after?.data() as Lot | undefined;
+
+    // Only fire when status flips to COMPLETED
+    if (!after || after.status !== "COMPLETED") return;
+    if (before?.status === "COMPLETED") return;
+
+    // Guard against duplicate creation (e.g. trigger retry)
+    const existing = await db
+      .collection(`users/${businessId}/finished_goods`)
+      .where("lotId", "==", lotId)
+      .limit(1)
+      .get();
+
+    if (!existing.empty) return;
+
+    const now = Timestamp.now();
+    const fgRef = db.collection(`users/${businessId}/finished_goods`).doc();
+
+    await fgRef.set({
+      id: fgRef.id,
+      lotId,
+      lotNumber: after.lotNumber,
+      orderId: after.orderId,
+      orderNumber: after.orderNumber,
+      buyerId: after.buyerId,
+      buyerName: after.buyerName,
+      productId: after.productId,
+      productName: after.productName,
+      productSku: after.productSku,
+      color: after.color,
+      size: after.size ?? null,
+      quantity: after.quantity,
+      cartonCount: null,
+      totalWeightKg: null,
+      packedAt: now,
+      dispatchedAt: null,
+      isDispatched: false,
+      courierName: null,
+      awb: null,
+      createdAt: now,
+      updatedAt: now,
+    } satisfies FinishedGood);
+  },
+);
+
+// ----------------------------------------------------------------------------
+
+export const syncMaterialStockOnReservationChange = onDocumentWritten(
+  "users/{businessId}/material_reservations/{reservationId}",
+  async (event) => {
+    const businessId = event.params.businessId;
+
+    const before = event.data?.before?.data() as MaterialReservation | undefined;
+    const after = event.data?.after?.data() as MaterialReservation | undefined;
+
+    const materialId = after?.materialId ?? before?.materialId;
+    if (!materialId) return;
+
+    const materialRef = db.doc(`users/${businessId}/raw_materials/${materialId}`);
+    const now = Timestamp.now();
+
+    const beforeStatus = before?.status ?? null;
+    const afterStatus = after?.status ?? null;
+    const qty = after?.quantityRequired ?? before?.quantityRequired ?? 0;
+
+    // Created → RESERVED
+    if (!before && afterStatus === "RESERVED") {
+      await materialRef.update({
+        reservedStock: FieldValue.increment(qty),
+        availableStock: FieldValue.increment(-qty),
+        updatedAt: now,
+      });
+      return;
+    }
+
+    // RESERVED → CONSUMED (stage completed, material physically used up)
+    if (beforeStatus === "RESERVED" && afterStatus === "CONSUMED") {
+      await materialRef.update({
+        reservedStock: FieldValue.increment(-qty),
+        totalStock: FieldValue.increment(-qty),
+        updatedAt: now,
+      });
+      return;
+    }
+
+    // RESERVED → RELEASED (lot or order cancelled)
+    if (beforeStatus === "RESERVED" && afterStatus === "RELEASED") {
+      await materialRef.update({
+        reservedStock: FieldValue.increment(-qty),
+        availableStock: FieldValue.increment(qty),
+        updatedAt: now,
+      });
+      return;
+    }
+  },
+);
 
 export const recomputeLotDelays = onSchedule(
   { schedule: "0 3 * * *", timeZone: "Asia/Kolkata" }, // 3 UTC = 9 IST

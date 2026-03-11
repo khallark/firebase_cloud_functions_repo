@@ -415,7 +415,7 @@ export interface LotStageHistory {
   toStage: StageName;
   fromSequence: number | null;
   toSequence: number;
-  movedBy: string;
+  movedBy: string | null;
   movedAt: Timestamp;
   note: string | null;
 }
