@@ -18,3 +18,4 @@ export * from "./fetchNotPickedUpOrders";
 export * from "./syncLastStatusUpdate";
 export * from "./convertToRTOClosed";
 export * from "./syncBlueDartDeliveredTime";
+export * from "./syncDelhiveryDeliveredTime";

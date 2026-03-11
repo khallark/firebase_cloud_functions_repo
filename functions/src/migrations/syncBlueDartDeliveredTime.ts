@@ -77,11 +77,16 @@ const trackBatch = async (awbs: string[], jwtToken: string): Promise<Shipment[]>
   return data?.ShipmentData?.Shipment ?? [];
 };
 
-// Parses "11-Feb-2026" + "14:55" into a JS Date
 const parseScanDateTime = (date: string, time: string): Date | null => {
   try {
-    // "11-Feb-2026 14:55"
-    const dt = new Date(`${date} ${time}`);
+    const [day, month, year] = date.split("-");
+    const monthMap: Record<string, string> = {
+      Jan: "01", Feb: "02", Mar: "03", Apr: "04",
+      May: "05", Jun: "06", Jul: "07", Aug: "08",
+      Sep: "09", Oct: "10", Nov: "11", Dec: "12",
+    };
+    const isoString = `${year}-${monthMap[month]}-${day}T${time}:00+05:30`;
+    const dt = new Date(isoString);
     if (isNaN(dt.getTime())) return null;
     return dt;
   } catch {
@@ -92,7 +97,7 @@ const parseScanDateTime = (date: string, time: string): Date | null => {
 export const syncBlueDartDeliveredTime = onRequest(
   {
     cors: true,
-    timeoutSeconds: 540,
+    timeoutSeconds: 3600,
     memory: "1GiB",
   },
   async (req, res) => {
@@ -104,7 +109,7 @@ export const syncBlueDartDeliveredTime = onRequest(
         STORE_IDS.map((storeId) =>
           db
             .collection(`accounts/${storeId}/orders`)
-            .where("customStatus", "in", ["Delivered", "Closed"])
+            .where("customStatus", "in", ["Delivered", "Closed", "DTO Requested", "DTO Booked", "DTO In Transit", "DTO Delivered", "Pending Refunds", "DTO Refunded"])
             .where("courier", "==", "Blue Dart")
             .get(),
         ),

@@ -1,7 +1,253 @@
+/*
+ * =============================================================================
+ * B2B OMS — CLOUD FUNCTIONS
+ * =============================================================================
+ *
+ * All functions are HTTP onRequest handlers unless noted otherwise.
+ * All write functions require the x-api-key header (ENQUEUE_FUNCTION_SECRET).
+ * All paths are scoped under users/{businessId}/...
+ *
+ * =============================================================================
+ * SECTION 1 — MASTER DATA
+ * =============================================================================
+ *
+ * createBuyer
+ *   Creates a new buyer record.
+ *   Types: Buyer
+ *   Writes: users/{businessId}/buyers/{buyerId}
+ *
+ * updateBuyer
+ *   Updates editable fields on an existing buyer (name, contact, address, etc.).
+ *   Cannot change id or createdAt.
+ *   Types: Buyer
+ *   Writes: users/{businessId}/buyers/{buyerId}
+ *
+ * createProduct
+ *   Creates a new finished-garment product with a default stage sequence.
+ *   Types: Product
+ *   Writes: users/{businessId}/b2bProducts/{productId}
+ *
+ * updateProduct
+ *   Updates editable fields on a product (name, category, defaultStages, etc.).
+ *   Types: Product
+ *   Writes: users/{businessId}/b2bProducts/{productId}
+ *
+ * createRawMaterial
+ *   Creates a new raw material with zero stock. Stock is added separately via addStock.
+ *   Types: RawMaterial
+ *   Writes: users/{businessId}/raw_materials/{materialId}
+ *
+ * updateRawMaterial
+ *   Updates metadata on a raw material (name, category, reorderLevel, supplier, etc.).
+ *   Does NOT touch stock fields — use addStock / adjustStock for that.
+ *   Types: RawMaterial
+ *   Writes: users/{businessId}/raw_materials/{materialId}
+ *
+ * createBOMEntry
+ *   Creates a BOM entry linking one product to one raw material.
+ *   Defines how much of the material is needed per finished piece,
+ *   which production stage consumes it, and the wastage buffer %.
+ *   Types: BOMEntry
+ *   Reads:  users/{businessId}/b2bProducts/{productId}
+ *           users/{businessId}/raw_materials/{materialId}
+ *   Writes: users/{businessId}/bom/{bomId}
+ *
+ * updateBOMEntry
+ *   Updates quantityPerPiece, wastagePercent, or consumedAtStage on a BOM entry.
+ *   Cannot change which product or material the entry links.
+ *   Types: BOMEntry
+ *   Writes: users/{businessId}/bom/{bomId}
+ *
+ * deactivateBOMEntry
+ *   Soft-deletes a BOM entry by setting isActive: false.
+ *   Deactivated entries are ignored by createOrder / confirmOrder.
+ *   Types: BOMEntry
+ *   Writes: users/{businessId}/bom/{bomId}
+ *
+ * createStageConfig
+ *   Creates a production stage config entry (seed data for the stage picker UI).
+ *   Types: ProductionStageConfig
+ *   Writes: users/{businessId}/production_stage_config/{stageId}
+ *
+ * updateStageConfig
+ *   Updates label, description, defaultDurationDays, canBeOutsourced, or sortOrder.
+ *   Types: ProductionStageConfig
+ *   Writes: users/{businessId}/production_stage_config/{stageId}
+ *
+ * =============================================================================
+ * SECTION 2 — ORDER LIFECYCLE
+ * =============================================================================
+ *
+ * saveDraftOrder
+ *   Creates an order in DRAFT status. No lots are created, no materials reserved.
+ *   Lot configurations are stored as draftLots[] on the order doc for later editing.
+ *   Types: Order, DraftLotInput
+ *   Writes: users/{businessId}/orders/{orderId}
+ *           users/{businessId}/counters/orders
+ *
+ * confirmOrder
+ *   Moves a DRAFT order to IN_PRODUCTION. Creates lots, fetches BOM per product,
+ *   checks material availability, reserves stock, and clears draftLots from the order.
+ *   Optionally accepts updated lot configs to allow last-minute changes before confirming.
+ *   Rolls back to DRAFT if stock check fails.
+ *   Types: Order, DraftLotInput, Lot, LotStage, BOMEntry, MaterialReservation, RawMaterial
+ *   Reads:  users/{businessId}/orders/{orderId}
+ *           users/{businessId}/bom (query by productId)
+ *           users/{businessId}/raw_materials/{materialId}
+ *   Writes: users/{businessId}/orders/{orderId}
+ *           users/{businessId}/lots/{lotId} (one per lot)
+ *           users/{businessId}/material_reservations/{reservationId} (one per lot-material pair)
+ *           users/{businessId}/raw_materials/{materialId} (reservedStock / availableStock)
+ *           users/{businessId}/counters/lots
+ *
+ * createOrder
+ *   Creates an order and immediately starts production in a single call (no draft step).
+ *   Identical to confirmOrder but also creates the order doc in the same batch.
+ *   Types: Order, DraftLotInput, Lot, LotStage, BOMEntry, MaterialReservation, RawMaterial
+ *   Reads:  users/{businessId}/bom (query by productId)
+ *           users/{businessId}/raw_materials/{materialId}
+ *   Writes: users/{businessId}/orders/{orderId}
+ *           users/{businessId}/lots/{lotId}
+ *           users/{businessId}/material_reservations/{reservationId}
+ *           users/{businessId}/raw_materials/{materialId}
+ *           users/{businessId}/counters/orders
+ *           users/{businessId}/counters/lots
+ *
+ * cancelOrder
+ *   Cancels an order and all its active lots.
+ *   For DRAFT orders: just flips status, no lot/reservation cleanup needed.
+ *   For IN_PRODUCTION orders: cancels all non-completed lots, releases all RESERVED
+ *   material reservations, restores availableStock, and writes RETURN transactions.
+ *   Types: Order, Lot, MaterialReservation, RawMaterial, MaterialTransaction
+ *   Reads:  users/{businessId}/orders/{orderId}
+ *           users/{businessId}/lots (query by orderId)
+ *           users/{businessId}/material_reservations (query by lotId + status)
+ *   Writes: users/{businessId}/orders/{orderId}
+ *           users/{businessId}/lots/{lotId}
+ *           users/{businessId}/material_reservations/{reservationId}
+ *           users/{businessId}/raw_materials/{materialId}
+ *           users/{businessId}/material_transactions/{txId}
+ *
+ * =============================================================================
+ * SECTION 3 — LOT LIFECYCLE
+ * =============================================================================
+ *
+ * advanceLotStage
+ *   Marks the current stage COMPLETED and moves the lot to the next stage.
+ *   Consumes all RESERVED material reservations for the completed stage,
+ *   decrementing reservedStock and totalStock on each raw material.
+ *   If the completed stage is the last one, creates a finished_goods doc
+ *   and marks the lot COMPLETED.
+ *   Runs in a Firestore transaction.
+ *   Types: Lot, LotStage, LotStageHistory, MaterialReservation, RawMaterial, FinishedGood
+ *   Reads:  users/{businessId}/lots/{lotId}
+ *           users/{businessId}/material_reservations (query by lotId + stage + status)
+ *   Writes: users/{businessId}/lots/{lotId}
+ *           users/{businessId}/lot_stage_history/{historyId}
+ *           users/{businessId}/material_reservations/{reservationId}
+ *           users/{businessId}/raw_materials/{materialId}
+ *           users/{businessId}/finished_goods/{finishedGoodId} (if last stage)
+ *
+ * setLotStageBlocked
+ *   Toggles the current stage between BLOCKED and IN_PROGRESS.
+ *   Used to flag a lot that needs attention (machine breakdown, outsource delay, etc.)
+ *   and to clear that flag when resolved.
+ *   Types: Lot, LotStage
+ *   Reads:  users/{businessId}/lots/{lotId}
+ *   Writes: users/{businessId}/lots/{lotId}
+ *
+ * cancelLot
+ *   Cancels a single lot. Releases all RESERVED reservations for the lot,
+ *   restores availableStock, and writes RETURN transactions per material.
+ *   Guards against cancelling an already-CANCELLED or COMPLETED lot.
+ *   Runs in a Firestore transaction.
+ *   Types: Lot, MaterialReservation, RawMaterial, MaterialTransaction
+ *   Reads:  users/{businessId}/lots/{lotId}
+ *           users/{businessId}/material_reservations (query by lotId + status)
+ *   Writes: users/{businessId}/lots/{lotId}
+ *           users/{businessId}/material_reservations/{reservationId}
+ *           users/{businessId}/raw_materials/{materialId}
+ *           users/{businessId}/material_transactions/{txId}
+ *
+ * =============================================================================
+ * SECTION 4 — STOCK MANAGEMENT
+ * =============================================================================
+ *
+ * addStock
+ *   Records an inbound stock receipt (GRN / purchase order).
+ *   Increments both totalStock and availableStock.
+ *   Writes a PURCHASE transaction with stockBefore / stockAfter.
+ *   Quantity must be positive.
+ *   Types: RawMaterial, MaterialTransaction
+ *   Reads:  users/{businessId}/raw_materials/{materialId}
+ *   Writes: users/{businessId}/raw_materials/{materialId}
+ *           users/{businessId}/material_transactions/{txId}
+ *
+ * adjustStock
+ *   Manual stock correction (positive or negative). Requires a note explaining why.
+ *   Only touches totalStock and availableStock — never reservedStock
+ *   (reservations are independent commitments and must not be silently changed).
+ *   Guards against pushing availableStock below zero.
+ *   Writes an ADJUSTMENT transaction with stockBefore / stockAfter.
+ *   Types: RawMaterial, MaterialTransaction
+ *   Reads:  users/{businessId}/raw_materials/{materialId}
+ *   Writes: users/{businessId}/raw_materials/{materialId}
+ *           users/{businessId}/material_transactions/{txId}
+ *
+ * =============================================================================
+ * SECTION 5 — DISPATCH
+ * =============================================================================
+ *
+ * dispatchFinishedGood
+ *   Marks a finished good as dispatched. Sets isDispatched: true, dispatchedAt,
+ *   courierName, and awb. This is the handoff point to Majime — after dispatch,
+ *   Majime takes over tracking via the AWB.
+ *   Guards against double-dispatching.
+ *   Types: FinishedGood
+ *   Reads:  users/{businessId}/finished_goods/{finishedGoodId}
+ *   Writes: users/{businessId}/finished_goods/{finishedGoodId}
+ *
+ * =============================================================================
+ * SECTION 6 — BACKGROUND (TRIGGERS + SCHEDULED)
+ * =============================================================================
+ *
+ * syncOrderStatsOnLotChange  [onDocumentWritten trigger]
+ *   Fires on every lot write. Re-aggregates lotsCompleted, lotsInProduction,
+ *   and lotsDelayed on the parent order by querying all lots for that order.
+ *   Auto-sets order status to COMPLETED when all lots are completed.
+ *   Types: Lot, Order
+ *   Reads:  users/{businessId}/lots (query by orderId)
+ *   Writes: users/{businessId}/orders/{orderId}
+ *
+ * recomputeLotDelays  [onSchedule — daily at 9am IST]
+ *   Iterates all businesses and all ACTIVE lots in chunks of 100.
+ *   Recomputes isDelayed and delayDays based on plannedDate vs today.
+ *   Only writes if the value has changed, to avoid unnecessary Firestore writes.
+ *   Types: Lot, LotStage
+ *   Reads:  users (all businesses)
+ *           users/{businessId}/lots (query by status ACTIVE, paginated)
+ *   Writes: users/{businessId}/lots/{lotId} (only if delay status changed)
+ *
+ * =============================================================================
+ * SECTION 7 — READ / QUERY
+ * =============================================================================
+ *
+ * getOrderDashboard
+ *   Returns the full order detail view in one call.
+ *   Fetches the order doc and all its lots in parallel.
+ *   Returns: order data, lots grouped by currentStage (for Kanban),
+ *   and a tnaSummary per lot (for TNA table view).
+ *   Types: Order, Lot, LotStage
+ *   Reads:  users/{businessId}/orders/{orderId}
+ *           users/{businessId}/lots (query by orderId)
+ *
+ * =============================================================================
+ */
+
 import { onRequest } from "firebase-functions/v2/https";
 import { onDocumentWritten } from "firebase-functions/v2/firestore";
-// import { onSchedule } from "firebase-functions/v2/scheduler";
-import { FieldValue, Timestamp } from "firebase-admin/firestore";
+import { onSchedule } from "firebase-functions/v2/scheduler";
+import { FieldValue, QueryDocumentSnapshot, Timestamp } from "firebase-admin/firestore";
 import { db } from "../../firebaseAdmin";
 import {
   Lot,
@@ -15,12 +261,16 @@ import {
   BOMEntry,
   MaterialTransaction,
   MaterialTransactionType,
+  Buyer,
+  Product,
+  ProductionStageConfig,
+  StageName,
 } from "../types";
 import { requireHeaderSecret } from "../../helpers";
 import { ENQUEUE_FUNCTION_SECRET } from "../../config";
 
 // ============================================================================
-// HELPERS
+// INTERNAL HELPERS
 // ============================================================================
 
 async function generateLotNumber(businessId: string): Promise<string> {
@@ -61,7 +311,6 @@ function computeDelayStatus(stages: LotStage[]): { isDelayed: boolean; delayDays
   return { isDelayed: maxDelay > 0, delayDays: maxDelay };
 }
 
-// Shared lot-building logic — used by both createOrder and confirmOrder
 async function buildLotsAndReservations(
   businessId: string,
   orderId: string,
@@ -128,7 +377,8 @@ async function buildLotsAndReservations(
     for (const bomDoc of bomSnap.docs) {
       const bom = bomDoc.data() as BOMEntry;
       const reservationId = db.collection(`users/${businessId}/material_reservations`).doc().id;
-      const qtyRequired = lotInput.quantity * bom.quantityPerPiece * (1 + bom.wastagePercent / 100);
+      const qtyRequired =
+        lotInput.quantity * bom.quantityPerPiece * (1 + bom.wastagePercent / 100);
 
       reservationDocs.push({
         id: reservationId,
@@ -152,7 +402,6 @@ async function buildLotsAndReservations(
   return { lotDocs, reservationDocs };
 }
 
-// Shared stock check — used by both createOrder and confirmOrder
 async function checkStockShortfalls(
   businessId: string,
   reservationDocs: MaterialReservation[],
@@ -179,7 +428,625 @@ async function checkStockShortfalls(
 }
 
 // ============================================================================
-// ORDER LIFECYCLE
+// SECTION 1 — MASTER DATA
+// createBuyer → updateBuyer → createProduct → updateProduct →
+// createRawMaterial → updateRawMaterial →
+// createBOMEntry → updateBOMEntry → deactivateBOMEntry →
+// createStageConfig → updateStageConfig
+// ============================================================================
+
+export const createBuyer = onRequest(
+  {
+    secrets: [ENQUEUE_FUNCTION_SECRET],
+    cors: true,
+    timeoutSeconds: 60,
+    memory: "128MiB",
+  },
+  async (req, res) => {
+    requireHeaderSecret(req, "x-api-key", ENQUEUE_FUNCTION_SECRET.value() || "");
+    if (req.method !== "POST") {
+      res.status(405).json({ error: "method_not_allowed" });
+      return;
+    }
+
+    try {
+      const { businessId, name, contactPerson, phone, email, address, gstNumber, createdBy } =
+        req.body as {
+          businessId: string;
+          name: string;
+          contactPerson: string;
+          phone: string;
+          email: string;
+          address: string;
+          gstNumber?: string;
+          createdBy: string;
+        };
+
+      const buyerId = db.collection(`users/${businessId}/buyers`).doc().id;
+      const now = Timestamp.now();
+
+      await db.doc(`users/${businessId}/buyers/${buyerId}`).set({
+        id: buyerId,
+        name,
+        contactPerson,
+        phone,
+        email,
+        address,
+        gstNumber: gstNumber ?? null,
+        isActive: true,
+        createdAt: now,
+        updatedAt: now,
+      } satisfies Buyer);
+
+      res.status(200).json({ buyerId });
+    } catch (error) {
+      console.error("createBuyer error:", error);
+      res.status(500).json({ error: "internal", message: (error as Error).message });
+    }
+  },
+);
+
+// ----------------------------------------------------------------------------
+
+export const updateBuyer = onRequest(
+  {
+    secrets: [ENQUEUE_FUNCTION_SECRET],
+    cors: true,
+    timeoutSeconds: 60,
+    memory: "128MiB",
+  },
+  async (req, res) => {
+    requireHeaderSecret(req, "x-api-key", ENQUEUE_FUNCTION_SECRET.value() || "");
+    if (req.method !== "POST") {
+      res.status(405).json({ error: "method_not_allowed" });
+      return;
+    }
+
+    try {
+      const { businessId, buyerId, ...fields } = req.body as {
+        businessId: string;
+        buyerId: string;
+        name?: string;
+        contactPerson?: string;
+        phone?: string;
+        email?: string;
+        address?: string;
+        gstNumber?: string | null;
+        isActive?: boolean;
+      };
+
+      const buyerRef = db.doc(`users/${businessId}/buyers/${buyerId}`);
+      const buyerDoc = await buyerRef.get();
+
+      if (!buyerDoc.exists) {
+        res.status(404).json({ error: "buyer_not_found" });
+        return;
+      }
+
+      // Strip undefined values so we don't write them to Firestore
+      const updates = Object.fromEntries(
+        Object.entries(fields).filter(([, v]) => v !== undefined),
+      );
+
+      await buyerRef.update({ ...updates, updatedAt: Timestamp.now() });
+      res.status(200).json({ success: true });
+    } catch (error) {
+      console.error("updateBuyer error:", error);
+      res.status(500).json({ error: "internal", message: (error as Error).message });
+    }
+  },
+);
+
+// ----------------------------------------------------------------------------
+
+export const createProduct = onRequest(
+  {
+    secrets: [ENQUEUE_FUNCTION_SECRET],
+    cors: true,
+    timeoutSeconds: 60,
+    memory: "128MiB",
+  },
+  async (req, res) => {
+    requireHeaderSecret(req, "x-api-key", ENQUEUE_FUNCTION_SECRET.value() || "");
+    if (req.method !== "POST") {
+      res.status(405).json({ error: "method_not_allowed" });
+      return;
+    }
+
+    try {
+      const { businessId, name, sku, category, description, defaultStages } = req.body as {
+        businessId: string;
+        name: string;
+        sku: string;
+        category: string;
+        description?: string;
+        defaultStages: StageName[];
+      };
+
+      const productId = db.collection(`users/${businessId}/products`).doc().id;
+      const now = Timestamp.now();
+
+      await db.doc(`users/${businessId}/b2bProducts/${productId}`).set({
+        id: productId,
+        name,
+        sku,
+        category,
+        description: description ?? null,
+        defaultStages,
+        isActive: true,
+        createdAt: now,
+        updatedAt: now,
+      } satisfies Product);
+
+      res.status(200).json({ productId });
+    } catch (error) {
+      console.error("createProduct error:", error);
+      res.status(500).json({ error: "internal", message: (error as Error).message });
+    }
+  },
+);
+
+// ----------------------------------------------------------------------------
+
+export const updateProduct = onRequest(
+  {
+    secrets: [ENQUEUE_FUNCTION_SECRET],
+    cors: true,
+    timeoutSeconds: 60,
+    memory: "128MiB",
+  },
+  async (req, res) => {
+    requireHeaderSecret(req, "x-api-key", ENQUEUE_FUNCTION_SECRET.value() || "");
+    if (req.method !== "POST") {
+      res.status(405).json({ error: "method_not_allowed" });
+      return;
+    }
+
+    try {
+      const { businessId, productId, ...fields } = req.body as {
+        businessId: string;
+        productId: string;
+        name?: string;
+        sku?: string;
+        category?: string;
+        description?: string | null;
+        defaultStages?: StageName[];
+        isActive?: boolean;
+      };
+
+      const productRef = db.doc(`users/${businessId}/b2bProducts/${productId}`);
+      const productDoc = await productRef.get();
+
+      if (!productDoc.exists) {
+        res.status(404).json({ error: "product_not_found" });
+        return;
+      }
+
+      const updates = Object.fromEntries(
+        Object.entries(fields).filter(([, v]) => v !== undefined),
+      );
+
+      await productRef.update({ ...updates, updatedAt: Timestamp.now() });
+      res.status(200).json({ success: true });
+    } catch (error) {
+      console.error("updateProduct error:", error);
+      res.status(500).json({ error: "internal", message: (error as Error).message });
+    }
+  },
+);
+
+// ----------------------------------------------------------------------------
+
+export const createRawMaterial = onRequest(
+  {
+    secrets: [ENQUEUE_FUNCTION_SECRET],
+    cors: true,
+    timeoutSeconds: 60,
+    memory: "128MiB",
+  },
+  async (req, res) => {
+    requireHeaderSecret(req, "x-api-key", ENQUEUE_FUNCTION_SECRET.value() || "");
+    if (req.method !== "POST") {
+      res.status(405).json({ error: "method_not_allowed" });
+      return;
+    }
+
+    try {
+      const { businessId, name, sku, unit, category, reorderLevel, supplierName } =
+        req.body as {
+          businessId: string;
+          name: string;
+          sku: string;
+          unit: string;
+          category: string;
+          reorderLevel: number;
+          supplierName?: string;
+        };
+
+      const materialId = db.collection(`users/${businessId}/raw_materials`).doc().id;
+      const now = Timestamp.now();
+
+      await db.doc(`users/${businessId}/raw_materials/${materialId}`).set({
+        id: materialId,
+        name,
+        sku,
+        unit,
+        category,
+        totalStock: 0,
+        reservedStock: 0,
+        availableStock: 0,
+        reorderLevel,
+        supplierName: supplierName ?? null,
+        isActive: true,
+        createdAt: now,
+        updatedAt: now,
+      } satisfies RawMaterial);
+
+      res.status(200).json({ materialId });
+    } catch (error) {
+      console.error("createRawMaterial error:", error);
+      res.status(500).json({ error: "internal", message: (error as Error).message });
+    }
+  },
+);
+
+// ----------------------------------------------------------------------------
+
+export const updateRawMaterial = onRequest(
+  {
+    secrets: [ENQUEUE_FUNCTION_SECRET],
+    cors: true,
+    timeoutSeconds: 60,
+    memory: "128MiB",
+  },
+  async (req, res) => {
+    requireHeaderSecret(req, "x-api-key", ENQUEUE_FUNCTION_SECRET.value() || "");
+    if (req.method !== "POST") {
+      res.status(405).json({ error: "method_not_allowed" });
+      return;
+    }
+
+    try {
+      const { businessId, materialId, ...fields } = req.body as {
+        businessId: string;
+        materialId: string;
+        name?: string;
+        sku?: string;
+        unit?: string;
+        category?: string;
+        reorderLevel?: number;
+        supplierName?: string | null;
+        isActive?: boolean;
+      };
+
+      const materialRef = db.doc(`users/${businessId}/raw_materials/${materialId}`);
+      const materialDoc = await materialRef.get();
+
+      if (!materialDoc.exists) {
+        res.status(404).json({ error: "material_not_found" });
+        return;
+      }
+
+      // Explicitly block stock field edits — those go through addStock / adjustStock
+      const STOCK_FIELDS = ["totalStock", "reservedStock", "availableStock"];
+      for (const f of STOCK_FIELDS) {
+        if (f in fields) {
+          res.status(400).json({
+            error: "stock_fields_not_allowed",
+            message: `Cannot update ${f} directly. Use addStock or adjustStock.`,
+          });
+          return;
+        }
+      }
+
+      const updates = Object.fromEntries(
+        Object.entries(fields).filter(([, v]) => v !== undefined),
+      );
+
+      await materialRef.update({ ...updates, updatedAt: Timestamp.now() });
+      res.status(200).json({ success: true });
+    } catch (error) {
+      console.error("updateRawMaterial error:", error);
+      res.status(500).json({ error: "internal", message: (error as Error).message });
+    }
+  },
+);
+
+// ----------------------------------------------------------------------------
+
+export const createBOMEntry = onRequest(
+  {
+    secrets: [ENQUEUE_FUNCTION_SECRET],
+    cors: true,
+    timeoutSeconds: 60,
+    memory: "128MiB",
+  },
+  async (req, res) => {
+    requireHeaderSecret(req, "x-api-key", ENQUEUE_FUNCTION_SECRET.value() || "");
+    if (req.method !== "POST") {
+      res.status(405).json({ error: "method_not_allowed" });
+      return;
+    }
+
+    try {
+      const {
+        businessId,
+        productId,
+        materialId,
+        quantityPerPiece,
+        consumedAtStage,
+        wastagePercent,
+      } = req.body as {
+        businessId: string;
+        productId: string;
+        materialId: string;
+        quantityPerPiece: number;
+        consumedAtStage: StageName;
+        wastagePercent: number;
+      };
+
+      // Fetch product and material to denormalize names into the BOM entry
+      const [productDoc, materialDoc] = await Promise.all([
+        db.doc(`users/${businessId}/b2bProducts/${productId}`).get(),
+        db.doc(`users/${businessId}/raw_materials/${materialId}`).get(),
+      ]);
+
+      if (!productDoc.exists) {
+        res.status(404).json({ error: "product_not_found" });
+        return;
+      }
+      if (!materialDoc.exists) {
+        res.status(404).json({ error: "material_not_found" });
+        return;
+      }
+
+      const product = productDoc.data() as Product;
+      const material = materialDoc.data() as RawMaterial;
+
+      // Guard: prevent duplicate active BOM entry for the same product-material pair
+      const existingSnap = await db
+        .collection(`users/${businessId}/bom`)
+        .where("productId", "==", productId)
+        .where("materialId", "==", materialId)
+        .where("isActive", "==", true)
+        .get();
+
+      if (!existingSnap.empty) {
+        res.status(400).json({
+          error: "bom_entry_already_exists",
+          message: `An active BOM entry for this product-material pair already exists. Deactivate it first to replace it.`,
+        });
+        return;
+      }
+
+      const bomId = db.collection(`users/${businessId}/bom`).doc().id;
+      const now = Timestamp.now();
+
+      await db.doc(`users/${businessId}/bom/${bomId}`).set({
+        id: bomId,
+        productId,
+        productName: product.name,
+        productSku: product.sku,
+        materialId,
+        materialName: material.name,
+        materialUnit: material.unit,
+        quantityPerPiece,
+        consumedAtStage,
+        wastagePercent,
+        isActive: true,
+        createdAt: now,
+        updatedAt: now,
+      } satisfies BOMEntry);
+
+      res.status(200).json({ bomId });
+    } catch (error) {
+      console.error("createBOMEntry error:", error);
+      res.status(500).json({ error: "internal", message: (error as Error).message });
+    }
+  },
+);
+
+// ----------------------------------------------------------------------------
+
+export const updateBOMEntry = onRequest(
+  {
+    secrets: [ENQUEUE_FUNCTION_SECRET],
+    cors: true,
+    timeoutSeconds: 60,
+    memory: "128MiB",
+  },
+  async (req, res) => {
+    requireHeaderSecret(req, "x-api-key", ENQUEUE_FUNCTION_SECRET.value() || "");
+    if (req.method !== "POST") {
+      res.status(405).json({ error: "method_not_allowed" });
+      return;
+    }
+
+    try {
+      const { businessId, bomId, quantityPerPiece, wastagePercent, consumedAtStage } =
+        req.body as {
+          businessId: string;
+          bomId: string;
+          quantityPerPiece?: number;
+          wastagePercent?: number;
+          consumedAtStage?: StageName;
+        };
+
+      const bomRef = db.doc(`users/${businessId}/bom/${bomId}`);
+      const bomDoc = await bomRef.get();
+
+      if (!bomDoc.exists) {
+        res.status(404).json({ error: "bom_entry_not_found" });
+        return;
+      }
+
+      const updates: Record<string, unknown> = { updatedAt: Timestamp.now() };
+      if (quantityPerPiece !== undefined) updates.quantityPerPiece = quantityPerPiece;
+      if (wastagePercent !== undefined) updates.wastagePercent = wastagePercent;
+      if (consumedAtStage !== undefined) updates.consumedAtStage = consumedAtStage;
+
+      await bomRef.update(updates);
+      res.status(200).json({ success: true });
+    } catch (error) {
+      console.error("updateBOMEntry error:", error);
+      res.status(500).json({ error: "internal", message: (error as Error).message });
+    }
+  },
+);
+
+// ----------------------------------------------------------------------------
+
+export const deactivateBOMEntry = onRequest(
+  {
+    secrets: [ENQUEUE_FUNCTION_SECRET],
+    cors: true,
+    timeoutSeconds: 60,
+    memory: "128MiB",
+  },
+  async (req, res) => {
+    requireHeaderSecret(req, "x-api-key", ENQUEUE_FUNCTION_SECRET.value() || "");
+    if (req.method !== "POST") {
+      res.status(405).json({ error: "method_not_allowed" });
+      return;
+    }
+
+    try {
+      const { businessId, bomId } = req.body as {
+        businessId: string;
+        bomId: string;
+      };
+
+      const bomRef = db.doc(`users/${businessId}/bom/${bomId}`);
+      const bomDoc = await bomRef.get();
+
+      if (!bomDoc.exists) {
+        res.status(404).json({ error: "bom_entry_not_found" });
+        return;
+      }
+
+      if (!(bomDoc.data() as BOMEntry).isActive) {
+        res.status(400).json({ error: "bom_entry_already_inactive" });
+        return;
+      }
+
+      await bomRef.update({ isActive: false, updatedAt: Timestamp.now() });
+      res.status(200).json({ success: true });
+    } catch (error) {
+      console.error("deactivateBOMEntry error:", error);
+      res.status(500).json({ error: "internal", message: (error as Error).message });
+    }
+  },
+);
+
+// ----------------------------------------------------------------------------
+
+export const createStageConfig = onRequest(
+  {
+    secrets: [ENQUEUE_FUNCTION_SECRET],
+    cors: true,
+    timeoutSeconds: 60,
+    memory: "128MiB",
+  },
+  async (req, res) => {
+    requireHeaderSecret(req, "x-api-key", ENQUEUE_FUNCTION_SECRET.value() || "");
+    if (req.method !== "POST") {
+      res.status(405).json({ error: "method_not_allowed" });
+      return;
+    }
+
+    try {
+      const { businessId, name, label, description, defaultDurationDays, canBeOutsourced, sortOrder } =
+        req.body as {
+          businessId: string;
+          name: StageName;
+          label: string;
+          description: string;
+          defaultDurationDays: number;
+          canBeOutsourced: boolean;
+          sortOrder: number;
+        };
+
+      const stageId = db.collection(`users/${businessId}/production_stage_config`).doc().id;
+
+      await db.doc(`users/${businessId}/production_stage_config/${stageId}`).set({
+        id: stageId,
+        name,
+        label,
+        description,
+        defaultDurationDays,
+        canBeOutsourced,
+        sortOrder,
+        createdAt: Timestamp.now(),
+      } satisfies ProductionStageConfig);
+
+      res.status(200).json({ stageId });
+    } catch (error) {
+      console.error("createStageConfig error:", error);
+      res.status(500).json({ error: "internal", message: (error as Error).message });
+    }
+  },
+);
+
+// ----------------------------------------------------------------------------
+
+export const updateStageConfig = onRequest(
+  {
+    secrets: [ENQUEUE_FUNCTION_SECRET],
+    cors: true,
+    timeoutSeconds: 60,
+    memory: "128MiB",
+  },
+  async (req, res) => {
+    requireHeaderSecret(req, "x-api-key", ENQUEUE_FUNCTION_SECRET.value() || "");
+    if (req.method !== "POST") {
+      res.status(405).json({ error: "method_not_allowed" });
+      return;
+    }
+
+    try {
+      const { businessId, stageId, ...fields } = req.body as {
+        businessId: string;
+        stageId: string;
+        label?: string;
+        description?: string;
+        defaultDurationDays?: number;
+        canBeOutsourced?: boolean;
+        sortOrder?: number;
+      };
+
+      const stageRef = db.doc(`users/${businessId}/production_stage_config/${stageId}`);
+      const stageDoc = await stageRef.get();
+
+      if (!stageDoc.exists) {
+        res.status(404).json({ error: "stage_config_not_found" });
+        return;
+      }
+
+      // name is intentionally not updatable — it's the StageName enum value
+      // that lots reference by string. Changing it would orphan existing lots.
+      if ("name" in fields) {
+        res.status(400).json({
+          error: "name_not_updatable",
+          message: "Stage name cannot be changed as it is referenced by existing lots.",
+        });
+        return;
+      }
+
+      const updates = Object.fromEntries(
+        Object.entries(fields).filter(([, v]) => v !== undefined),
+      );
+
+      await stageRef.update(updates);
+      res.status(200).json({ success: true });
+    } catch (error) {
+      console.error("updateStageConfig error:", error);
+      res.status(500).json({ error: "internal", message: (error as Error).message });
+    }
+  },
+);
+
+// ============================================================================
+// SECTION 2 — ORDER LIFECYCLE
 // saveDraftOrder → confirmOrder → createOrder → cancelOrder
 // ============================================================================
 
@@ -199,7 +1066,7 @@ export const saveDraftOrder = onRequest(
   {
     secrets: [ENQUEUE_FUNCTION_SECRET],
     cors: true,
-    timeoutSeconds: 60, // single doc write — no lots, no reservations
+    timeoutSeconds: 60,
     memory: "128MiB",
   },
   async (req, res) => {
@@ -260,8 +1127,6 @@ interface ConfirmOrderPayload {
   businessId: string;
   orderId: string;
   confirmedBy: string;
-  // Optional — pass updated lots if changes were made during review.
-  // If omitted, the draftLots stored on the order doc are used.
   lots?: DraftLotInput[];
 }
 
@@ -269,7 +1134,7 @@ export const confirmOrder = onRequest(
   {
     secrets: [ENQUEUE_FUNCTION_SECRET],
     cors: true,
-    timeoutSeconds: 540, // BOM fetches + stock checks + batch write — same as createOrder
+    timeoutSeconds: 540,
     memory: "256MiB",
   },
   async (req, res) => {
@@ -312,7 +1177,6 @@ export const confirmOrder = onRequest(
         return;
       }
 
-      // Flip to CONFIRMED immediately so the UI reflects the in-progress state
       await orderRef.update({ status: "CONFIRMED", updatedAt: Timestamp.now() });
 
       const { lotDocs, reservationDocs } = await buildLotsAndReservations(
@@ -329,7 +1193,6 @@ export const confirmOrder = onRequest(
       const shortfalls = await checkStockShortfalls(businessId, reservationDocs);
 
       if (shortfalls.length > 0) {
-        // Roll back to DRAFT — order remains editable
         await orderRef.update({ status: "DRAFT", updatedAt: Timestamp.now() });
         res.status(400).json({
           error: "insufficient_stock",
@@ -356,7 +1219,6 @@ export const confirmOrder = onRequest(
         });
       }
 
-      // Lots created — clear draftLots, flip to IN_PRODUCTION
       batch.update(orderRef, {
         status: "IN_PRODUCTION",
         draftLots: null,
@@ -382,7 +1244,7 @@ interface CreateOrderPayload {
   buyerId: string;
   buyerName: string;
   buyerContact: string;
-  shipDate: string; // ISO string
+  shipDate: string;
   deliveryAddress: string;
   note?: string;
   createdBy: string;
@@ -393,7 +1255,7 @@ export const createOrder = onRequest(
   {
     secrets: [ENQUEUE_FUNCTION_SECRET],
     cors: true,
-    timeoutSeconds: 540, // sequential BOM fetches + stock checks per lot + batch write
+    timeoutSeconds: 540,
     memory: "256MiB",
   },
   async (req, res) => {
@@ -496,7 +1358,7 @@ export const cancelOrder = onRequest(
   {
     secrets: [ENQUEUE_FUNCTION_SECRET],
     cors: true,
-    timeoutSeconds: 540, // multiple lots, each with multiple reservations
+    timeoutSeconds: 540,
     memory: "256MiB",
   },
   async (req, res) => {
@@ -535,7 +1397,6 @@ export const cancelOrder = onRequest(
         return;
       }
 
-      // Fetch all cancellable lots (skip already cancelled/completed)
       const lotsSnap = await db
         .collection(`users/${businessId}/lots`)
         .where("orderId", "==", orderId)
@@ -552,10 +1413,7 @@ export const cancelOrder = onRequest(
       for (const lotDoc of cancellableLots) {
         const lot = lotDoc.data() as Lot;
 
-        batch.update(lotDoc.ref, {
-          status: "CANCELLED",
-          updatedAt: now,
-        });
+        batch.update(lotDoc.ref, { status: "CANCELLED", updatedAt: now });
 
         const reservationsSnap = await db
           .collection(`users/${businessId}/material_reservations`)
@@ -566,10 +1424,7 @@ export const cancelOrder = onRequest(
         for (const resDoc of reservationsSnap.docs) {
           const reservation = resDoc.data() as MaterialReservation;
 
-          batch.update(resDoc.ref, {
-            status: "RELEASED",
-            updatedAt: now,
-          });
+          batch.update(resDoc.ref, { status: "RELEASED", updatedAt: now });
 
           batch.update(db.doc(`users/${businessId}/raw_materials/${reservation.materialId}`), {
             reservedStock: FieldValue.increment(-reservation.quantityRequired),
@@ -609,7 +1464,7 @@ export const cancelOrder = onRequest(
 );
 
 // ============================================================================
-// LOT LIFECYCLE
+// SECTION 3 — LOT LIFECYCLE
 // advanceLotStage → setLotStageBlocked → cancelLot
 // ============================================================================
 
@@ -624,7 +1479,7 @@ export const advanceLotStage = onRequest(
   {
     secrets: [ENQUEUE_FUNCTION_SECRET],
     cors: true,
-    timeoutSeconds: 120, // transaction + reservation reads inside
+    timeoutSeconds: 120,
     memory: "128MiB",
   },
   async (req, res) => {
@@ -758,7 +1613,7 @@ export const setLotStageBlocked = onRequest(
   {
     secrets: [ENQUEUE_FUNCTION_SECRET],
     cors: true,
-    timeoutSeconds: 60, // single read + single update
+    timeoutSeconds: 60,
     memory: "128MiB",
   },
   async (req, res) => {
@@ -797,11 +1652,7 @@ export const setLotStageBlocked = onRequest(
         return s;
       });
 
-      await lotRef.update({
-        stages: updatedStages,
-        updatedAt: Timestamp.now(),
-      });
-
+      await lotRef.update({ stages: updatedStages, updatedAt: Timestamp.now() });
       res.status(200).json({ success: true });
     } catch (error) {
       console.error("setLotStageBlocked error:", error);
@@ -816,7 +1667,7 @@ export const cancelLot = onRequest(
   {
     secrets: [ENQUEUE_FUNCTION_SECRET],
     cors: true,
-    timeoutSeconds: 120, // reservation query + writes per material
+    timeoutSeconds: 120,
     memory: "128MiB",
   },
   async (req, res) => {
@@ -846,10 +1697,7 @@ export const cancelLot = onRequest(
 
         const now = Timestamp.now();
 
-        tx.update(lotRef, {
-          status: "CANCELLED",
-          updatedAt: now,
-        });
+        tx.update(lotRef, { status: "CANCELLED", updatedAt: now });
 
         const reservationsSnap = await db
           .collection(`users/${businessId}/material_reservations`)
@@ -860,10 +1708,7 @@ export const cancelLot = onRequest(
         for (const resDoc of reservationsSnap.docs) {
           const reservation = resDoc.data() as MaterialReservation;
 
-          tx.update(resDoc.ref, {
-            status: "RELEASED",
-            updatedAt: now,
-          });
+          tx.update(resDoc.ref, { status: "RELEASED", updatedAt: now });
 
           tx.update(db.doc(`users/${businessId}/raw_materials/${reservation.materialId}`), {
             reservedStock: FieldValue.increment(-reservation.quantityRequired),
@@ -905,15 +1750,15 @@ export const cancelLot = onRequest(
 );
 
 // ============================================================================
-// STOCK MANAGEMENT
-// addStock (GRN) → adjustStock
+// SECTION 4 — STOCK MANAGEMENT
+// addStock → adjustStock
 // ============================================================================
 
 interface AddStockPayload {
   businessId: string;
   materialId: string;
   quantity: number;
-  referenceId: string; // PO number, GRN number, supplier invoice, etc.
+  referenceId: string;
   note?: string;
   createdBy: string;
 }
@@ -993,8 +1838,8 @@ export const addStock = onRequest(
 interface AdjustStockPayload {
   businessId: string;
   materialId: string;
-  quantity: number; // positive = add, negative = remove
-  note: string; // required for adjustments — must explain why
+  quantity: number;
+  note: string;
   createdBy: string;
 }
 
@@ -1028,7 +1873,6 @@ export const adjustStock = onRequest(
 
         const material = matDoc.data() as RawMaterial;
 
-        // Guard: adjustment cannot push availableStock below zero
         const projectedAvailable = material.availableStock + quantity;
         if (projectedAvailable < 0) throw new Error("adjustment_exceeds_available_stock");
 
@@ -1075,7 +1919,76 @@ export const adjustStock = onRequest(
 );
 
 // ============================================================================
-// BACKGROUND — TRIGGERS + SCHEDULED
+// SECTION 5 — DISPATCH
+// dispatchFinishedGood
+// ============================================================================
+
+export const dispatchFinishedGood = onRequest(
+  {
+    secrets: [ENQUEUE_FUNCTION_SECRET],
+    cors: true,
+    timeoutSeconds: 60,
+    memory: "128MiB",
+  },
+  async (req, res) => {
+    requireHeaderSecret(req, "x-api-key", ENQUEUE_FUNCTION_SECRET.value() || "");
+    if (req.method !== "POST") {
+      res.status(405).json({ error: "method_not_allowed" });
+      return;
+    }
+
+    try {
+      const { businessId, finishedGoodId, courierName, awb, cartonCount, totalWeightKg, dispatchedBy } =
+        req.body as {
+          businessId: string;
+          finishedGoodId: string;
+          courierName: string;
+          awb: string;
+          cartonCount?: number;
+          totalWeightKg?: number;
+          dispatchedBy: string;
+        };
+
+      const fgRef = db.doc(`users/${businessId}/finished_goods/${finishedGoodId}`);
+      const fgDoc = await fgRef.get();
+
+      if (!fgDoc.exists) {
+        res.status(404).json({ error: "finished_good_not_found" });
+        return;
+      }
+
+      const fg = fgDoc.data() as FinishedGood;
+
+      if (fg.isDispatched) {
+        res.status(400).json({
+          error: "already_dispatched",
+          message: `This lot was already dispatched with AWB ${fg.awb}.`,
+        });
+        return;
+      }
+
+      const now = Timestamp.now();
+
+      await fgRef.update({
+        isDispatched: true,
+        dispatchedAt: now,
+        courierName,
+        awb,
+        ...(cartonCount !== undefined && { cartonCount }),
+        ...(totalWeightKg !== undefined && { totalWeightKg }),
+        updatedAt: now,
+      });
+
+      res.status(200).json({ success: true });
+    } catch (error) {
+      console.error("dispatchFinishedGood error:", error);
+      res.status(500).json({ error: "internal", message: (error as Error).message });
+    }
+  },
+);
+
+// ============================================================================
+// SECTION 6 — BACKGROUND (TRIGGERS + SCHEDULED)
 // syncOrderStatsOnLotChange → recomputeLotDelays
 // ============================================================================
 
@@ -1119,46 +2032,46 @@ export const syncOrderStatsOnLotChange = onDocumentWritten(
 
 // ----------------------------------------------------------------------------
 
-// export const recomputeLotDelays = onSchedule(
-//   { schedule: "0 3 * * *", timeZone: "Asia/Kolkata" }, // 3 UTC = 9 IST
-//   async () => {
-//     const CHUNK = 100;
-//     const businessSnap = await db.collection("users").get();
+export const recomputeLotDelays = onSchedule(
+  { schedule: "0 3 * * *", timeZone: "Asia/Kolkata" }, // 3 UTC = 9 IST
+  async () => {
+    const CHUNK = 100;
+    const businessSnap = await db.collection("users").get();
 
-//     for (const bizDoc of businessSnap.docs) {
-//       const businessId = bizDoc.id;
-//       let lastDoc: QueryDocumentSnapshot | undefined;
+    for (const bizDoc of businessSnap.docs) {
+      const businessId = bizDoc.id;
+      let lastDoc: QueryDocumentSnapshot | undefined;
 
-//       do {
-//         let query = db
-//           .collection(`users/${businessId}/lots`)
-//           .where("status", "==", "ACTIVE")
-//           .limit(CHUNK);
+      do {
+        let query = db
+          .collection(`users/${businessId}/lots`)
+          .where("status", "==", "ACTIVE")
+          .limit(CHUNK);
 
-//         if (lastDoc) query = query.startAfter(lastDoc);
+        if (lastDoc) query = query.startAfter(lastDoc);
 
-//         const snap = await query.get();
-//         if (snap.empty) break;
+        const snap = await query.get();
+        if (snap.empty) break;
 
-//         const batch = db.batch();
-//         for (const doc of snap.docs) {
-//           const lot = doc.data() as Lot;
-//           const { isDelayed, delayDays } = computeDelayStatus(lot.stages);
-//           if (lot.isDelayed !== isDelayed || lot.delayDays !== delayDays) {
-//             batch.update(doc.ref, { isDelayed, delayDays, updatedAt: Timestamp.now() });
-//           }
-//         }
-//         await batch.commit();
+        const batch = db.batch();
+        for (const doc of snap.docs) {
+          const lot = doc.data() as Lot;
+          const { isDelayed, delayDays } = computeDelayStatus(lot.stages);
+          if (lot.isDelayed !== isDelayed || lot.delayDays !== delayDays) {
+            batch.update(doc.ref, { isDelayed, delayDays, updatedAt: Timestamp.now() });
+          }
+        }
+        await batch.commit();
 
-//         lastDoc = snap.docs[snap.docs.length - 1];
-//         if (snap.size < CHUNK) break;
-//       } while (true);
-//     }
-//   },
-// );
+        lastDoc = snap.docs[snap.docs.length - 1];
+        if (snap.size < CHUNK) break;
+      } while (true);
+    }
+  },
+);
 
 // ============================================================================
-// READ / QUERY
+// SECTION 7 — READ / QUERY
 // getOrderDashboard
 // ============================================================================
 
@@ -1166,7 +2079,7 @@ export const getOrderDashboard = onRequest(
   {
     secrets: [ENQUEUE_FUNCTION_SECRET],
     cors: true,
-    timeoutSeconds: 60, // two parallel reads + in-memory grouping
+    timeoutSeconds: 60,
     memory: "128MiB",
   },
   async (req, res) => {
