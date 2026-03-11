@@ -1237,7 +1237,9 @@ export const confirmOrder = onRequest(
           note: `Stock reserved for Lot ${reservation.lotNumber} (Order ${order.orderNumber})`,
           createdBy: confirmedBy,
           createdAt: Timestamp.now(),
-        } satisfies Omit<MaterialTransaction, "stockBefore" | "stockAfter">);
+          stockBefore: null,
+          stockAfter: null,
+        } satisfies MaterialTransaction);
       }
 
       batch.update(orderRef, {
@@ -1374,7 +1376,9 @@ export const createOrder = onRequest(
           note: `Stock reserved for Lot ${reservation.lotNumber} (Order ${orderNumber})`,
           createdBy: createdBy,
           createdAt: Timestamp.now(),
-        } satisfies Omit<MaterialTransaction, "stockBefore" | "stockAfter">);
+          stockBefore: null,
+          stockAfter: null,
+        } satisfies MaterialTransaction);
       }
 
       await batch.commit();
@@ -1478,7 +1482,9 @@ export const cancelOrder = onRequest(
             note: `Order ${order.orderNumber} cancelled — Lot ${lot.lotNumber} reserved stock released. Reason: ${reason}`,
             createdBy: cancelledBy,
             createdAt: now,
-          } satisfies Omit<MaterialTransaction, "stockBefore" | "stockAfter">);
+            stockBefore: null,
+            stockAfter: null,
+        } satisfies MaterialTransaction);
         }
       }
 
@@ -1607,7 +1613,9 @@ export const advanceLotStage = onRequest(
             note: `Consumed at stage ${currentStage.stage} — Lot ${lot.lotNumber}`,
             createdBy: completedBy,
             createdAt: now,
-          } satisfies Omit<MaterialTransaction, "stockBefore" | "stockAfter">);
+            stockBefore: null,
+            stockAfter: null,
+        } satisfies MaterialTransaction);
         }
 
         if (isLastStage) {
@@ -1775,7 +1783,9 @@ export const cancelLot = onRequest(
             note: `Lot ${lot.lotNumber} cancelled — reserved stock released. Reason: ${reason}`,
             createdBy: cancelledBy,
             createdAt: now,
-          } satisfies Omit<MaterialTransaction, "stockBefore" | "stockAfter">);
+            stockBefore: null,
+            stockAfter: null,
+        } satisfies MaterialTransaction);
         }
       });
 
