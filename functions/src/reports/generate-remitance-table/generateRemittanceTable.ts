@@ -13,7 +13,7 @@ const COURIER_CONFIG: Record<
   SupportedCourier,
   {
     deliveredTimeField: string; // Firestore field holding the delivered timestamp
-    firestoreKey: string;       // Key under users/{id}/remittanceTable.*
+    firestoreKey: string; // Key under users/{id}/remittanceTable.*
     logEmoji: string;
   }
 > = {
@@ -44,9 +44,9 @@ const COD_STATUSES = [
 // ─── Types ────────────────────────────────────────────────────────────────────
 
 interface RemittanceRow {
-  date: string;                     // DD-MM-YYYY — the remittance date
+  date: string; // DD-MM-YYYY — the remittance date
   orderDeliveredRangeStart: string; // DD-MM-YYYY
-  orderDeliveredRangeEnd: string;   // DD-MM-YYYY
+  orderDeliveredRangeEnd: string; // DD-MM-YYYY
   amount: number;
   orderCount: number;
   awbs: string[];
@@ -77,10 +77,10 @@ function istDayOfWeek(date: Date): number {
 }
 
 function formatISTDate(date: Date): string {
-  const ist   = new Date(date.getTime() + IST_OFFSET_MS);
-  const day   = String(ist.getUTCDate()).padStart(2, "0");
+  const ist = new Date(date.getTime() + IST_OFFSET_MS);
+  const day = String(ist.getUTCDate()).padStart(2, "0");
   const month = String(ist.getUTCMonth() + 1).padStart(2, "0");
-  const year  = ist.getUTCFullYear();
+  const year = ist.getUTCFullYear();
   return `${day}-${month}-${year}`;
 }
 
@@ -190,19 +190,22 @@ export const generateRemittanceTable = onRequest(
     const fsPath = `remittanceTable.${firestoreKey}`;
 
     console.log(`${logEmoji} Starting ${courierName} remittance table generation:`, {
-      businessId, startDate, endDate, stores: SHARED_STORE_IDS,
+      businessId,
+      startDate,
+      endDate,
+      stores: SHARED_STORE_IDS,
     });
 
     const businessDocRef = db.collection("users").doc(businessId);
 
     await businessDocRef.update({
       [`${fsPath}.loading`]: true,
-      [`${fsPath}.error`]:   null,
+      [`${fsPath}.error`]: null,
     });
 
     try {
       const start = istDateToUtc(startDate);
-      const end   = istDateToUtc(endDate);
+      const end = istDateToUtc(endDate);
 
       // ── Build remittance date list ────────────────────────────────────────
       const remittanceDates =
@@ -212,7 +215,7 @@ export const generateRemittanceTable = onRequest(
 
       console.log(
         `📅 ${courierName} remittance dates (${remittanceDates.length}):`,
-        remittanceDates.map(formatISTDate)
+        remittanceDates.map(formatISTDate),
       );
 
       // ── Process each remittance date ──────────────────────────────────────
@@ -225,21 +228,18 @@ export const generateRemittanceTable = onRequest(
             : getDelhiveryDeliveredRange(remDate);
 
         const tsStart = startOfISTDay(rangeStart);
-        const tsEnd   = endOfISTDay(rangeEnd);
+        const tsEnd = endOfISTDay(rangeEnd);
 
         console.log(
-          `📦 Remittance ${formatISTDate(remDate)} | Delivered: ${formatISTDate(rangeStart)} → ${formatISTDate(rangeEnd)}`
+          `📦 Remittance ${formatISTDate(remDate)} | Delivered: ${formatISTDate(rangeStart)} → ${formatISTDate(rangeEnd)}`,
         );
 
-        let totalAmount     = 0;
+        let totalAmount = 0;
         let totalOrderCount = 0;
         const rowAwbs: string[] = [];
 
         for (const storeId of SHARED_STORE_IDS) {
-          const ordersRef = db
-            .collection("accounts")
-            .doc(storeId)
-            .collection("orders");
+          const ordersRef = db.collection("accounts").doc(storeId).collection("orders");
 
           const statusSnaps = await Promise.all(
             COD_STATUSES.map((status) =>
@@ -248,8 +248,8 @@ export const generateRemittanceTable = onRequest(
                 .where("customStatus", "==", status)
                 .where(deliveredTimeField, ">=", tsStart)
                 .where(deliveredTimeField, "<=", tsEnd)
-                .get()
-            )
+                .get(),
+            ),
           );
 
           const seen = new Set<string>();
@@ -259,11 +259,11 @@ export const generateRemittanceTable = onRequest(
               if (seen.has(doc.id)) return;
               seen.add(doc.id);
 
-              const data        = doc.data();
+              const data = doc.data();
               const outstanding = Number(data?.raw?.total_outstanding || 0);
               if (outstanding <= 0) return;
 
-              totalAmount     += outstanding;
+              totalAmount += outstanding;
               totalOrderCount += 1;
 
               const awb = data?.awb;
@@ -277,30 +277,30 @@ export const generateRemittanceTable = onRequest(
         }
 
         rows.push({
-          date:                     formatISTDate(remDate),
+          date: formatISTDate(remDate),
           orderDeliveredRangeStart: formatISTDate(rangeStart),
-          orderDeliveredRangeEnd:   formatISTDate(rangeEnd),
-          amount:                   Math.round(totalAmount * 100) / 100,
-          orderCount:               totalOrderCount,
-          awbs:                     rowAwbs,
+          orderDeliveredRangeEnd: formatISTDate(rangeEnd),
+          amount: Math.round(totalAmount * 100) / 100,
+          orderCount: totalOrderCount,
+          awbs: rowAwbs,
         });
       }
 
       const tableData: RemittanceTableData = {
         rows,
-        totalAmount:     Math.round(rows.reduce((s, r) => s + r.amount,     0) * 100) / 100,
+        totalAmount: Math.round(rows.reduce((s, r) => s + r.amount, 0) * 100) / 100,
         totalOrderCount: rows.reduce((s, r) => s + r.orderCount, 0),
       };
 
       console.log(`${logEmoji} Remittance table complete:`, JSON.stringify(tableData, null, 2));
 
       await businessDocRef.update({
-        [`${fsPath}.loading`]:     false,
+        [`${fsPath}.loading`]: false,
         [`${fsPath}.lastUpdated`]: Timestamp.now(),
-        [`${fsPath}.startDate`]:   startDate,
-        [`${fsPath}.endDate`]:     endDate,
-        [`${fsPath}.data`]:        tableData,
-        [`${fsPath}.error`]:       null,
+        [`${fsPath}.startDate`]: startDate,
+        [`${fsPath}.endDate`]: endDate,
+        [`${fsPath}.data`]: tableData,
+        [`${fsPath}.error`]: null,
       });
 
       console.log(`✅ ${courierName} remittance table generation completed`);
@@ -314,8 +314,8 @@ export const generateRemittanceTable = onRequest(
       console.error(`❌ Error generating ${courierName} remittance table:`, error);
       try {
         await businessDocRef.update({
-          [`${fsPath}.loading`]:     false,
-          [`${fsPath}.error`]:       error.message || "Unknown error occurred",
+          [`${fsPath}.loading`]: false,
+          [`${fsPath}.error`]: error.message || "Unknown error occurred",
           [`${fsPath}.lastUpdated`]: Timestamp.now(),
         });
       } catch (updateError) {
@@ -327,5 +327,5 @@ export const generateRemittanceTable = onRequest(
         message: error.message,
       });
     }
-  }
+  },
 );

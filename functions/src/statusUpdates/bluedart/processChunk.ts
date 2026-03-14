@@ -265,9 +265,18 @@ function prepareBlueDartOrderUpdates(orders: any[], shipments: any[]): OrderUpda
       for (const scan of dlScans) {
         const [day, month, year] = scan.ScanDate.split("-");
         const monthMap: Record<string, string> = {
-          Jan: "01", Feb: "02", Mar: "03", Apr: "04",
-          May: "05", Jun: "06", Jul: "07", Aug: "08",
-          Sep: "09", Oct: "10", Nov: "11", Dec: "12",
+          Jan: "01",
+          Feb: "02",
+          Mar: "03",
+          Apr: "04",
+          May: "05",
+          Jun: "06",
+          Jul: "07",
+          Aug: "08",
+          Sep: "09",
+          Oct: "10",
+          Nov: "11",
+          Dec: "12",
         };
         const isoString = `${year}-${monthMap[month]}-${day}T${scan.ScanTime}:00+05:30`;
         const parsed = new Date(isoString);

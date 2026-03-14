@@ -66,13 +66,20 @@ function hasTrackedFieldChanged(before: UPC, after: UPC): boolean {
 async function writeUPCLog(
   businessId: string,
   upcId: string,
+  productId: string,
+  grnRef: string | null,
   snapshot: ReturnType<typeof getUPCSnapshot>,
 ) {
+  const batch = db.batch();
+  const timestamp = Timestamp.now();
+
   const logRef = db.collection(`users/${businessId}/upcs/${upcId}/logs`).doc();
-  await logRef.set({
-    timestamp: Timestamp.now(),
-    snapshot,
-  });
+  batch.set(logRef, { timestamp, snapshot });
+
+  const flatLogRef = db.collection("users").doc(businessId).collection("upcsLogs").doc(logRef.id);
+  batch.set(flatLogRef, { timestamp, upcId, productId, grnRef, snapshot });
+
+  await batch.commit();
 }
 
 export const onUpcWritten = onDocumentWritten(
@@ -93,7 +100,7 @@ export const onUpcWritten = onDocumentWritten(
     if (!before && after) {
       // Log the initial state on creation
       try {
-        await writeUPCLog(businessId, upcId, getUPCSnapshot(after));
+        await writeUPCLog(businessId, upcId, after.productId, after.grnRef, getUPCSnapshot(after));
       } catch (err) {
         console.error(`⚠️ Failed to write creation log for UPC ${upcId}:`, err);
       }
@@ -149,7 +156,13 @@ export const onUpcWritten = onDocumentWritten(
       // Log if any tracked field changed (before the putAway-specific check so we catch all field changes)
       if (hasTrackedFieldChanged(before, after)) {
         try {
-          await writeUPCLog(businessId, upcId, getUPCSnapshot(after));
+          await writeUPCLog(
+            businessId,
+            upcId,
+            after.productId,
+            after.grnRef,
+            getUPCSnapshot(after),
+          );
         } catch (err) {
           console.error(`⚠️ Failed to write update log for UPC ${upcId}:`, err);
         }

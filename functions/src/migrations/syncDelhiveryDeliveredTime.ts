@@ -38,9 +38,21 @@ export const syncDelhiveryDeliveredTime = onRequest(
 
     await Promise.all(
       SHARED_STORE_IDS.map(async (storeId) => {
-        const snap = await db.collection("accounts").doc(storeId).collection("orders")
+        const snap = await db
+          .collection("accounts")
+          .doc(storeId)
+          .collection("orders")
           .where("courierProvider", "==", COURIER)
-          .where("customStatus", "in", ["Delivered", "Closed", "DTO Requested", "DTO Booked", "DTO In Transit", "DTO Delivered", "Pending Refunds", "DTO Refunded"])
+          .where("customStatus", "in", [
+            "Delivered",
+            "Closed",
+            "DTO Requested",
+            "DTO Booked",
+            "DTO In Transit",
+            "DTO Delivered",
+            "Pending Refunds",
+            "DTO Refunded",
+          ])
           .get();
 
         snap.forEach((doc) => {
@@ -48,7 +60,7 @@ export const syncDelhiveryDeliveredTime = onRequest(
           seenIds.add(doc.id);
           allOrders.push({ id: doc.id, ref: doc.ref, ...doc.data() });
         });
-      })
+      }),
     );
 
     console.log(`📦 Total Delhivery orders: ${allOrders.length}`);
@@ -60,7 +72,7 @@ export const syncDelhiveryDeliveredTime = onRequest(
         (log) =>
           log.status === "Delivered" &&
           log.createdAt instanceof Timestamp &&
-          log.createdAt.seconds >= DELIVERED_LOG_CUTOFF.seconds
+          log.createdAt.seconds >= DELIVERED_LOG_CUTOFF.seconds,
       );
     });
 
@@ -102,7 +114,7 @@ export const syncDelhiveryDeliveredTime = onRequest(
                 Authorization: `Token ${DELHIVERY_TOKEN}`,
                 Accept: "application/json",
               },
-            }
+            },
           );
           responseData = await response.json();
         } catch (err: any) {
@@ -154,30 +166,31 @@ export const syncDelhiveryDeliveredTime = onRequest(
 
           updates.push({ ref: order.ref, delhiverydeliveredtime: latestTimestamp });
         }
-      })
+      }),
     );
 
     for (const order of ordersWithAwb) {
       const awb = String(order.awb);
-      if (!updates.find((u) => u.ref.id === order.ref.id) &&
+      if (
+        !updates.find((u) => u.ref.id === order.ref.id) &&
         !skipReasons.api_error.includes(awb) &&
         !skipReasons.no_scans.includes(awb) &&
         !skipReasons.no_dl_scan.includes(awb) &&
-        !skipReasons.scan_date_parse_error.includes(awb)) {
+        !skipReasons.scan_date_parse_error.includes(awb)
+      ) {
         skipReasons.api_not_found = skipReasons.api_not_found ?? [];
         skipReasons.api_not_found.push(awb);
       }
     }
 
     // Track orders with no AWB separately
-    eligibleOrders
-      .filter((o) => !o.awb)
-      .forEach((o) => skipReasons.no_awb.push(o.id));
+    eligibleOrders.filter((o) => !o.awb).forEach((o) => skipReasons.no_awb.push(o.id));
 
     console.log(`📝 Updates to apply: ${updates.length}`);
-    console.log(`⏭️ Skipped:`, Object.fromEntries(
-      Object.entries(skipReasons).map(([k, v]) => [k, v.length])
-    ));
+    console.log(
+      `⏭️ Skipped:`,
+      Object.fromEntries(Object.entries(skipReasons).map(([k, v]) => [k, v.length])),
+    );
 
     // ── 4. Write to Firestore in 499-op chunks ───────────────────────────────
     if (!dryRun) {
@@ -199,10 +212,8 @@ export const syncDelhiveryDeliveredTime = onRequest(
       success: true,
       dryRun,
       updatedCount: updates.length,
-      skipped: Object.fromEntries(
-        Object.entries(skipReasons).map(([k, v]) => [k, v.length])
-      ),
+      skipped: Object.fromEntries(Object.entries(skipReasons).map(([k, v]) => [k, v.length])),
       skippedDetails: dryRun ? skipReasons : undefined,
     });
-  }
+  },
 );

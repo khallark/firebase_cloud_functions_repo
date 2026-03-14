@@ -1,6 +1,6 @@
 // ─── Types ────────────────────────────────────────────────────────────────────
 
-import { Timestamp } from "firebase-admin/firestore";
+import { QueryDocumentSnapshot, Timestamp } from "firebase-admin/firestore";
 import { db, storage } from "../../firebaseAdmin";
 import ExcelJS from "exceljs";
 import { randomUUID } from "crypto";
@@ -60,14 +60,14 @@ export async function calcSaleMetric(
   let totalCgst = 0;
   let totalSgst = 0;
 
-  const RETURN_STATUSES = [
-    "RTO Closed",
-    "Pending Refunds",
-    "DTO Refunded",
-    // "Lost",
-    "Cancellation Requested",
-    "Cancelled",
-  ];
+  // const RETURN_STATUSES = [
+  //   "RTO Closed",
+  //   "Pending Refunds",
+  //   "DTO Refunded",
+  //   // "Lost",
+  //   "Cancellation Requested",
+  //   "Cancelled",
+  // ];
 
   const startTs = Timestamp.fromDate(new Date(formattedStartDate));
   const endTs = Timestamp.fromDate(new Date(formattedEndDate));
@@ -75,16 +75,56 @@ export async function calcSaleMetric(
   for (const storeId of storeIds) {
     const baseQuery = db.collection("accounts").doc(storeId).collection("orders");
 
-    const query = isReturn
-      ? baseQuery
+    let snapshot;
+    if (isReturn) {
+      const [rtoSnap, pendingRefundsSnap, cancellationSnap, cancelledSnap] = await Promise.all([
+        baseQuery
+          .where("customStatus", "==", "RTO Closed")
           .where("lastStatusUpdate", ">=", startTs)
           .where("lastStatusUpdate", "<=", endTs)
-          .where("customStatus", "in", RETURN_STATUSES)
-      : baseQuery
-          .where("createdAt", ">=", formattedStartDate)
-          .where("createdAt", "<=", formattedEndDate);
+          .get(),
+        baseQuery
+          .where("pendingRefundsAt", ">=", startTs)
+          .where("pendingRefundsAt", "<=", endTs)
+          .get(),
+        baseQuery
+          .where("cancellationRequestedAt", ">=", startTs)
+          .where("cancellationRequestedAt", "<=", endTs)
+          .get(),
+        baseQuery
+          .where("customStatus", "==", "Cancelled")
+          .where("lastStatusUpdate", ">=", startTs)
+          .where("lastStatusUpdate", "<=", endTs)
+          .get(),
+      ]);
 
-    const snapshot = await query.get();
+      const seenIds = new Set<string>();
+      const mergedDocs: QueryDocumentSnapshot[] = [];
+
+      for (const snap of [rtoSnap, pendingRefundsSnap, cancellationSnap]) {
+        for (const doc of snap.docs) {
+          if (seenIds.has(doc.id)) continue;
+          seenIds.add(doc.id);
+          mergedDocs.push(doc);
+        }
+      }
+
+      // Cancelled: only fall back to lastStatusUpdate if cancellationRequestedAt is absent
+      for (const doc of cancelledSnap.docs) {
+        if (seenIds.has(doc.id)) continue;
+        const cancelReqAt = doc.data().cancellationRequestedAt as Timestamp | undefined;
+        if (cancelReqAt) continue;
+        seenIds.add(doc.id);
+        mergedDocs.push(doc);
+      }
+
+      snapshot = { docs: mergedDocs };
+    } else {
+      snapshot = await baseQuery
+        .where("createdAt", ">=", formattedStartDate)
+        .where("createdAt", "<=", formattedEndDate)
+        .get();
+    }
 
     const a: Record<string, string[]> = {};
     for (const doc of snapshot.docs) {
@@ -97,16 +137,16 @@ export async function calcSaleMetric(
       a[order.customStatus].push(order.name);
       const netPrice = Number(order?.raw?.total_price ?? 0);
       const isPunjab = order?.raw?.shipping_address?.province === "Punjab";
-
       const tax = reverseCalculateTax(netPrice, isPunjab);
-      const numItems = ["Pending Refunds", "DTO Refunded"].includes(order.customStatus)
-        ? order?.raw?.line_items
-            ?.filter((item: any) => item?.qc_status === "QC Pass")
-            ?.reduce((sum: number, item: any) => sum + Number(item?.quantity ?? 0), 0)
-        : order?.raw?.line_items?.reduce(
-            (sum: number, item: any) => sum + Number(item?.quantity ?? 0),
-            0,
-          );
+      const numItems =
+        isReturn && ["Pending Refunds", "DTO Refunded"].includes(order.customStatus)
+          ? order?.raw?.line_items
+              ?.filter((item: any) => item?.qc_status === "QC Pass")
+              ?.reduce((sum: number, item: any) => sum + Number(item?.quantity ?? 0), 0)
+          : order?.raw?.line_items?.reduce(
+              (sum: number, item: any) => sum + Number(item?.quantity ?? 0),
+              0,
+            );
 
       totalQty += numItems;
       totalNet += netPrice;
@@ -116,6 +156,12 @@ export async function calcSaleMetric(
       totalSgst += tax.sgst;
     }
     if (isReturn) {
+      console.log("Sale Return orders:");
+      for (const [status, names] of Object.entries(a)) {
+        console.log(status, ":", names.join(","));
+      }
+    } else {
+      console.log("Sale orders:");
       for (const [status, names] of Object.entries(a)) {
         console.log(status, ":", names.join(","));
       }

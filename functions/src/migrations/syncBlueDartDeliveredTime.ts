@@ -1,7 +1,12 @@
 import { onRequest } from "firebase-functions/v2/https";
 import { db } from "../firebaseAdmin";
 import { SHARED_STORE_ID, SHARED_STORE_ID_2 } from "../config";
-import { DocumentReference, QueryDocumentSnapshot, Timestamp, WriteBatch } from "firebase-admin/firestore";
+import {
+  DocumentReference,
+  QueryDocumentSnapshot,
+  Timestamp,
+  WriteBatch,
+} from "firebase-admin/firestore";
 
 const STORE_IDS = [SHARED_STORE_ID, SHARED_STORE_ID_2];
 const BD_BATCH_SIZE = 50;
@@ -81,9 +86,18 @@ const parseScanDateTime = (date: string, time: string): Date | null => {
   try {
     const [day, month, year] = date.split("-");
     const monthMap: Record<string, string> = {
-      Jan: "01", Feb: "02", Mar: "03", Apr: "04",
-      May: "05", Jun: "06", Jul: "07", Aug: "08",
-      Sep: "09", Oct: "10", Nov: "11", Dec: "12",
+      Jan: "01",
+      Feb: "02",
+      Mar: "03",
+      Apr: "04",
+      May: "05",
+      Jun: "06",
+      Jul: "07",
+      Aug: "08",
+      Sep: "09",
+      Oct: "10",
+      Nov: "11",
+      Dec: "12",
     };
     const isoString = `${year}-${monthMap[month]}-${day}T${time}:00+05:30`;
     const dt = new Date(isoString);
@@ -109,7 +123,16 @@ export const syncBlueDartDeliveredTime = onRequest(
         STORE_IDS.map((storeId) =>
           db
             .collection(`accounts/${storeId}/orders`)
-            .where("customStatus", "in", ["Delivered", "Closed", "DTO Requested", "DTO Booked", "DTO In Transit", "DTO Delivered", "Pending Refunds", "DTO Refunded"])
+            .where("customStatus", "in", [
+              "Delivered",
+              "Closed",
+              "DTO Requested",
+              "DTO Booked",
+              "DTO In Transit",
+              "DTO Delivered",
+              "Pending Refunds",
+              "DTO Refunded",
+            ])
             .where("courier", "==", "Blue Dart")
             .get(),
         ),
@@ -198,10 +221,7 @@ export const syncBlueDartDeliveredTime = onRequest(
       const firestoreBatches: WriteBatch[] = [firestoreBatch];
       let totalUpdated = 0;
 
-      const addUpdate = (
-        ref: DocumentReference,
-        data: Record<string, unknown>,
-      ) => {
+      const addUpdate = (ref: DocumentReference, data: Record<string, unknown>) => {
         if (batchOpCount > 0 && batchOpCount % 499 === 0) {
           firestoreBatch = db.batch();
           firestoreBatches.push(firestoreBatch);

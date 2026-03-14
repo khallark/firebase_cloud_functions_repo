@@ -15,7 +15,7 @@ export const grossProfitReport = onRequest(
   {
     cors: true,
     timeoutSeconds: 3600,
-    memory: "2GiB",
+    memory: "4GiB",
   },
   async (req, res) => {
     try {

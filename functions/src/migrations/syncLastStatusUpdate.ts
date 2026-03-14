@@ -133,7 +133,7 @@ export const syncLastStatusUpdate = onRequest(
               latestValidLogStatus: latestLog.status,
               expectedLastStatusUpdate: latestLog.createdAt,
             });
-          } else if (lastStatusUpdate.toMillis() !== latestLog.createdAt.toMillis()) {
+          } else if (lastStatusUpdate.seconds !== latestLog.createdAt.seconds) {
             mismatchedOrders.push({
               orderId: doc.id,
               orderName: order.name ?? doc.id,
