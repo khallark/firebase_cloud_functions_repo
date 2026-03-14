@@ -1,271 +1,501 @@
 /*
  * =============================================================================
- * B2B OMS — CLOUD FUNCTIONS
+ * B2B OMS — FUNCTION & API ROUTE REFERENCE
  * =============================================================================
  *
- * All functions are HTTP onRequest handlers unless noted otherwise.
- * All write functions require the x-api-key header (ENQUEUE_FUNCTION_SECRET).
+ * All HTTP handlers live as Next.js API routes under /api/business/b2b/.
+ * This file contains only background triggers and the scheduled function.
  * All paths are scoped under users/{businessId}/...
+ *
+ * Authentication:
+ *   API routes  → authUserForBusiness() — Firebase ID token via Authorization header
+ *   onRequest   → requireHeaderSecret() — ENQUEUE_FUNCTION_SECRET via x-api-key header
+ *   Triggers    → no auth, fire automatically on Firestore writes
+ *
+ * Key design decisions baked into every route:
+ *   — SKU is the document ID for b2bProducts and raw_materials (not auto-generated).
+ *     Duplicate check is a single doc.get() — no collection query needed.
+ *   — Stock number updates (reservedStock, availableStock, totalStock) for the
+ *     reservation lifecycle are owned exclusively by syncMaterialStockOnReservationChange.
+ *     Routes only write reservation docs — they never touch raw material stock fields
+ *     for RESERVATION / CONSUMPTION / RETURN events.
+ *   — LotStageHistory writes are owned by appendLotStageHistoryOnStageAdvance.
+ *   — FinishedGood creation is owned by createFinishedGoodOnLotCompleted.
+ *     Routes only update the lot doc — they never write to finished_goods.
+ *   — Order stats (lotsCompleted, lotsInProduction, lotsDelayed) are owned by
+ *     syncOrderStatsOnLotChange. Routes never write these fields except at
+ *     order creation time.
  *
  * =============================================================================
  * SECTION 1 — MASTER DATA
  * =============================================================================
  *
- * createBuyer
- *   Creates a new buyer record.
+ * POST /api/business/b2b/create-buyer
+ *   Creates a new buyer. Starts as isActive: true.
+ *   No duplicate check — buyers are not uniquely keyed on any field.
+ *   Required: name, contactPerson, phone, email, address, createdBy
+ *   Optional: gstNumber
  *   Types: Buyer
  *   Writes: users/{businessId}/buyers/{buyerId}
  *
- * updateBuyer
- *   Updates editable fields on an existing buyer (name, contact, address, etc.).
- *   Cannot change id or createdAt.
+ * POST /api/business/b2b/update-buyer
+ *   Updates editable fields on an existing buyer.
+ *   Checks existence before updating. Cannot change id or createdAt.
+ *   Pass isActive: false to deactivate. Deactivated buyers block new orders.
+ *   Required: buyerId
+ *   Optional: name, contactPerson, phone, email, address, gstNumber, isActive
  *   Types: Buyer
+ *   Reads:  users/{businessId}/buyers/{buyerId}
  *   Writes: users/{businessId}/buyers/{buyerId}
  *
- * createProduct
- *   Creates a new finished-garment product with a default stage sequence.
+ * POST /api/business/b2b/create-product
+ *   Creates a new finished-garment product (template — not physical inventory).
+ *   SKU is the document ID, normalized to uppercase. Duplicate check is a
+ *   single doc.get() on the SKU path — returns sku_already_exists if taken.
+ *   Validates: defaultStages must be a non-empty array.
+ *   Required: name, sku, category, defaultStages, createdBy
+ *   Optional: description
  *   Types: Product
+ *   Reads:  users/{businessId}/b2bProducts/{sku} (duplicate check)
+ *   Writes: users/{businessId}/b2bProducts/{sku}
+ *
+ * POST /api/business/b2b/update-product
+ *   Updates editable fields on a product. Checks existence before updating.
+ *   Blocks sku changes — SKU is the doc ID and is referenced by lots,
+ *   BOM entries, and finished goods. Changing it would orphan all of them.
+ *   Validates: defaultStages must be non-empty if provided.
+ *   Pass isActive: false to deactivate. Inactive products block new orders and BOM entries.
+ *   Required: productId
+ *   Optional: name, category, description, defaultStages, isActive
+ *   Types: Product
+ *   Reads:  users/{businessId}/b2bProducts/{productId}
  *   Writes: users/{businessId}/b2bProducts/{productId}
  *
- * updateProduct
- *   Updates editable fields on a product (name, category, defaultStages, etc.).
- *   Types: Product
- *   Writes: users/{businessId}/b2bProducts/{productId}
- *
- * createRawMaterial
- *   Creates a new raw material with zero stock. Stock is added separately via addStock.
+ * POST /api/business/b2b/create-raw-material
+ *   Creates a new raw material with zero stock. Stock is added separately via add-stock.
+ *   SKU is the document ID, normalized to uppercase. Same duplicate check pattern as products.
+ *   Validates: reorderLevel must be >= 0.
+ *   Required: name, sku, unit, category, reorderLevel, createdBy
+ *   Optional: supplierName
  *   Types: RawMaterial
+ *   Reads:  users/{businessId}/raw_materials/{sku} (duplicate check)
+ *   Writes: users/{businessId}/raw_materials/{sku}
+ *
+ * POST /api/business/b2b/update-raw-material
+ *   Updates metadata on a raw material. Checks existence before updating.
+ *   Explicitly blocks direct writes to totalStock, reservedStock, availableStock —
+ *   those fields are owned by add-stock, adjust-stock, and syncMaterialStockOnReservationChange.
+ *   Validates: reorderLevel must be >= 0 if provided.
+ *   Required: materialId
+ *   Optional: name, unit, category, reorderLevel, supplierName, isActive
+ *   Types: RawMaterial
+ *   Reads:  users/{businessId}/raw_materials/{materialId}
  *   Writes: users/{businessId}/raw_materials/{materialId}
  *
- * updateRawMaterial
- *   Updates metadata on a raw material (name, category, reorderLevel, supplier, etc.).
- *   Does NOT touch stock fields — use addStock / adjustStock for that.
- *   Types: RawMaterial
- *   Writes: users/{businessId}/raw_materials/{materialId}
- *
- * createBOMEntry
+ * POST /api/business/b2b/create-bom-entry
  *   Creates a BOM entry linking one product to one raw material.
- *   Defines how much of the material is needed per finished piece,
- *   which production stage consumes it, and the wastage buffer %.
+ *   Defines how much of the material is needed per finished piece (quantityPerPiece),
+ *   which stage physically consumes it (consumedAtStage), and a wastage buffer % added
+ *   on top when calculating reservation quantities.
+ *   Validates:
+ *     — product exists and isActive
+ *     — material exists and isActive
+ *     — no existing active BOM entry for this product-material pair (returns
+ *       bom_entry_already_exists — deactivate the existing entry first to replace it)
+ *     — quantityPerPiece > 0
+ *     — wastagePercent between 0 and 100
+ *   Denormalizes productName, productSku, materialName, materialUnit into the entry
+ *   so BOM queries don't need joins.
+ *   Required: productId, materialId, quantityPerPiece, consumedAtStage, wastagePercent
  *   Types: BOMEntry
  *   Reads:  users/{businessId}/b2bProducts/{productId}
  *           users/{businessId}/raw_materials/{materialId}
+ *           users/{businessId}/bom (query: productId + materialId + isActive)
  *   Writes: users/{businessId}/bom/{bomId}
  *
- * updateBOMEntry
+ * POST /api/business/b2b/update-bom-entry
  *   Updates quantityPerPiece, wastagePercent, or consumedAtStage on a BOM entry.
  *   Cannot change which product or material the entry links.
+ *   Blocks updates on inactive entries — reactivation is done by deactivating
+ *   the current entry and creating a new one.
+ *   Validates: quantityPerPiece > 0, wastagePercent 0–100 if provided.
+ *   Required: bomId
+ *   Optional: quantityPerPiece, wastagePercent, consumedAtStage
  *   Types: BOMEntry
+ *   Reads:  users/{businessId}/bom/{bomId}
  *   Writes: users/{businessId}/bom/{bomId}
  *
- * deactivateBOMEntry
+ * POST /api/business/b2b/deactivate-bom-entry
  *   Soft-deletes a BOM entry by setting isActive: false.
- *   Deactivated entries are ignored by createOrder / confirmOrder.
+ *   Deactivated entries are ignored by confirm-order and create-order.
+ *   Guards against double-deactivation.
+ *   Required: bomId
  *   Types: BOMEntry
+ *   Reads:  users/{businessId}/bom/{bomId}
  *   Writes: users/{businessId}/bom/{bomId}
  *
- * createStageConfig
- *   Creates a production stage config entry (seed data for the stage picker UI).
+ * POST /api/business/b2b/create-stage-config
+ *   Creates a production stage config entry — seed data for the stage picker UI.
+ *   Guards against duplicate stage names (one config per StageName enum value).
+ *   Validates: defaultDurationDays > 0.
+ *   Required: name, label, description, defaultDurationDays, canBeOutsourced, sortOrder
  *   Types: ProductionStageConfig
+ *   Reads:  users/{businessId}/production_stage_config (query: name duplicate check)
  *   Writes: users/{businessId}/production_stage_config/{stageId}
  *
- * updateStageConfig
+ * POST /api/business/b2b/update-stage-config
  *   Updates label, description, defaultDurationDays, canBeOutsourced, or sortOrder.
+ *   Blocks name changes — StageName is referenced as a plain string on every lot's
+ *   stage array. Changing it would orphan all existing lots referencing that stage.
+ *   Validates: defaultDurationDays > 0, sortOrder >= 1 if provided.
+ *   Required: stageId
+ *   Optional: label, description, defaultDurationDays, canBeOutsourced, sortOrder
  *   Types: ProductionStageConfig
+ *   Reads:  users/{businessId}/production_stage_config/{stageId}
  *   Writes: users/{businessId}/production_stage_config/{stageId}
  *
  * =============================================================================
  * SECTION 2 — ORDER LIFECYCLE
  * =============================================================================
  *
- * saveDraftOrder
- *   Creates an order in DRAFT status. No lots are created, no materials reserved.
- *   Lot configurations are stored as draftLots[] on the order doc for later editing.
+ * POST /api/business/b2b/save-draft-order
+ *   Creates a new order in DRAFT status. No lots are created, no stock is reserved.
+ *   Lot configurations are stored as draftLots[] on the order doc for later editing
+ *   or confirmation. Generates a sequential order number (ORD-YYYY-NNNN).
+ *   Validates:
+ *     — buyer exists and isActive
+ *     — each lot: productId present, quantity > 0, stages non-empty,
+ *       product exists and isActive
+ *     — BOM check is intentionally deferred to confirm-order (a draft may be
+ *       created before BOM is fully set up)
+ *     — lots array must be non-empty
+ *   Required: buyerId, buyerName, buyerContact, shipDate, deliveryAddress, createdBy, lots
+ *   Optional: note
  *   Types: Order, DraftLotInput
  *   Writes: users/{businessId}/orders/{orderId}
  *           users/{businessId}/counters/orders
  *
- * confirmOrder
- *   Moves a DRAFT order to IN_PRODUCTION. Creates lots, fetches BOM per product,
- *   checks material availability, reserves stock, and clears draftLots from the order.
- *   Optionally accepts updated lot configs to allow last-minute changes before confirming.
- *   Rolls back to DRAFT if stock check fails.
- *   Types: Order, DraftLotInput, Lot, LotStage, BOMEntry, MaterialReservation, RawMaterial
+ * POST /api/business/b2b/update-draft-order
+ *   Updates an existing DRAFT order's metadata and lot configurations.
+ *   Same validations as save-draft-order (buyer, products) but BOM check
+ *   is still deferred — save should not block if BOM is not yet set up.
+ *   Blocks if order is not in DRAFT status.
+ *   Does NOT generate a new order number — the existing one is preserved.
+ *   Required: orderId, buyerId, buyerName, buyerContact, shipDate, deliveryAddress, lots
+ *   Optional: note
+ *   Types: Order, DraftLotInput
  *   Reads:  users/{businessId}/orders/{orderId}
- *           users/{businessId}/bom (query by productId)
- *           users/{businessId}/raw_materials/{materialId}
+ *           users/{businessId}/buyers/{buyerId}
+ *           users/{businessId}/b2bProducts/{productId} (per lot)
+ *   Writes: users/{businessId}/orders/{orderId}
+ *
+ * POST /api/business/b2b/confirm-order
+ *   Moves a DRAFT order to IN_PRODUCTION. Accepts optional updated lot configs
+ *   to allow last-minute changes at confirmation time without a separate edit step.
+ *   If lots are not passed, uses the draftLots already on the order.
+ *   Full validation pipeline:
+ *     — order must be in DRAFT status
+ *     — buyer re-validated for isActive (may have been deactivated since draft was saved)
+ *     — each lot: product exists + isActive, quantity > 0, stages non-empty
+ *     — each product must have at least one active BOM entry — blocks confirmation
+ *       entirely if missing (returns no_bom_for_product)
+ *     — stock shortfall check across all reservations — rolls order back to DRAFT
+ *       and returns insufficient_stock with per-material detail if any material
+ *       has insufficient availableStock
+ *   On success: creates all lot docs, writes one MaterialReservation per lot-material
+ *   pair, writes one RESERVATION MaterialTransaction per reservation, clears draftLots,
+ *   and sets order status to IN_PRODUCTION.
+ *   Note: raw material stock numbers (reservedStock, availableStock) are NOT updated
+ *   here — that is handled by syncMaterialStockOnReservationChange when each
+ *   reservation doc is written.
+ *   Required: orderId, confirmedBy
+ *   Optional: lots (updated DraftLotInput array)
+ *   Types: Order, DraftLotInput, Lot, LotStage, BOMEntry, MaterialReservation, MaterialTransaction
+ *   Reads:  users/{businessId}/orders/{orderId}
+ *           users/{businessId}/buyers/{buyerId}
+ *           users/{businessId}/b2bProducts/{productId} (per lot)
+ *           users/{businessId}/bom (query: productId + isActive, per lot)
+ *           users/{businessId}/raw_materials/{materialId} (stock shortfall check)
  *   Writes: users/{businessId}/orders/{orderId}
  *           users/{businessId}/lots/{lotId} (one per lot)
  *           users/{businessId}/material_reservations/{reservationId} (one per lot-material pair)
- *           users/{businessId}/raw_materials/{materialId} (reservedStock / availableStock)
+ *           users/{businessId}/material_transactions/{txId} (one RESERVATION per reservation)
  *           users/{businessId}/counters/lots
  *
- * createOrder
- *   Creates an order and immediately starts production in a single call (no draft step).
- *   Identical to confirmOrder but also creates the order doc in the same batch.
- *   Types: Order, DraftLotInput, Lot, LotStage, BOMEntry, MaterialReservation, RawMaterial
- *   Reads:  users/{businessId}/bom (query by productId)
- *           users/{businessId}/raw_materials/{materialId}
+ * POST /api/business/b2b/create-order
+ *   Creates an order and immediately starts production in a single call — skips
+ *   the draft step entirely. Identical validation pipeline to confirm-order including
+ *   buyer, product, BOM, and stock shortfall checks. Generates order number and
+ *   lot numbers in the same batch.
+ *   Required: buyerId, buyerName, buyerContact, shipDate, deliveryAddress, createdBy, lots
+ *   Optional: note
+ *   Types: Order, DraftLotInput, Lot, LotStage, BOMEntry, MaterialReservation, MaterialTransaction
+ *   Reads:  users/{businessId}/buyers/{buyerId}
+ *           users/{businessId}/b2bProducts/{productId} (per lot)
+ *           users/{businessId}/bom (query: productId + isActive, per lot)
+ *           users/{businessId}/raw_materials/{materialId} (stock shortfall check)
  *   Writes: users/{businessId}/orders/{orderId}
- *           users/{businessId}/lots/{lotId}
- *           users/{businessId}/material_reservations/{reservationId}
- *           users/{businessId}/raw_materials/{materialId}
+ *           users/{businessId}/lots/{lotId} (one per lot)
+ *           users/{businessId}/material_reservations/{reservationId} (one per lot-material pair)
+ *           users/{businessId}/material_transactions/{txId} (one RESERVATION per reservation)
  *           users/{businessId}/counters/orders
  *           users/{businessId}/counters/lots
  *
- * cancelOrder
- *   Cancels an order and all its active lots.
- *   For DRAFT orders: just flips status, no lot/reservation cleanup needed.
- *   For IN_PRODUCTION orders: cancels all non-completed lots, releases all RESERVED
- *   material reservations, restores availableStock, and writes RETURN transactions.
- *   Types: Order, Lot, MaterialReservation, RawMaterial, MaterialTransaction
+ * POST /api/business/b2b/cancel-order
+ *   Cancels an order and all its non-completed lots.
+ *   DRAFT orders: just flips status to CANCELLED — no lots or reservations exist.
+ *   IN_PRODUCTION orders: cancels all ACTIVE lots, releases all RESERVED material
+ *   reservations (flips to RELEASED), and writes one RETURN MaterialTransaction
+ *   per released reservation. COMPLETED lots are left untouched.
+ *   Note: raw material stock numbers are not updated here — owned by trigger.
+ *   Required: orderId, cancelledBy, reason
+ *   Types: Order, Lot, MaterialReservation, MaterialTransaction
  *   Reads:  users/{businessId}/orders/{orderId}
- *           users/{businessId}/lots (query by orderId)
- *           users/{businessId}/material_reservations (query by lotId + status)
+ *           users/{businessId}/lots (query: orderId)
+ *           users/{businessId}/material_reservations (query: lotId + status RESERVED)
  *   Writes: users/{businessId}/orders/{orderId}
- *           users/{businessId}/lots/{lotId}
- *           users/{businessId}/material_reservations/{reservationId}
- *           users/{businessId}/raw_materials/{materialId}
- *           users/{businessId}/material_transactions/{txId}
+ *           users/{businessId}/lots/{lotId} (status → CANCELLED)
+ *           users/{businessId}/material_reservations/{reservationId} (status → RELEASED)
+ *           users/{businessId}/material_transactions/{txId} (one RETURN per reservation)
  *
  * =============================================================================
  * SECTION 3 — LOT LIFECYCLE
  * =============================================================================
  *
- * advanceLotStage
- *   Marks the current stage COMPLETED and moves the lot to the next stage.
- *   Consumes all RESERVED material reservations for the completed stage,
- *   decrementing reservedStock and totalStock on each raw material.
- *   If the completed stage is the last one, creates a finished_goods doc
- *   and marks the lot COMPLETED.
- *   Runs in a Firestore transaction.
- *   Types: Lot, LotStage, LotStageHistory, MaterialReservation, RawMaterial, FinishedGood
+ * POST /api/business/b2b/advance-lot-stage
+ *   Marks the current stage COMPLETED, moves the lot to the next stage, and consumes
+ *   all RESERVED material reservations whose consumedAtStage matches the stage
+ *   just completed (flips them to CONSUMED).
+ *   Writes one CONSUMPTION MaterialTransaction per consumed reservation.
+ *   Runs in a Firestore transaction for atomicity.
+ *   Validates:
+ *     — lot must exist and be ACTIVE
+ *     — current stage must not be BLOCKED (returns lot_stage_blocked)
+ *   Does NOT write LotStageHistory — owned by appendLotStageHistoryOnStageAdvance.
+ *   Does NOT create FinishedGood — owned by createFinishedGoodOnLotCompleted.
+ *   Does NOT update raw material stock numbers — owned by syncMaterialStockOnReservationChange.
+ *   Required: lotId, completedBy
+ *   Optional: note
+ *   Types: Lot, LotStage, MaterialReservation, MaterialTransaction
  *   Reads:  users/{businessId}/lots/{lotId}
- *           users/{businessId}/material_reservations (query by lotId + stage + status)
+ *           users/{businessId}/material_reservations (query: lotId + consumedAtStage + RESERVED)
  *   Writes: users/{businessId}/lots/{lotId}
- *           users/{businessId}/lot_stage_history/{historyId}
- *           users/{businessId}/material_reservations/{reservationId}
- *           users/{businessId}/raw_materials/{materialId}
- *           users/{businessId}/finished_goods/{finishedGoodId} (if last stage)
+ *           users/{businessId}/material_reservations/{reservationId} (status → CONSUMED)
+ *           users/{businessId}/material_transactions/{txId} (one CONSUMPTION per reservation)
  *
- * setLotStageBlocked
+ * POST /api/business/b2b/set-lot-stage-blocked
  *   Toggles the current stage between BLOCKED and IN_PROGRESS.
- *   Used to flag a lot that needs attention (machine breakdown, outsource delay, etc.)
- *   and to clear that flag when resolved.
+ *   Used to flag a lot that cannot proceed (machine breakdown, material shortage,
+ *   outsource delay) and to clear that flag when resolved.
+ *   Validates:
+ *     — lot must exist and be ACTIVE
+ *     — idempotency guards: returns already_blocked or already_unblocked if the
+ *       stage is already in the requested state
+ *   Required: lotId, blocked (boolean)
+ *   Optional: reason
  *   Types: Lot, LotStage
  *   Reads:  users/{businessId}/lots/{lotId}
  *   Writes: users/{businessId}/lots/{lotId}
  *
- * cancelLot
- *   Cancels a single lot. Releases all RESERVED reservations for the lot,
- *   restores availableStock, and writes RETURN transactions per material.
- *   Guards against cancelling an already-CANCELLED or COMPLETED lot.
+ * POST /api/business/b2b/cancel-lot
+ *   Cancels a single lot. Releases all RESERVED material reservations for the lot
+ *   (flips to RELEASED) and writes one RETURN MaterialTransaction per reservation.
  *   Runs in a Firestore transaction.
- *   Types: Lot, MaterialReservation, RawMaterial, MaterialTransaction
+ *   Guards against cancelling an already-CANCELLED or COMPLETED lot.
+ *   Note: raw material stock numbers are not updated here — owned by trigger.
+ *   Required: lotId, cancelledBy, reason
+ *   Types: Lot, MaterialReservation, MaterialTransaction
  *   Reads:  users/{businessId}/lots/{lotId}
- *           users/{businessId}/material_reservations (query by lotId + status)
- *   Writes: users/{businessId}/lots/{lotId}
- *           users/{businessId}/material_reservations/{reservationId}
- *           users/{businessId}/raw_materials/{materialId}
- *           users/{businessId}/material_transactions/{txId}
+ *           users/{businessId}/material_reservations (query: lotId + status RESERVED)
+ *   Writes: users/{businessId}/lots/{lotId} (status → CANCELLED)
+ *           users/{businessId}/material_reservations/{reservationId} (status → RELEASED)
+ *           users/{businessId}/material_transactions/{txId} (one RETURN per reservation)
  *
  * =============================================================================
  * SECTION 4 — STOCK MANAGEMENT
  * =============================================================================
  *
- * addStock
- *   Records an inbound stock receipt (GRN / purchase order).
- *   Increments both totalStock and availableStock.
- *   Writes a PURCHASE transaction with stockBefore / stockAfter.
- *   Quantity must be positive.
+ * POST /api/business/b2b/add-stock
+ *   Records an inbound stock receipt (GRN / purchase order arrival).
+ *   Increments totalStock and availableStock directly — no reservation involved.
+ *   Validates:
+ *     — material exists and isActive (cannot add stock to a deactivated material)
+ *     — quantity must be positive
+ *   Writes a PURCHASE MaterialTransaction with stockBefore/stockAfter populated
+ *   (these are meaningful here since we're doing the update ourselves in the
+ *   same transaction, unlike the trigger-owned types).
+ *   Runs in a Firestore transaction.
+ *   Required: materialId, quantity, referenceId (PO number), createdBy
+ *   Optional: note
  *   Types: RawMaterial, MaterialTransaction
  *   Reads:  users/{businessId}/raw_materials/{materialId}
- *   Writes: users/{businessId}/raw_materials/{materialId}
- *           users/{businessId}/material_transactions/{txId}
+ *   Writes: users/{businessId}/raw_materials/{materialId} (totalStock↑, availableStock↑)
+ *           users/{businessId}/material_transactions/{txId} (PURCHASE)
  *
- * adjustStock
- *   Manual stock correction (positive or negative). Requires a note explaining why.
- *   Only touches totalStock and availableStock — never reservedStock
- *   (reservations are independent commitments and must not be silently changed).
- *   Guards against pushing availableStock below zero.
- *   Writes an ADJUSTMENT transaction with stockBefore / stockAfter.
+ * POST /api/business/b2b/adjust-stock
+ *   Manual stock correction — positive to add, negative to reduce.
+ *   Requires a note explaining the reason (damaged goods, counting error, etc.).
+ *   Only touches totalStock and availableStock — never reservedStock, because
+ *   reservations are independent commitments and must not be silently altered.
+ *   Validates:
+ *     — material exists and isActive
+ *     — quantity cannot be zero
+ *     — resulting availableStock cannot go below zero (returns
+ *       adjustment_exceeds_available_stock — cannot adjust away stock that
+ *       is already committed to active reservations)
+ *   Writes an ADJUSTMENT MaterialTransaction with stockBefore/stockAfter populated.
+ *   Runs in a Firestore transaction.
+ *   Required: materialId, quantity, note, createdBy
  *   Types: RawMaterial, MaterialTransaction
  *   Reads:  users/{businessId}/raw_materials/{materialId}
- *   Writes: users/{businessId}/raw_materials/{materialId}
- *           users/{businessId}/material_transactions/{txId}
+ *   Writes: users/{businessId}/raw_materials/{materialId} (totalStock±, availableStock±)
+ *           users/{businessId}/material_transactions/{txId} (ADJUSTMENT)
  *
- * --- MaterialTransaction types and where each is written ---
+ * --- MaterialTransaction types — where each is written and what it means ---
  *
- *   PURCHASE     → addStock
- *   RESERVATION  → createOrder, confirmOrder  (stock locked for a lot)
- *   CONSUMPTION  → advanceLotStage            (stock physically used up)
- *   RETURN       → cancelOrder, cancelLot     (reserved stock released back)
- *   ADJUSTMENT   → adjustStock
+ *   PURCHASE     → add-stock
+ *                  Physical stock arrived. stockBefore/stockAfter populated.
+ *
+ *   ADJUSTMENT   → adjust-stock
+ *                  Manual correction. stockBefore/stockAfter populated.
+ *
+ *   RESERVATION  → confirm-order, create-order
+ *                  Stock locked for a lot. Physical stock unchanged — only
+ *                  reservedStock↑ and availableStock↓ (via trigger).
+ *                  stockBefore/stockAfter are null.
+ *
+ *   CONSUMPTION  → advance-lot-stage
+ *                  Material physically used up at a stage. totalStock↓,
+ *                  reservedStock↓ (via trigger). stockBefore/stockAfter are null.
+ *
+ *   RETURN       → cancel-order, cancel-lot
+ *                  Reserved stock released — lot cancelled before material was used.
+ *                  reservedStock↓, availableStock↑ (via trigger).
+ *                  stockBefore/stockAfter are null.
+ *
+ *   Note on null stockBefore/stockAfter: for RESERVATION, CONSUMPTION, and RETURN,
+ *   the raw material stock update is owned by syncMaterialStockOnReservationChange.
+ *   Routes only write the reservation doc — the trigger fires asynchronously and
+ *   updates the material. Capturing before/after in the route would require an
+ *   extra read and would be stale by the time the trigger fires anyway.
+ *   For PURCHASE and ADJUSTMENT, the route updates the material directly in the
+ *   same transaction, so before/after are accurate and meaningful.
  *
  * =============================================================================
  * SECTION 5 — DISPATCH
  * =============================================================================
  *
- * dispatchFinishedGood
+ * POST /api/business/b2b/dispatch-finished-good
  *   Marks a finished good as dispatched. Sets isDispatched: true, dispatchedAt,
- *   courierName, and awb. This is the handoff point to Majime — after dispatch,
- *   Majime takes over tracking via the AWB.
- *   Guards against double-dispatching.
+ *   courierName, and AWB number. This is the handoff point to Majime — after
+ *   dispatch, Majime takes over shipment tracking via the AWB.
+ *   Guards against double-dispatching (returns already_dispatched with the
+ *   existing AWB if the lot was already dispatched).
+ *   Required: finishedGoodId, courierName, awb, dispatchedBy
+ *   Optional: cartonCount, totalWeightKg
  *   Types: FinishedGood
  *   Reads:  users/{businessId}/finished_goods/{finishedGoodId}
  *   Writes: users/{businessId}/finished_goods/{finishedGoodId}
  *
  * =============================================================================
- * SECTION 6 — BACKGROUND (TRIGGERS + SCHEDULED)
+ * SECTION 6 — READ / QUERY
  * =============================================================================
  *
- * syncOrderStatsOnLotChange  [onDocumentWritten trigger]
- *   Fires on every lot write. Re-aggregates lotsCompleted, lotsInProduction,
- *   and lotsDelayed on the parent order by querying all lots for that order.
- *   Auto-sets order status to COMPLETED when all lots are completed.
- *   Types: Lot, Order
- *   Reads:  users/{businessId}/lots (query by orderId)
- *   Writes: users/{businessId}/orders/{orderId}
- *
- * recomputeLotDelays  [onSchedule — daily at 9am IST]
- *   Iterates all businesses and all ACTIVE lots in chunks of 100.
- *   Recomputes isDelayed and delayDays based on plannedDate vs today.
- *   Only writes if the value has changed, to avoid unnecessary Firestore writes.
- *   Types: Lot, LotStage
- *   Reads:  users (all businesses)
- *           users/{businessId}/lots (query by status ACTIVE, paginated)
- *   Writes: users/{businessId}/lots/{lotId} (only if delay status changed)
- *
- * =============================================================================
- * SECTION 7 — READ / QUERY
- * =============================================================================
- *
- * getOrderDashboard
+ * POST /api/business/b2b/get-order-dashboard
  *   Returns the full order detail view in one call.
  *   Fetches the order doc and all its lots in parallel.
- *   Returns: order data, lots grouped by currentStage (for Kanban),
- *   and a tnaSummary per lot (for TNA table view).
+ *   Returns: order data, lots grouped by currentStage (for Kanban column view),
+ *   and a tnaSummary per lot (for the TNA table — stage name, planned date,
+ *   actual date, status per stage).
+ *   Required: orderId
  *   Types: Order, Lot, LotStage
  *   Reads:  users/{businessId}/orders/{orderId}
- *           users/{businessId}/lots (query by orderId)
+ *           users/{businessId}/lots (query: orderId)
+ *
+ * =============================================================================
+ * SECTION 7 — BACKGROUND TRIGGERS
+ * =============================================================================
+ *
+ * syncOrderStatsOnLotChange  [onDocumentWritten: users/{businessId}/lots/{lotId}]
+ *   Fires on every lot write. Re-aggregates lotsCompleted, lotsInProduction, and
+ *   lotsDelayed on the parent order by querying all lots for that orderId.
+ *   Auto-sets order status to COMPLETED when all lots are in a terminal state
+ *   (all COMPLETED) — but only if the order is currently IN_PRODUCTION, so a
+ *   CANCELLED order is never accidentally flipped to COMPLETED.
+ *   Note: cancelled lots with isDelayed: true would inflate lotsDelayed if not
+ *   handled — cancel-lot and cancel-order reset isDelayed to false on cancellation.
+ *   Types: Lot, Order
+ *   Reads:  users/{businessId}/lots (query: orderId)
+ *           users/{businessId}/orders/{orderId}
+ *   Writes: users/{businessId}/orders/{orderId}
+ *           (lotsCompleted, lotsInProduction, lotsDelayed, optionally status)
+ *
+ * appendLotStageHistoryOnStageAdvance  [onDocumentWritten: users/{businessId}/lots/{lotId}]
+ *   Fires on every lot write. Writes a LotStageHistory doc when either:
+ *     (a) currentSequence advances (normal stage progression), or
+ *     (b) lot status flips to COMPLETED (last stage — currentSequence does not
+ *         change on the final advance, so condition (a) alone would miss it)
+ *   The completedStage is read from after.stages[before.currentSequence - 1],
+ *   which correctly points to the stage that was just finished in both cases.
+ *   movedBy and movedAt are taken from the stage's completedBy and actualDate fields.
+ *   Types: Lot, LotStageHistory
+ *   Reads:  (event data only — no additional Firestore reads)
+ *   Writes: users/{businessId}/lot_stage_history/{historyId}
+ *
+ * createFinishedGoodOnLotCompleted  [onDocumentWritten: users/{businessId}/lots/{lotId}]
+ *   Fires on every lot write. Creates a FinishedGood doc when the lot status
+ *   flips to COMPLETED for the first time. Includes a duplicate guard —
+ *   queries finished_goods by lotId before writing to handle trigger retries
+ *   or any edge case where the lot flips to COMPLETED more than once.
+ *   The FinishedGood doc represents the physical packed inventory ready to ship.
+ *   isDispatched starts false — updated by dispatch-finished-good when shipped.
+ *   Types: Lot, FinishedGood
+ *   Reads:  users/{businessId}/finished_goods (query: lotId, limit 1 — duplicate check)
+ *   Writes: users/{businessId}/finished_goods/{finishedGoodId}
+ *
+ * syncMaterialStockOnReservationChange  [onDocumentWritten: users/{businessId}/material_reservations/{reservationId}]
+ *   Fires on every reservation write. Sole owner of reservedStock, availableStock,
+ *   and totalStock updates for the reservation lifecycle. Routes never touch
+ *   these fields directly for RESERVATION / CONSUMPTION / RETURN events.
+ *   Three transitions handled:
+ *     Created (no before) → status RESERVED:
+ *       reservedStock↑ qty, availableStock↓ qty
+ *       (stock committed — physically still in warehouse)
+ *     RESERVED → CONSUMED:
+ *       reservedStock↓ qty, totalStock↓ qty
+ *       (stock physically used up at the stage)
+ *     RESERVED → RELEASED:
+ *       reservedStock↓ qty, availableStock↑ qty
+ *       (commitment cancelled — stock freed back)
+ *   All other transitions (e.g. already CONSUMED → no-op) are ignored.
+ *   Types: MaterialReservation, RawMaterial
+ *   Reads:  (event data only — no additional Firestore reads)
+ *   Writes: users/{businessId}/raw_materials/{materialId}
+ *
+ * =============================================================================
+ * SECTION 8 — SCHEDULED
+ * =============================================================================
+ *
+ * recomputeLotDelays  [onSchedule: daily 9am IST (03:00 UTC)]
+ *   Iterates all businesses and all ACTIVE lots in chunks of 100 using
+ *   cursor-based pagination. Recomputes isDelayed and delayDays for each lot
+ *   by comparing plannedDate of PENDING and IN_PROGRESS stages against today.
+ *   Only writes if the value has actually changed — avoids unnecessary Firestore
+ *   writes and prevents triggering downstream triggers on unchanged lots.
+ *   Runs daily to catch lots that became delayed overnight without any user action.
+ *   Types: Lot, LotStage
+ *   Reads:  users (all businesses)
+ *           users/{businessId}/lots (query: status ACTIVE, paginated in chunks of 100)
+ *   Writes: users/{businessId}/lots/{lotId} (only if isDelayed or delayDays changed)
  *
  * =============================================================================
  */
 
-import { onRequest } from "firebase-functions/v2/https";
 import { onDocumentWritten } from "firebase-functions/v2/firestore";
 import { onSchedule } from "firebase-functions/v2/scheduler";
 import { FieldValue, QueryDocumentSnapshot, Timestamp } from "firebase-admin/firestore";
 import { db } from "../../firebaseAdmin";
-import {
-  Lot,
-  LotStage,
-  MaterialReservation,
-  FinishedGood,
-  LotStageHistory,
-} from "../types";
-import { requireHeaderSecret } from "../../helpers";
-import { ENQUEUE_FUNCTION_SECRET } from "../../config";
+import { Lot, LotStage, MaterialReservation, FinishedGood, LotStageHistory } from "../types";
 
 // ============================================================================
 // INTERNAL HELPERS
@@ -507,8 +737,9 @@ export const recomputeLotDelays = onSchedule(
     for (const bizDoc of businessSnap.docs) {
       const businessId = bizDoc.id;
       let lastDoc: QueryDocumentSnapshot | undefined;
+      let hasMore = true;
 
-      do {
+      while (hasMore) {
         let query = db
           .collection(`users/${businessId}/lots`)
           .where("status", "==", "ACTIVE")
@@ -530,8 +761,8 @@ export const recomputeLotDelays = onSchedule(
         await batch.commit();
 
         lastDoc = snap.docs[snap.docs.length - 1];
-        if (snap.size < CHUNK) break;
-      } while (true);
+        if (snap.size < CHUNK) hasMore = false;
+      }
     }
   },
 );
