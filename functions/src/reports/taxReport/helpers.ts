@@ -1,7 +1,8 @@
 import ExcelJS from "exceljs";
 import { formatDate } from "../../helpers";
-import { RETURN_STATUSES } from "../../config";
+// import { RETURN_STATUSES } from "../../config";
 import { db } from "../../firebaseAdmin";
+import { QueryDocumentSnapshot, Timestamp } from "firebase-admin/firestore";
 
 interface ProductInfo {
   hsn: string;
@@ -352,59 +353,74 @@ async function processSalesReturnOrders(
   endOfRange.setHours(23, 59, 59, 999);
 
   console.log(
-    `📊 Fetching sales return orders with status changes from ${startOfRange.toDateString()} to ${endOfRange.toDateString()}`,
+    `📊 Fetching sales return orders from ${startOfRange.toDateString()} to ${endOfRange.toDateString()}`,
   );
+  const startTs = Timestamp.fromDate(startOfRange);
+  const endTs = Timestamp.fromDate(endOfRange);
 
-  // Fetch orders with return statuses only
-  const ordersSnapshot = await db
-    .collection("accounts")
-    .doc(storeId)
-    .collection("orders")
-    .where("customStatus", "in", Array.from(RETURN_STATUSES))
-    .get();
+  const baseQuery = db.collection("accounts").doc(storeId).collection("orders");
 
-  console.log(`Scanning ${ordersSnapshot.size} total orders for returns`);
+  const [rtoSnap, pendingRefundsSnap, cancellationSnap, cancelledSnap] = await Promise.all([
+    baseQuery
+      .where("customStatus", "==", "RTO Closed")
+      .where("lastStatusUpdate", ">=", startTs)
+      .where("lastStatusUpdate", "<=", endTs)
+      .get(),
+    baseQuery
+      .where("pendingRefundsAt", ">=", startTs)
+      .where("pendingRefundsAt", "<=", endTs)
+      .get(),
+    baseQuery
+      .where("cancellationRequestedAt", ">=", startTs)
+      .where("cancellationRequestedAt", "<=", endTs)
+      .get(),
+    baseQuery
+      .where("customStatus", "==", "Cancelled")
+      .where("lastStatusUpdate", ">=", startTs)
+      .where("lastStatusUpdate", "<=", endTs)
+      .get(),
+  ]);
+
+  const seenIds = new Set<string>();
+  const mergedDocs: QueryDocumentSnapshot[] = [];
+
+  for (const snap of [rtoSnap, pendingRefundsSnap, cancellationSnap]) {
+    for (const doc of snap.docs) {
+      if (seenIds.has(doc.id)) continue;
+      seenIds.add(doc.id);
+      mergedDocs.push(doc);
+    }
+  }
+
+  // Cancelled: only fall back to lastStatusUpdate if cancellationRequestedAt is absent
+  for (const doc of cancelledSnap.docs) {
+    if (seenIds.has(doc.id)) continue;
+    const cancelReqAt = doc.data().cancellationRequestedAt;
+    if (cancelReqAt) continue;
+    seenIds.add(doc.id);
+    mergedDocs.push(doc);
+  }
+
+  console.log(`Found ${mergedDocs.length} return orders`);
 
   const salesReturnRows: SalesReturnRow[] = [];
   let srNo = 1;
-  let eligibleOrdersCount = 0;
   let skippedItemsCount = 0;
 
-  for (const orderDoc of ordersSnapshot.docs) {
+  for (const orderDoc of mergedDocs) {
     const order = orderDoc.data();
-    const statusLogs = order.customStatusesLogs || [];
     const hasRefundedAmount = order.refundedAmount !== undefined && order.refundedAmount !== null;
 
-    // Find logs from date range with return statuses
-    const returnLogs = statusLogs.filter((log: any) => {
-      if (!log.createdAt || !log.status) return false;
+    // Determine dateOfReturn:
+    // pendingRefundsAt > cancellationRequestedAt > lastStatusUpdate
+    const dateOfReturn =
+      order.cancellationRequestedAt ??
+      order.pendingRefundsAt ??
+      order.lastStatusUpdate;
 
-      const logDate = log.createdAt.toDate ? log.createdAt.toDate() : new Date(log.createdAt);
-      const logDateOnly = new Date(logDate);
-      logDateOnly.setHours(0, 0, 0, 0);
-
-      const startDateOnly = new Date(startOfRange);
-      startDateOnly.setHours(0, 0, 0, 0);
-
-      const endDateOnly = new Date(endOfRange);
-      endDateOnly.setHours(0, 0, 0, 0);
-
-      return (
-        logDateOnly >= startDateOnly &&
-        logDateOnly <= endDateOnly &&
-        RETURN_STATUSES.has(log.status)
-      );
-    });
-
-    if (returnLogs.length === 0) continue;
-
-    eligibleOrdersCount++;
     const items = order.raw?.line_items || [];
     const itemsArr = Array.isArray(items) ? items : [];
-    const totalMRP = itemsArr.reduce((acc, item) => acc + Number(item.price), 0);
-
-    // Use the first return log for date of return
-    const dateOfReturn = returnLogs[0].createdAt;
+    const totalMRP = itemsArr.reduce((acc: number, item: any) => acc + Number(item.price), 0);
 
     for (const item of items) {
       try {
@@ -422,7 +438,7 @@ async function processSalesReturnOrders(
         const mrp = Number((itemQty * itemPrice).toFixed(2));
         const discountArr = item.discount_allocations;
         const discountLinewise = (Array.isArray(discountArr) ? discountArr : []).reduce(
-          (a, i) => a + Number(i.amount),
+          (a: number, i: any) => a + Number(i.amount),
           0,
         );
 
@@ -434,11 +450,9 @@ async function processSalesReturnOrders(
         );
         const salePrice = Number((mrp - discountLinewise + proportionateShippingPrice).toFixed(2));
 
-        // Determine refund amount based on whether order has refundedAmount
+        // Determine refund amount
         let refundAmount: number;
-
         if (hasRefundedAmount) {
-          // Order has refundedAmount: use item-wise refundedAmount, skip if 0
           const itemRefundAmount = Number(item.refundedAmount || 0);
           if (itemRefundAmount <= 0) {
             skippedItemsCount++;
@@ -446,14 +460,10 @@ async function processSalesReturnOrders(
           }
           refundAmount = itemRefundAmount;
         } else {
-          // No refundedAmount on order: use full salePrice
           refundAmount = salePrice;
         }
 
-        // Get HSN and Tax Rate
         const productInfo = await getProductInfo(storeId, item.title);
-
-        // Calculate taxable on the refund amount
         const taxable = calculateTaxable(refundAmount, productInfo.taxRate);
         const taxes = calculateTaxes(taxable, productInfo.taxRate, state);
 
@@ -487,7 +497,6 @@ async function processSalesReturnOrders(
     }
   }
 
-  console.log(`Found ${eligibleOrdersCount} eligible return orders`);
   console.log(
     `Skipped ${skippedItemsCount} items with zero refundedAmount (from orders with refundedAmount set)`,
   );

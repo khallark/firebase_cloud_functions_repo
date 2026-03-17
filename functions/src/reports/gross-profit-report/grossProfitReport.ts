@@ -59,14 +59,23 @@ export const grossProfitReport = onRequest(
       const formattedStartDate = `${startDate}T00:00:00+05:30`;
       const formattedEndDate = `${endDate}T23:59:59+05:30`;
 
-      // ── 3. Calculate all metrics in parallel ───────────────────────────────
-      const [sale, saleReturn, purchase, openingStock, closingStock] = await Promise.all([
+      // ── 3. Calculate metrics ───────────────────────────────────────────────
+      // sale, saleReturn, purchase, openingStock can all run in parallel.
+      // closingStock must come after saleReturn because it needs lostQty.
+      const [sale, saleReturn, purchase, openingStock] = await Promise.all([
         calcSaleMetric(storeIds, formattedStartDate, formattedEndDate, false),
         calcSaleMetric(storeIds, formattedStartDate, formattedEndDate, true),
         calcPurchaseMetric(businessId, startDate, endDate),
         calcStockMetric(businessId, startDate, true),
-        calcStockMetric(businessId, endDate, false),
       ]);
+
+      // Pass lostQty so closing stock deducts lost items from the snapshot total
+      const closingStock = await calcStockMetric(
+        businessId,
+        endDate,
+        false,
+        saleReturn.lostQty ?? 0,
+      );
 
       const grossProfit = calcGrossProfit([sale, saleReturn, purchase, openingStock, closingStock]);
 
@@ -87,13 +96,17 @@ export const grossProfitReport = onRequest(
 
       const businessDocRef = db.collection("users").doc(businessId);
 
+      const firestoreRows = allRows.map(({ lostQty, ...rest }) =>
+        lostQty !== undefined ? { ...rest, lostQty } : rest,
+      );
+
       // ── 6. Write to Firestore (same pattern as generateTableData)
       await businessDocRef.update({
         "grossProfitData.loading": false,
         "grossProfitData.lastUpdated": Timestamp.now(),
         "grossProfitData.startDate": startDate,
         "grossProfitData.endDate": endDate,
-        "grossProfitData.rows": allRows,
+        "grossProfitData.rows": firestoreRows,   // ← use sanitized rows
         "grossProfitData.downloadUrl": null,
         "grossProfitData.error": null,
       });

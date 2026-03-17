@@ -13,6 +13,7 @@ export interface MetricRow {
   cgst: number;
   sgst: number;
   net: number;
+  lostQty?: number; // present on Sale Return and Closing Stock rows
 }
 
 // ─── Tax Helpers ──────────────────────────────────────────────────────────────
@@ -46,6 +47,7 @@ function round2(n: number): number {
 /**
  * Calculates Sale (or Sale Return) metric across all stores.
  * If `isReturn` is true, applies the customStatus filter for returns.
+ * Returns `lostQty` on the Sale Return row so the caller can pass it to calcStockMetric.
  */
 export async function calcSaleMetric(
   storeIds: string[],
@@ -59,15 +61,7 @@ export async function calcSaleMetric(
   let totalIgst = 0;
   let totalCgst = 0;
   let totalSgst = 0;
-
-  // const RETURN_STATUSES = [
-  //   "RTO Closed",
-  //   "Pending Refunds",
-  //   "DTO Refunded",
-  //   // "Lost",
-  //   "Cancellation Requested",
-  //   "Cancelled",
-  // ];
+  let totalLostQty = 0;
 
   const startTs = Timestamp.fromDate(new Date(formattedStartDate));
   const endTs = Timestamp.fromDate(new Date(formattedEndDate));
@@ -75,28 +69,35 @@ export async function calcSaleMetric(
   for (const storeId of storeIds) {
     const baseQuery = db.collection("accounts").doc(storeId).collection("orders");
 
-    let snapshot;
+    let snapshot: { docs: QueryDocumentSnapshot[] };
+
     if (isReturn) {
-      const [rtoSnap, pendingRefundsSnap, cancellationSnap, cancelledSnap] = await Promise.all([
-        baseQuery
-          .where("customStatus", "==", "RTO Closed")
-          .where("lastStatusUpdate", ">=", startTs)
-          .where("lastStatusUpdate", "<=", endTs)
-          .get(),
-        baseQuery
-          .where("pendingRefundsAt", ">=", startTs)
-          .where("pendingRefundsAt", "<=", endTs)
-          .get(),
-        baseQuery
-          .where("cancellationRequestedAt", ">=", startTs)
-          .where("cancellationRequestedAt", "<=", endTs)
-          .get(),
-        baseQuery
-          .where("customStatus", "==", "Cancelled")
-          .where("lastStatusUpdate", ">=", startTs)
-          .where("lastStatusUpdate", "<=", endTs)
-          .get(),
-      ]);
+      const [rtoSnap, pendingRefundsSnap, cancellationSnap, cancelledSnap, lostSnap] =
+        await Promise.all([
+          baseQuery
+            .where("customStatus", "==", "RTO Closed")
+            .where("lastStatusUpdate", ">=", startTs)
+            .where("lastStatusUpdate", "<=", endTs)
+            .get(),
+          baseQuery
+            .where("pendingRefundsAt", ">=", startTs)
+            .where("pendingRefundsAt", "<=", endTs)
+            .get(),
+          baseQuery
+            .where("cancellationRequestedAt", ">=", startTs)
+            .where("cancellationRequestedAt", "<=", endTs)
+            .get(),
+          baseQuery
+            .where("customStatus", "==", "Cancelled")
+            .where("lastStatusUpdate", ">=", startTs)
+            .where("lastStatusUpdate", "<=", endTs)
+            .get(),
+          baseQuery
+            .where("customStatus", "==", "Lost")
+            .where("lastStatusUpdate", ">=", startTs)
+            .where("lastStatusUpdate", "<=", endTs)
+            .get(),
+        ]);
 
       const seenIds = new Set<string>();
       const mergedDocs: QueryDocumentSnapshot[] = [];
@@ -116,6 +117,19 @@ export async function calcSaleMetric(
         if (cancelReqAt) continue;
         seenIds.add(doc.id);
         mergedDocs.push(doc);
+      }
+
+      // Lost: always include, track qty separately
+      for (const doc of lostSnap.docs) {
+        if (seenIds.has(doc.id)) continue;
+        seenIds.add(doc.id);
+        mergedDocs.push(doc);
+        const lostItems: number =
+          doc.data()?.raw?.line_items?.reduce(
+            (sum: number, item: any) => sum + Number(item?.quantity ?? 0),
+            0,
+          ) ?? 0;
+        totalLostQty += lostItems;
       }
 
       snapshot = { docs: mergedDocs };
@@ -141,12 +155,12 @@ export async function calcSaleMetric(
       const numItems =
         isReturn && ["Pending Refunds", "DTO Refunded"].includes(order.customStatus)
           ? order?.raw?.line_items
-              ?.filter((item: any) => item?.qc_status === "QC Pass")
-              ?.reduce((sum: number, item: any) => sum + Number(item?.quantity ?? 0), 0)
+            ?.filter((item: any) => item?.qc_status === "QC Pass")
+            ?.reduce((sum: number, item: any) => sum + Number(item?.quantity ?? 0), 0)
           : order?.raw?.line_items?.reduce(
-              (sum: number, item: any) => sum + Number(item?.quantity ?? 0),
-              0,
-            );
+            (sum: number, item: any) => sum + Number(item?.quantity ?? 0),
+            0,
+          );
 
       totalQty += numItems;
       totalNet += netPrice;
@@ -155,6 +169,7 @@ export async function calcSaleMetric(
       totalCgst += tax.cgst;
       totalSgst += tax.sgst;
     }
+
     if (isReturn) {
       console.log("Sale Return orders:");
       for (const [status, names] of Object.entries(a)) {
@@ -178,6 +193,7 @@ export async function calcSaleMetric(
     cgst: round2(sign * totalCgst),
     sgst: round2(sign * totalSgst),
     net: round2(sign * totalNet),
+    lostQty: isReturn && totalLostQty > 0 ? totalLostQty : undefined,
   };
 }
 
@@ -226,11 +242,13 @@ export async function calcPurchaseMetric(
  * Calculates Opening or Closing Stock from inventory snapshots (all Punjab).
  * For Opening Stock → use (startDate - 1 day).
  * For Closing Stock → use endDate.
+ * Pass `lostQty` (from calcSaleMetric) for closing stock to deduct lost items.
  */
 export async function calcStockMetric(
   businessId: string,
   date: string,
   isOpening: boolean,
+  lostQty = 0,
 ): Promise<MetricRow> {
   let snapshotDate = date;
 
@@ -254,6 +272,12 @@ export async function calcStockMetric(
       Number(doc.data().exactDocState.inventory.blockedStock ?? 0);
   }
 
+  // Deduct lost qty from closing stock (lost items are still counted in snapshot
+  // but physically no longer in warehouse)
+  if (!isOpening && lostQty > 0) {
+    totalQty += lostQty;
+  }
+
   const ASSUMED_COGS = 762;
   const totalNet = totalQty * ASSUMED_COGS;
   const tax = reverseCalculateTax(totalNet, true);
@@ -268,6 +292,7 @@ export async function calcStockMetric(
     cgst: round2(sign * tax.cgst),
     sgst: round2(sign * tax.sgst),
     net: round2(sign * totalNet),
+    lostQty: !isOpening && lostQty > 0 ? lostQty : undefined,
   };
 }
 
@@ -301,7 +326,7 @@ export function buildExcel(rows: MetricRow[]): ExcelJS.Workbook {
 
   // Column definitions
   ws.columns = [
-    { header: "Type", key: "type", width: 18 },
+    { header: "Type", key: "type", width: 28 },
     { header: "Qty", key: "qty", width: 12 },
     { header: "Taxable Amount", key: "taxable", width: 18 },
     { header: "IGST", key: "igst", width: 14 },
@@ -325,8 +350,16 @@ export function buildExcel(rows: MetricRow[]): ExcelJS.Workbook {
 
   // Data rows
   for (const row of rows) {
+    // Annotate type label in Excel too
+    let typeLabel = row.type;
+    if (row.type === "Sale Return" && row.lostQty) {
+      typeLabel = `Sale Return (incl. Lost: ${row.lostQty})`;
+    } else if (row.type === "Closing Stock" && row.lostQty) {
+      typeLabel = `Closing Stock (excl. Lost: ${row.lostQty})`;
+    }
+
     const excelRow = ws.addRow([
-      row.type,
+      typeLabel,
       row.qty,
       row.taxable,
       row.igst,
