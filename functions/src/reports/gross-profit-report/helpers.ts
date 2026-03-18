@@ -13,17 +13,12 @@ export interface MetricRow {
   cgst: number;
   sgst: number;
   net: number;
-  lostQty?: number; // present on Sale Return and Closing Stock rows
 }
 
 // ─── Tax Helpers ──────────────────────────────────────────────────────────────
 
 const TAX_RATE = 0.05;
 
-/**
- * Reverse-calculates taxable amount and splits tax into IGST or CGST/SGST
- * depending on whether the state is Punjab.
- */
 function reverseCalculateTax(
   netAmount: number,
   isPunjab: boolean,
@@ -46,8 +41,7 @@ function round2(n: number): number {
 
 /**
  * Calculates Sale (or Sale Return) metric across all stores.
- * If `isReturn` is true, applies the customStatus filter for returns.
- * Returns `lostQty` on the Sale Return row so the caller can pass it to calcStockMetric.
+ * Lost orders are NOT included here — they have their own calcLostMetric.
  */
 export async function calcSaleMetric(
   storeIds: string[],
@@ -61,7 +55,6 @@ export async function calcSaleMetric(
   let totalIgst = 0;
   let totalCgst = 0;
   let totalSgst = 0;
-  let totalLostQty = 0;
 
   const startTs = Timestamp.fromDate(new Date(formattedStartDate));
   const endTs = Timestamp.fromDate(new Date(formattedEndDate));
@@ -72,7 +65,7 @@ export async function calcSaleMetric(
     let snapshot: { docs: QueryDocumentSnapshot[] };
 
     if (isReturn) {
-      const [rtoSnap, pendingRefundsSnap, cancellationSnap, cancelledSnap, lostSnap] =
+      const [rtoSnap, pendingRefundsSnap, cancellationSnap, cancelledSnap] =
         await Promise.all([
           baseQuery
             .where("customStatus", "==", "RTO Closed")
@@ -89,11 +82,6 @@ export async function calcSaleMetric(
             .get(),
           baseQuery
             .where("customStatus", "==", "Cancelled")
-            .where("lastStatusUpdate", ">=", startTs)
-            .where("lastStatusUpdate", "<=", endTs)
-            .get(),
-          baseQuery
-            .where("customStatus", "==", "Lost")
             .where("lastStatusUpdate", ">=", startTs)
             .where("lastStatusUpdate", "<=", endTs)
             .get(),
@@ -119,19 +107,6 @@ export async function calcSaleMetric(
         mergedDocs.push(doc);
       }
 
-      // Lost: always include, track qty separately
-      for (const doc of lostSnap.docs) {
-        if (seenIds.has(doc.id)) continue;
-        seenIds.add(doc.id);
-        mergedDocs.push(doc);
-        const lostItems: number =
-          doc.data()?.raw?.line_items?.reduce(
-            (sum: number, item: any) => sum + Number(item?.quantity ?? 0),
-            0,
-          ) ?? 0;
-        totalLostQty += lostItems;
-      }
-
       snapshot = { docs: mergedDocs };
     } else {
       snapshot = await baseQuery
@@ -143,7 +118,6 @@ export async function calcSaleMetric(
     const a: Record<string, string[]> = {};
     for (const doc of snapshot.docs) {
       const order = doc.data();
-      // in-memory vendor exclusion (replaces the not-in Firestore filter)
       const vendors: string[] = order.vendors ?? [];
       if (vendors.length === 1 && (vendors.includes("ENDORA") || vendors.includes("STYLE 05")))
         continue;
@@ -155,12 +129,12 @@ export async function calcSaleMetric(
       const numItems =
         isReturn && ["Pending Refunds", "DTO Refunded"].includes(order.customStatus)
           ? order?.raw?.line_items
-            ?.filter((item: any) => item?.qc_status === "QC Pass")
-            ?.reduce((sum: number, item: any) => sum + Number(item?.quantity ?? 0), 0)
+              ?.filter((item: any) => item?.qc_status === "QC Pass")
+              ?.reduce((sum: number, item: any) => sum + Number(item?.quantity ?? 0), 0)
           : order?.raw?.line_items?.reduce(
-            (sum: number, item: any) => sum + Number(item?.quantity ?? 0),
-            0,
-          );
+              (sum: number, item: any) => sum + Number(item?.quantity ?? 0),
+              0,
+            );
 
       totalQty += numItems;
       totalNet += netPrice;
@@ -183,7 +157,6 @@ export async function calcSaleMetric(
     }
   }
 
-  // Sale Return values are stored as negatives in the report
   const sign = isReturn ? -1 : 1;
   return {
     type: isReturn ? "Sale Return" : "Sale",
@@ -193,7 +166,69 @@ export async function calcSaleMetric(
     cgst: round2(sign * totalCgst),
     sgst: round2(sign * totalSgst),
     net: round2(sign * totalNet),
-    lostQty: isReturn && totalLostQty > 0 ? totalLostQty : undefined,
+  };
+}
+
+/**
+ * Calculates Lost orders metric across all stores.
+ * Qty is 0 (displayed as "–" in UI). Amounts are negative (subtracted in gross profit).
+ * Row type is "Lost (N)" where N is the actual item count.
+ */
+export async function calcLostMetric(
+  storeIds: string[],
+  formattedStartDate: string,
+  formattedEndDate: string,
+): Promise<MetricRow> {
+  const startTs = Timestamp.fromDate(new Date(formattedStartDate));
+  const endTs = Timestamp.fromDate(new Date(formattedEndDate));
+
+  let totalItemQty = 0;
+  let totalNet = 0;
+  let totalTaxable = 0;
+  let totalIgst = 0;
+  let totalCgst = 0;
+  let totalSgst = 0;
+
+  for (const storeId of storeIds) {
+    const snap = await db
+      .collection("accounts")
+      .doc(storeId)
+      .collection("orders")
+      .where("customStatus", "==", "Lost")
+      .where("lastStatusUpdate", ">=", startTs)
+      .where("lastStatusUpdate", "<=", endTs)
+      .get();
+
+    for (const doc of snap.docs) {
+      const order = doc.data();
+      const vendors: string[] = order.vendors ?? [];
+      if (vendors.length === 1 && (vendors.includes("ENDORA") || vendors.includes("STYLE 05")))
+        continue;
+      const netPrice = Number(order?.raw?.total_price ?? 0);
+      const isPunjab = order?.raw?.shipping_address?.province === "Punjab";
+      const tax = reverseCalculateTax(netPrice, isPunjab);
+      const qty: number =
+        order?.raw?.line_items?.reduce(
+          (sum: number, item: any) => sum + Number(item?.quantity ?? 0),
+          0,
+        ) ?? 0;
+      totalItemQty += qty;
+      totalNet += netPrice;
+      totalTaxable += tax.taxable;
+      totalIgst += tax.igst;
+      totalCgst += tax.cgst;
+      totalSgst += tax.sgst;
+    }
+  }
+
+  return {
+    type: `Lost (${totalItemQty})`,
+    qty: 0,          // shown as "–" in UI; doesn't affect gross profit qty
+    taxable: round2(-totalTaxable),
+    igst: round2(-totalIgst),
+    cgst: round2(-totalCgst),
+    sgst: round2(-totalSgst),
+    net: round2(-totalNet),
   };
 }
 
@@ -225,7 +260,6 @@ export async function calcPurchaseMetric(
     totalNet += Number(grn.totalReceivedValue ?? 0);
   }
 
-  // Purchase is Punjab and stored as negative
   const tax = reverseCalculateTax(totalNet, true);
   return {
     type: "Purchase",
@@ -242,13 +276,11 @@ export async function calcPurchaseMetric(
  * Calculates Opening or Closing Stock from inventory snapshots (all Punjab).
  * For Opening Stock → use (startDate - 1 day).
  * For Closing Stock → use endDate.
- * Pass `lostQty` (from calcSaleMetric) for closing stock to deduct lost items.
  */
 export async function calcStockMetric(
   businessId: string,
   date: string,
   isOpening: boolean,
-  lostQty = 0,
 ): Promise<MetricRow> {
   let snapshotDate = date;
 
@@ -265,24 +297,46 @@ export async function calcStockMetric(
     .where("date", "==", snapshotDate)
     .get();
 
-  let totalQty = 0;
+  const qtyByProduct = new Map<string, number>();
   for (const doc of snapshot.docs) {
-    totalQty +=
-      Number(doc.data().stockLevel ?? 0) -
-      Number(doc.data().exactDocState.inventory.blockedStock ?? 0);
+    const data = doc.data();
+    const productId = data.productId as string;
+    if (!productId) continue;
+    const qty =
+      Number(data.stockLevel ?? 0) -
+      Number(data.exactDocState?.inventory?.blockedStock ?? 0);
+    qtyByProduct.set(productId, (qtyByProduct.get(productId) ?? 0) + qty);
   }
 
-  // Deduct lost qty from closing stock (lost items are still counted in snapshot
-  // but physically no longer in warehouse)
-  if (!isOpening && lostQty > 0) {
-    totalQty += lostQty;
+  const productIds = Array.from(qtyByProduct.keys());
+  const productDocs = await Promise.all(
+    productIds.map((productId) =>
+      db.collection("users").doc(businessId).collection("products").doc(productId).get(),
+    ),
+  );
+
+  const priceByProduct = new Map<string, number>();
+  for (const doc of productDocs) {
+    if (!doc.exists) continue;
+    const price = Number(doc.data()?.price ?? 0);
+    priceByProduct.set(doc.id, price);
   }
 
-  const ASSUMED_COGS = 762;
-  const totalNet = totalQty * ASSUMED_COGS;
+  let totalQty = 0;
+  let totalNet = 0;
+  for (const [productId, qty] of qtyByProduct) {
+    totalQty += qty;
+    const cogs = priceByProduct.get(productId) ?? 0;
+    totalNet += qty * cogs;
+  }
+
+  // if (!isOpening && lostQty > 0) {
+  //   totalQty += lostQty;
+  //   const avgCogs = totalQty > 0 ? totalNet / (totalQty + lostQty) : 0;
+  //   totalNet += lostQty * avgCogs;
+  // }
+
   const tax = reverseCalculateTax(totalNet, true);
-
-  // Opening Stock is negative, Closing Stock is positive
   const sign = isOpening ? -1 : 1;
   return {
     type: isOpening ? "Opening Stock" : "Closing Stock",
@@ -292,13 +346,11 @@ export async function calcStockMetric(
     cgst: round2(sign * tax.cgst),
     sgst: round2(sign * tax.sgst),
     net: round2(sign * totalNet),
-    lostQty: !isOpening && lostQty > 0 ? lostQty : undefined,
   };
 }
 
 /**
- * Calculates Gross Profit row: Sale + SaleReturn + Purchase + OpeningStock + ClosingStock
- * (signs are already applied, so it's a straight sum).
+ * Calculates Gross Profit row: sum of all rows (signs already applied).
  */
 export function calcGrossProfit(rows: MetricRow[]): MetricRow {
   const sum = (key: keyof MetricRow) =>
@@ -324,7 +376,6 @@ export function buildExcel(rows: MetricRow[]): ExcelJS.Workbook {
 
   const ws = workbook.addWorksheet("Gross Profit Report");
 
-  // Column definitions
   ws.columns = [
     { header: "Type", key: "type", width: 28 },
     { header: "Qty", key: "qty", width: 12 },
@@ -335,32 +386,19 @@ export function buildExcel(rows: MetricRow[]): ExcelJS.Workbook {
     { header: "Net Amount", key: "net", width: 16 },
   ];
 
-  // Style header row
   const headerRow = ws.getRow(1);
   headerRow.font = { bold: true, name: "Arial", size: 11 };
-  headerRow.fill = {
-    type: "pattern",
-    pattern: "solid",
-    fgColor: { argb: "FFD9E1F2" },
-  };
+  headerRow.fill = { type: "pattern", pattern: "solid", fgColor: { argb: "FFD9E1F2" } };
   headerRow.alignment = { horizontal: "center", vertical: "middle" };
   headerRow.height = 20;
 
   const numFmt = '#,##0.00;(#,##0.00);"-"';
 
-  // Data rows
   for (const row of rows) {
-    // Annotate type label in Excel too
-    let typeLabel = row.type;
-    if (row.type === "Sale Return" && row.lostQty) {
-      typeLabel = `Sale Return (incl. Lost: ${row.lostQty})`;
-    } else if (row.type === "Closing Stock" && row.lostQty) {
-      typeLabel = `Closing Stock (excl. Lost: ${row.lostQty})`;
-    }
-
+    const isLost = row.type.startsWith("Lost (");
     const excelRow = ws.addRow([
-      typeLabel,
-      row.qty,
+      row.type,
+      isLost ? "–" : row.qty,
       row.taxable,
       row.igst,
       row.cgst,
@@ -371,23 +409,18 @@ export function buildExcel(rows: MetricRow[]): ExcelJS.Workbook {
     excelRow.font = { name: "Arial", size: 10 };
     excelRow.alignment = { vertical: "middle" };
 
-    // Apply number format to numeric columns (B–G)
     for (let col = 2; col <= 7; col++) {
-      excelRow.getCell(col).numFmt = numFmt;
+      if (!(isLost && col === 2)) {
+        excelRow.getCell(col).numFmt = numFmt;
+      }
     }
 
-    // Highlight Gross Profit row
     if (row.type === "Gross Profit") {
       excelRow.font = { name: "Arial", size: 10, bold: true };
-      excelRow.fill = {
-        type: "pattern",
-        pattern: "solid",
-        fgColor: { argb: "FFE2EFDA" },
-      };
+      excelRow.fill = { type: "pattern", pattern: "solid", fgColor: { argb: "FFE2EFDA" } };
     }
   }
 
-  // Borders on all cells
   const totalRows = ws.rowCount;
   for (let r = 1; r <= totalRows; r++) {
     for (let c = 1; c <= 7; c++) {
@@ -412,22 +445,14 @@ export async function uploadToStorage(
   endDate: string,
 ): Promise<string> {
   const uniqueSuffix = `${Date.now()}_${randomUUID()}`;
-
   const filename = `gross_profit_${startDate}_to_${endDate}_${uniqueSuffix}.xlsx`;
   const storagePath = `gross_profit_reports/${businessId}/${filename}`;
-
   const buffer = await workbook.xlsx.writeBuffer();
-
   const bucket = storage.bucket();
   const file = bucket.file(storagePath);
-
   await file.save(Buffer.from(buffer), {
-    metadata: {
-      contentType: "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-    },
+    metadata: { contentType: "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet" },
   });
-
   await file.makePublic();
-
   return `https://storage.googleapis.com/${bucket.name}/${storagePath}`;
 }

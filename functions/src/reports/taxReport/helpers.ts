@@ -11,6 +11,7 @@ interface ProductInfo {
 
 interface SalesRow {
   srNo: number;
+  totalOrderPrice: number;
   billNo: string;
   dateOfBill: string;
   customerName: string;
@@ -310,6 +311,7 @@ async function processSalesOrders(
           mrp: mrp,
           discountLinewise: discountLinewise,
           proportionateShippingPrice: proportionateShippingPrice,
+          totalOrderPrice: totalPrice,
           salePrice: salePrice,
           hsn: String(productInfo.hsn),
           taxRate: Number(productInfo.taxRate),
@@ -724,6 +726,7 @@ async function createExcelWorkbook(
     { header: "MRP", key: "mrp", width: 12 },
     { header: "Discount Line wise", key: "discountLinewise", width: 18 },
     { header: "Proportionate Shipping Price", key: "proportionateShippingPrice", width: 12 },
+    { header: "Total Order Price", key: "totalOrderPrice", width: 12 },
     { header: "Sale Price", key: "salePrice", width: 12 },
     { header: "HSN", key: "hsn", width: 10 },
     { header: "Tax Rate", key: "taxRate", width: 10 },
@@ -741,7 +744,7 @@ async function createExcelWorkbook(
 
   // Style header with all borders
   const salesHeaderRow = salesSheet.getRow(1);
-  for (let col = 1; col <= 25; col++) {
+  for (let col = 1; col <= 26; col++) {
     const cell = salesHeaderRow.getCell(col);
     cell.font = { bold: true, color: { argb: "FFFFFFFF" } };
     cell.fill = {
