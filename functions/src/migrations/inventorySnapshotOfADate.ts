@@ -15,7 +15,9 @@ interface SnapshotRow {
   stock: number;
   blockedStock: number | null;
   variantSku: string | null;
+  productName: string | null;  // ← add
   price: number | null;
+  cogs: number | null;
 }
 
 async function buildExcelBuffer(rows: SnapshotRow[], date: string): Promise<Buffer> {
@@ -26,12 +28,14 @@ async function buildExcelBuffer(rows: SnapshotRow[], date: string): Promise<Buff
   const ws = workbook.addWorksheet("Closing Stock");
 
   ws.columns = [
-    { header: "Product SKU", key: "productSku", width: 22 },
-    { header: "Stock", key: "stock", width: 12 },
-    { header: "Blocked Stock", key: "blockedStock", width: 16 },
-    { header: "Variant SKU", key: "variantSku", width: 22 },
-    { header: "Price", key: "price", width: 14 },
-  ];
+  { header: "Product SKU", key: "productSku", width: 22 },
+  { header: "Stock", key: "stock", width: 12 },
+  { header: "Blocked Stock", key: "blockedStock", width: 16 },
+  { header: "Product Name", key: "productName", width: 28 },  // ← add
+  { header: "Variant SKU", key: "variantSku", width: 22 },
+  { header: "Price", key: "price", width: 14 },
+  { header: "COGS", key: "cogs", width: 14 },
+];
 
   // Header styling
   const headerRow = ws.getRow(1);
@@ -47,18 +51,20 @@ async function buildExcelBuffer(rows: SnapshotRow[], date: string): Promise<Buff
       row.productSku,
       row.stock,
       row.blockedStock,
+      row.productName,
       row.variantSku,
       row.price,
+      row.cogs,
     ]);
     excelRow.font = { name: "Arial", size: 10 };
     excelRow.alignment = { vertical: "middle" };
-    // Numeric columns: Stock(B), Blocked Stock(C), Price(E)
-    [2, 3, 5].forEach((col) => (excelRow.getCell(col).numFmt = numFmt));
+    // Numeric columns: Stock(B), Blocked Stock(C), Price(E), COGS(F)
+    [2, 3, 6, 7].forEach((col) => (excelRow.getCell(col).numFmt = numFmt));
   }
 
   // Thin borders on all cells
   for (let r = 1; r <= ws.rowCount; r++) {
-    for (let c = 1; c <= 5; c++) {
+    for (let c = 1; c <= 7; c++) {
       ws.getRow(r).getCell(c).border = {
         top: { style: "thin" },
         left: { style: "thin" },
@@ -69,7 +75,7 @@ async function buildExcelBuffer(rows: SnapshotRow[], date: string): Promise<Buff
   }
 
   // Add a note with the report date in cell G1
-  ws.getCell("G1").value = `Date: ${date}`;
+  ws.getCell("H1").value = `Date: ${date}`;
   ws.getCell("G1").font = { name: "Arial", size: 10, italic: true };
 
   return Buffer.from(await workbook.xlsx.writeBuffer());
@@ -128,38 +134,48 @@ export const inventorySnapshotOfADate = onRequest(
       const result = await Promise.all(
         snap.docs.map(async (doc) => {
           const data = doc.data();
+          const productId = data.productId as string;
           const mappedVariants: MappedVariant[] = data.exactDocState?.mappedVariants ?? [];
-
           const targetVariant = mappedVariants.find((v) => v.storeId === "gj9ejg-cu.myshopify.com");
 
           let variantSku: string | null = targetVariant?.variantSku ?? null;
           let price: number | null = null;
+          let cogs: number | null = null;
 
-          if (targetVariant) {
-            try {
-              const productDoc = await db
-                .doc(`accounts/${targetVariant.storeId}/products/${targetVariant.productId}`)
-                .get();
-
-              if (productDoc.exists) {
-                const variants: { id: number; price: number }[] = productDoc.data()?.variants ?? [];
-                const matchedVariant = variants.find((v) => v.id === targetVariant.variantId);
-                price = matchedVariant?.price ?? null;
+          const [variantResult, cogsDoc] = await Promise.all([
+            // existing variant/price fetch
+            (async () => {
+              if (!targetVariant) return null;
+              try {
+                const productDoc = await db
+                  .doc(`accounts/${targetVariant.storeId}/products/${targetVariant.productId}`)
+                  .get();
+                if (productDoc.exists) {
+                  const variants: { id: number; price: number }[] = productDoc.data()?.variants ?? [];
+                  const matchedVariant = variants.find((v) => v.id === targetVariant.variantId);
+                  return matchedVariant?.price ?? null;
+                }
+              } catch (err) {
+                console.error(`Error fetching product for productId=${targetVariant.productId}:`, err);
               }
-            } catch (err) {
-              console.error(
-                `Error fetching product for productId=${targetVariant.productId}:`,
-                err,
-              );
-            }
-          }
+              return null;
+            })(),
+            // new COGS fetch
+            db.doc(`users/${businessId}/products/${productId}`).get(),
+          ]);
+
+          price = variantResult;
+          cogs = cogsDoc.exists ? (Number(cogsDoc.data()?.price) || null) : null;
+          const productName = cogsDoc.exists ? (String(cogsDoc.data()?.name ?? "") || null) : null;  // ← add
 
           return {
-            productSku: data.productId as string,
+            productSku: productId,
             stock: data.stockLevel as number,
             blockedStock: data?.exactDocState?.inventory?.blockedStock ?? null,
+            productName,
             variantSku,
             price,
+            cogs,
           } satisfies SnapshotRow;
         }),
       );

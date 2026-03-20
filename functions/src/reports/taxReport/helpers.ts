@@ -228,7 +228,7 @@ async function processSalesOrders(
     const order = orderDoc.data();
     const items = order.raw?.line_items || [];
     const itemsArr = Array.isArray(items) ? items : [];
-    const totalMRP = itemsArr.reduce((acc, item) => acc + Number(item.price), 0);
+    const totalMRP = itemsArr.reduce((acc, item) => acc + Number(item.price ?? 0) * Number(item.quantity ?? 0), 0);
 
     for (const item of items) {
       try {

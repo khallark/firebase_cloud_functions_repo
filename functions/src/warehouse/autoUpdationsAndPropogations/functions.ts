@@ -33,7 +33,7 @@ import {
   updateZoneCountsInTransaction,
 } from "./helpers";
 import { db } from "../../firebaseAdmin";
-import { FieldValue, Timestamp } from "firebase-admin/firestore";
+import { FieldValue, Timestamp, Transaction } from "firebase-admin/firestore";
 import { TASKS_SECRET } from "../../config";
 
 // Helper to extract the loggable snapshot from a UPC
@@ -82,12 +82,42 @@ async function writeUPCLog(
   await batch.commit();
 }
 
+// ─── Retry helper: wraps a Firestore transaction with outer exponential backoff ───
+async function runTransactionWithRetry<T>(
+  label: string,
+  fn: (tx: Transaction) => Promise<T>,
+  outerAttempts = 8,
+): Promise<T> {
+  let lastError: unknown;
+
+  for (let attempt = 1; attempt <= outerAttempts; attempt++) {
+    try {
+      // Inner retry is handled by Firestore itself (maxAttempts: 25)
+      return await db.runTransaction(fn, { maxAttempts: 25 });
+    } catch (err) {
+      lastError = err;
+      const jitter = Math.random() * 200;
+      const delayMs = Math.min(150 * Math.pow(2, attempt) + jitter, 15_000);
+      console.warn(
+        `⚠️ [${label}] Transaction outer attempt ${attempt}/${outerAttempts} failed. ` +
+          `Retrying in ${Math.round(delayMs)}ms…`,
+        err,
+      );
+      await new Promise((res) => setTimeout(res, delayMs));
+    }
+  }
+
+  throw lastError;
+}
+
 export const onUpcWritten = onDocumentWritten(
   {
     document: "users/{businessId}/upcs/{upcId}",
     secrets: [TASKS_SECRET],
-    memory: "256MiB",
-    timeoutSeconds: 30,
+    memory: "4GiB",
+    timeoutSeconds: 540,
+    // Cap parallelism — fewer concurrent instances = less contention on hot product docs
+    maxInstances: 100,
   },
   async (event) => {
     const before = event.data?.before?.data() as UPC | undefined;
@@ -95,19 +125,21 @@ export const onUpcWritten = onDocumentWritten(
     const { businessId, upcId } = event.params;
 
     // ============================================================
-    // CASE 1: UPC Created With putAway as 'inbound'
+    // CASE 1: UPC Created
     // ============================================================
     if (!before && after) {
-      // Log the initial state on creation
+      // Log and inventory update are independent — isolate failures
       try {
         await writeUPCLog(businessId, upcId, after.productId, after.grnRef, getUPCSnapshot(after));
       } catch (err) {
-        console.error(`⚠️ Failed to write creation log for UPC ${upcId}:`, err);
+        console.error(`⚠️ [CASE 1] Failed to write creation log for UPC ${upcId}:`, err);
+        // Non-fatal — continue to inventory update
       }
 
       if (after.putAway === "inbound") {
-        console.log(`UPC ${upcId} created with 'inbound' putAway - incrementing autoAddition`);
-        await db.runTransaction(async (transaction) => {
+        console.log(`UPC ${upcId} created with 'inbound' putAway - incrementing inventory`);
+
+        await runTransactionWithRetry(`CASE1:${upcId}`, async (transaction) => {
           const productRef = db.doc(`users/${businessId}/products/${after.productId}`);
           const productDoc = await transaction.get(productRef);
 
@@ -115,6 +147,7 @@ export const onUpcWritten = onDocumentWritten(
             console.warn(`⚠️ Product ${after.productId} not found for UPC ${upcId}`);
             return;
           }
+
           if (after.storeId?.length && after.orderId?.length) {
             transaction.update(productRef, {
               "inventory.autoAddition": FieldValue.increment(1),
@@ -126,6 +159,7 @@ export const onUpcWritten = onDocumentWritten(
           }
         });
       }
+
       return;
     }
 
@@ -137,9 +171,10 @@ export const onUpcWritten = onDocumentWritten(
         console.log(`🗑️ UPC ${upcId} deleted but not in the warehouse:`, before);
         return;
       }
+
       console.log(`🗑️ UPC ${upcId} deleted - decrementing placement quantity`);
 
-      await db.runTransaction(async (transaction) => {
+      await runTransactionWithRetry(`CASE2:${upcId}`, async (transaction) => {
         const placementRef = db.doc(`users/${businessId}/placements/${before.placementId}`);
         transaction.update(placementRef, {
           quantity: FieldValue.increment(-1),
@@ -153,7 +188,7 @@ export const onUpcWritten = onDocumentWritten(
     // CASE 3: UPC Updated
     // ============================================================
     if (before && after) {
-      // Log if any tracked field changed (before the putAway-specific check so we catch all field changes)
+      // Log independently — don't let it block or fail the inventory update
       if (hasTrackedFieldChanged(before, after)) {
         try {
           await writeUPCLog(
@@ -164,11 +199,11 @@ export const onUpcWritten = onDocumentWritten(
             getUPCSnapshot(after),
           );
         } catch (err) {
-          console.error(`⚠️ Failed to write update log for UPC ${upcId}:`, err);
+          console.error(`⚠️ [CASE 3] Failed to write update log for UPC ${upcId}:`, err);
+          // Non-fatal — continue
         }
       }
 
-      // Skip remaining logic if putAway hasn't changed
       if (before.putAway === after.putAway) {
         console.log(`⏭️ UPC ${upcId} - no putAway change, skipping`);
         return;
@@ -176,18 +211,17 @@ export const onUpcWritten = onDocumentWritten(
 
       console.log(`📦 UPC ${upcId} putAway changed: ${before.putAway} → ${after.putAway}`);
 
-      await db.runTransaction(async (transaction) => {
+      await runTransactionWithRetry(`CASE3:${upcId}`, async (transaction) => {
         // --------------------------------------------------------
         // Handle placement quantity changes
         // --------------------------------------------------------
         if (after.putAway === "none" && before.putAway !== "none") {
           const placementRef = db.doc(`users/${businessId}/placements/${after.placementId}`);
-
           const placementSnap = await transaction.get(placementRef);
 
           if (!placementSnap.exists) {
             console.log(
-              `🆕 The placement ${after.placementId} for this upc doesn't exists which means that it is definitely being put away from 'inbound' to 'none', Creating placement ${after.placementId}`,
+              `🆕 Placement ${after.placementId} doesn't exist — creating it (put-away from 'inbound' → 'none')`,
             );
 
             const newPlacement: Placement = {
@@ -214,19 +248,13 @@ export const onUpcWritten = onDocumentWritten(
             };
 
             transaction.set(placementRef, newPlacement);
-
-            console.log(`  ✓ Put-away handled for ${after.placementId}`);
+            console.log(`  ✓ Created placement ${after.placementId}`);
           } else {
-            console.log(
-              `🆕 The placement ${after.placementId} for this upc exists, incrementing the quantity`,
-            );
-
             transaction.update(placementRef, {
               quantity: FieldValue.increment(1),
               updatedAt: Timestamp.now(),
               updatedBy: after.updatedBy,
             });
-
             console.log(`  ✓ Incremented placement quantity for ${after.placementId}`);
           }
         }
@@ -242,7 +270,6 @@ export const onUpcWritten = onDocumentWritten(
         // --------------------------------------------------------
         // Handle inventory auto deduction/addition
         // --------------------------------------------------------
-
         if (after.putAway === null && before.putAway !== null) {
           if (!after.productId) {
             console.warn(`⚠️ UPC ${upcId} has no productId, skipping autoDeduction`);
@@ -260,7 +287,6 @@ export const onUpcWritten = onDocumentWritten(
           transaction.update(productRef, {
             "inventory.autoDeduction": FieldValue.increment(1),
           });
-
           console.log(`  ✅ Incremented autoDeduction for product ${after.productId}`);
         }
 
@@ -285,7 +311,6 @@ export const onUpcWritten = onDocumentWritten(
           transaction.update(productRef, {
             "inventory.autoAddition": FieldValue.increment(1),
           });
-
           console.log(`  ✅ Incremented autoAddition for product ${after.productId}`);
         }
       });

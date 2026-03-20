@@ -330,22 +330,21 @@ export async function calcStockMetric(
     totalNet += qty * cogs;
   }
 
-  // if (!isOpening && lostQty > 0) {
-  //   totalQty += lostQty;
-  //   const avgCogs = totalQty > 0 ? totalNet / (totalQty + lostQty) : 0;
-  //   totalNet += lostQty * avgCogs;
-  // }
+  // totalNet is COGS = taxable amount; apply tax forward (not reverse)
+  const totalTax = round2(totalNet * TAX_RATE);
+  const cgst = round2(totalTax / 2);
+  const sgst = round2(totalTax / 2);
+  const grossNet = round2(totalNet + totalTax);
 
-  const tax = reverseCalculateTax(totalNet, true);
   const sign = isOpening ? -1 : 1;
   return {
     type: isOpening ? "Opening Stock" : "Closing Stock",
     qty: sign * totalQty,
-    taxable: round2(sign * tax.taxable),
+    taxable: round2(sign * totalNet),   // COGS is the taxable base
     igst: 0,
-    cgst: round2(sign * tax.cgst),
-    sgst: round2(sign * tax.sgst),
-    net: round2(sign * totalNet),
+    cgst: round2(sign * cgst),
+    sgst: round2(sign * sgst),
+    net: round2(sign * grossNet),       // taxable + tax
   };
 }
 

@@ -1,13 +1,11 @@
 // Daily Tax Report Generation Function
 import { onSchedule } from "firebase-functions/v2/scheduler";
 import { db, storage } from "../../firebaseAdmin";
-import { ENQUEUE_FUNCTION_SECRET, REPORT_PHONE_NUMBER, TASKS_SECRET } from "../../config";
+import { ENQUEUE_FUNCTION_SECRET, TASKS_SECRET } from "../../config";
 import { createTask, sendTaxReportWhatsAppMessage } from "../../services";
 import { onRequest } from "firebase-functions/v2/https";
 import { generateTaxReport } from "./helpers";
 import { requireHeaderSecret } from "../../helpers";
-
-const SHARED_STORE_ID = "nfkjgp-sv.myshopify.com";
 
 /**
  * Scheduled function - runs daily at 12:00 AM
@@ -21,87 +19,87 @@ export const generateDailyTaxReport = onSchedule(
     timeoutSeconds: 540,
   },
   async () => {
-    console.log("🚀 Starting Daily Tax Report Generation...");
+    // console.log("🚀 Starting Daily Tax Report Generation...");
 
-    try {
-      // Get current date in IST
-      const istDateStr = new Date().toLocaleDateString("en-CA", {
-        timeZone: "Asia/Kolkata",
-      }); // Returns "2024-12-12" format
+    // try {
+    //   // Get current date in IST
+    //   const istDateStr = new Date().toLocaleDateString("en-CA", {
+    //     timeZone: "Asia/Kolkata",
+    //   }); // Returns "2024-12-12" format
 
-      // Parse and subtract a day
-      const todayIST = new Date(istDateStr + "T00:00:00+05:30");
-      const yesterday = new Date(todayIST);
-      yesterday.setDate(yesterday.getDate() - 1);
+    //   // Parse and subtract a day
+    //   const todayIST = new Date(istDateStr + "T00:00:00+05:30");
+    //   const yesterday = new Date(todayIST);
+    //   yesterday.setDate(yesterday.getDate() - 1);
 
-      // Generate report for single day (yesterday to yesterday)
-      const { workbook, salesRows, returnRows, statePivot, hsnPivot } = await generateTaxReport(
-        SHARED_STORE_ID,
-        yesterday,
-        yesterday,
-      );
+    //   // Generate report for single day (yesterday to yesterday)
+    //   const { workbook, salesRows, returnRows, statePivot, hsnPivot } = await generateTaxReport(
+    //     SHARED_STORE_ID,
+    //     yesterday,
+    //     yesterday,
+    //   );
 
-      // Upload to Firebase Storage
-      console.log("\n📊 Step 6: Uploading to Firebase Storage...");
-      const dateStr = yesterday.toLocaleDateString("en-GB").replace(/\//g, "-");
-      const timestamp = Date.now();
-      const fileName = `Tax_Report_${dateStr}_${timestamp}.xlsx`;
-      const filePath = `tax_reports/${SHARED_STORE_ID}/${fileName}`;
+    //   // Upload to Firebase Storage
+    //   console.log("\n📊 Step 6: Uploading to Firebase Storage...");
+    //   const dateStr = yesterday.toLocaleDateString("en-GB").replace(/\//g, "-");
+    //   const timestamp = Date.now();
+    //   const fileName = `Tax_Report_${dateStr}_${timestamp}.xlsx`;
+    //   const filePath = `tax_reports/${SHARED_STORE_ID}/${fileName}`;
 
-      const bucket = storage.bucket();
-      const file = bucket.file(filePath);
+    //   const bucket = storage.bucket();
+    //   const file = bucket.file(filePath);
 
-      const writeStream = file.createWriteStream({
-        metadata: {
-          contentType: "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-          metadata: {
-            generatedAt: new Date().toISOString(),
-            reportDate: yesterday.toISOString(),
-            salesCount: salesRows.length,
-            returnsCount: returnRows.length,
-          },
-        },
-      });
+    //   const writeStream = file.createWriteStream({
+    //     metadata: {
+    //       contentType: "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+    //       metadata: {
+    //         generatedAt: new Date().toISOString(),
+    //         reportDate: yesterday.toISOString(),
+    //         salesCount: salesRows.length,
+    //         returnsCount: returnRows.length,
+    //       },
+    //     },
+    //   });
 
-      await workbook.xlsx.write(writeStream);
+    //   await workbook.xlsx.write(writeStream);
 
-      await new Promise<void>((resolve, reject) => {
-        writeStream.on("finish", () => resolve());
-        writeStream.on("error", (error) => reject(error));
-      });
+    //   await new Promise<void>((resolve, reject) => {
+    //     writeStream.on("finish", () => resolve());
+    //     writeStream.on("error", (error) => reject(error));
+    //   });
 
-      await file.makePublic();
-      const downloadUrl = `${bucket.name}/${filePath}`;
+    //   await file.makePublic();
+    //   const downloadUrl = `${bucket.name}/${filePath}`;
 
-      console.log(`✅ File uploaded: ${downloadUrl}`);
+    //   console.log(`✅ File uploaded: ${downloadUrl}`);
 
-      // Send WhatsApp Message
-      console.log("\n📊 Step 7: Sending WhatsApp Message...");
-      const shopDoc = await db.collection("accounts").doc(SHARED_STORE_ID).get();
-      const shopData = shopDoc.data();
+    //   // Send WhatsApp Message
+    //   console.log("\n📊 Step 7: Sending WhatsApp Message...");
+    //   const shopDoc = await db.collection("accounts").doc(SHARED_STORE_ID).get();
+    //   const shopData = shopDoc.data();
 
-      if (shopData) {
-        await sendTaxReportWhatsAppMessage(
-          shopData,
-          yesterday.toDateString(),
-          yesterday.toDateString(),
-          downloadUrl,
-          REPORT_PHONE_NUMBER,
-        );
-        console.log(`✅ WhatsApp message sent to ${REPORT_PHONE_NUMBER}`);
-      }
+    //   if (shopData) {
+    //     await sendTaxReportWhatsAppMessage(
+    //       shopData,
+    //       yesterday.toDateString(),
+    //       yesterday.toDateString(),
+    //       downloadUrl,
+    //       REPORT_PHONE_NUMBER,
+    //     );
+    //     console.log(`✅ WhatsApp message sent to ${REPORT_PHONE_NUMBER}`);
+    //   }
 
-      console.log("\n✨ Daily Tax Report Generation Completed Successfully!");
-      console.log(`📊 Summary:`);
-      console.log(`   - Sales line items: ${salesRows.length}`);
-      console.log(`   - Return line items: ${returnRows.length}`);
-      console.log(`   - States covered: ${statePivot.length}`);
-      console.log(`   - HSN codes: ${hsnPivot.length}`);
-      console.log(`   - Download URL: ${downloadUrl}`);
-    } catch (error) {
-      console.error("❌ Error generating daily tax report:", error);
-      throw error;
-    }
+    //   console.log("\n✨ Daily Tax Report Generation Completed Successfully!");
+    //   console.log(`📊 Summary:`);
+    //   console.log(`   - Sales line items: ${salesRows.length}`);
+    //   console.log(`   - Return line items: ${returnRows.length}`);
+    //   console.log(`   - States covered: ${statePivot.length}`);
+    //   console.log(`   - HSN codes: ${hsnPivot.length}`);
+    //   console.log(`   - Download URL: ${downloadUrl}`);
+    // } catch (error) {
+    //   console.error("❌ Error generating daily tax report:", error);
+    //   throw error;
+    // }
   },
 );
 
@@ -183,7 +181,7 @@ export const generateCustomTaxReportPreliminary = onRequest(
         return;
       }
 
-      const phone = "9779752241";
+      const phone = businessDoc.data()?.primaryContact?.phone;
 
       // Validate all storeIds
       const invalidStoreId = resolvedStoreIds.find(
@@ -269,6 +267,7 @@ export const generateCustomTaxReportPreliminary = onRequest(
 
       const taskName = await createTask(
         {
+          businessId,
           phone,
           storeIds: resolvedStoreIds,
           startDate,
