@@ -69,7 +69,14 @@ export const grossProfitReport = onRequest(
         calcLostMetric(storeIds, formattedStartDate, formattedEndDate),
       ]);
 
-      const grossProfit = calcGrossProfit([sale, saleReturn, purchase, openingStock, closingStock, lost]);
+      const grossProfit = calcGrossProfit([
+        sale,
+        saleReturn,
+        purchase,
+        openingStock,
+        closingStock,
+        lost,
+      ]);
 
       const allRows: MetricRow[] = [
         sale,

@@ -65,27 +65,26 @@ export async function calcSaleMetric(
     let snapshot: { docs: QueryDocumentSnapshot[] };
 
     if (isReturn) {
-      const [rtoSnap, pendingRefundsSnap, cancellationSnap, cancelledSnap] =
-        await Promise.all([
-          baseQuery
-            .where("customStatus", "==", "RTO Closed")
-            .where("lastStatusUpdate", ">=", startTs)
-            .where("lastStatusUpdate", "<=", endTs)
-            .get(),
-          baseQuery
-            .where("pendingRefundsAt", ">=", startTs)
-            .where("pendingRefundsAt", "<=", endTs)
-            .get(),
-          baseQuery
-            .where("cancellationRequestedAt", ">=", startTs)
-            .where("cancellationRequestedAt", "<=", endTs)
-            .get(),
-          baseQuery
-            .where("customStatus", "==", "Cancelled")
-            .where("lastStatusUpdate", ">=", startTs)
-            .where("lastStatusUpdate", "<=", endTs)
-            .get(),
-        ]);
+      const [rtoSnap, pendingRefundsSnap, cancellationSnap, cancelledSnap] = await Promise.all([
+        baseQuery
+          .where("customStatus", "==", "RTO Closed")
+          .where("lastStatusUpdate", ">=", startTs)
+          .where("lastStatusUpdate", "<=", endTs)
+          .get(),
+        baseQuery
+          .where("pendingRefundsAt", ">=", startTs)
+          .where("pendingRefundsAt", "<=", endTs)
+          .get(),
+        baseQuery
+          .where("cancellationRequestedAt", ">=", startTs)
+          .where("cancellationRequestedAt", "<=", endTs)
+          .get(),
+        baseQuery
+          .where("customStatus", "==", "Cancelled")
+          .where("lastStatusUpdate", ">=", startTs)
+          .where("lastStatusUpdate", "<=", endTs)
+          .get(),
+      ]);
 
       const seenIds = new Set<string>();
       const mergedDocs: QueryDocumentSnapshot[] = [];
@@ -223,7 +222,7 @@ export async function calcLostMetric(
 
   return {
     type: `Lost (${totalItemQty})`,
-    qty: 0,          // shown as "–" in UI; doesn't affect gross profit qty
+    qty: 0, // shown as "–" in UI; doesn't affect gross profit qty
     taxable: round2(-totalTaxable),
     igst: round2(-totalIgst),
     cgst: round2(-totalCgst),
@@ -303,8 +302,7 @@ export async function calcStockMetric(
     const productId = data.productId as string;
     if (!productId) continue;
     const qty =
-      Number(data.stockLevel ?? 0) -
-      Number(data.exactDocState?.inventory?.blockedStock ?? 0);
+      Number(data.stockLevel ?? 0) - Number(data.exactDocState?.inventory?.blockedStock ?? 0);
     qtyByProduct.set(productId, (qtyByProduct.get(productId) ?? 0) + qty);
   }
 
@@ -340,11 +338,11 @@ export async function calcStockMetric(
   return {
     type: isOpening ? "Opening Stock" : "Closing Stock",
     qty: sign * totalQty,
-    taxable: round2(sign * totalNet),   // COGS is the taxable base
+    taxable: round2(sign * totalNet), // COGS is the taxable base
     igst: 0,
     cgst: round2(sign * cgst),
     sgst: round2(sign * sgst),
-    net: round2(sign * grossNet),       // taxable + tax
+    net: round2(sign * grossNet), // taxable + tax
   };
 }
 

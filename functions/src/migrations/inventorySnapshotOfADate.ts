@@ -15,7 +15,7 @@ interface SnapshotRow {
   stock: number;
   blockedStock: number | null;
   variantSku: string | null;
-  productName: string | null;  // ← add
+  productName: string | null; // ← add
   price: number | null;
   cogs: number | null;
 }
@@ -28,14 +28,14 @@ async function buildExcelBuffer(rows: SnapshotRow[], date: string): Promise<Buff
   const ws = workbook.addWorksheet("Closing Stock");
 
   ws.columns = [
-  { header: "Product SKU", key: "productSku", width: 22 },
-  { header: "Stock", key: "stock", width: 12 },
-  { header: "Blocked Stock", key: "blockedStock", width: 16 },
-  { header: "Product Name", key: "productName", width: 28 },  // ← add
-  { header: "Variant SKU", key: "variantSku", width: 22 },
-  { header: "Price", key: "price", width: 14 },
-  { header: "COGS", key: "cogs", width: 14 },
-];
+    { header: "Product SKU", key: "productSku", width: 22 },
+    { header: "Stock", key: "stock", width: 12 },
+    { header: "Blocked Stock", key: "blockedStock", width: 16 },
+    { header: "Product Name", key: "productName", width: 28 }, // ← add
+    { header: "Variant SKU", key: "variantSku", width: 22 },
+    { header: "Price", key: "price", width: 14 },
+    { header: "COGS", key: "cogs", width: 14 },
+  ];
 
   // Header styling
   const headerRow = ws.getRow(1);
@@ -151,12 +151,16 @@ export const inventorySnapshotOfADate = onRequest(
                   .doc(`accounts/${targetVariant.storeId}/products/${targetVariant.productId}`)
                   .get();
                 if (productDoc.exists) {
-                  const variants: { id: number; price: number }[] = productDoc.data()?.variants ?? [];
+                  const variants: { id: number; price: number }[] =
+                    productDoc.data()?.variants ?? [];
                   const matchedVariant = variants.find((v) => v.id === targetVariant.variantId);
                   return matchedVariant?.price ?? null;
                 }
               } catch (err) {
-                console.error(`Error fetching product for productId=${targetVariant.productId}:`, err);
+                console.error(
+                  `Error fetching product for productId=${targetVariant.productId}:`,
+                  err,
+                );
               }
               return null;
             })(),
@@ -165,8 +169,8 @@ export const inventorySnapshotOfADate = onRequest(
           ]);
 
           price = variantResult;
-          cogs = cogsDoc.exists ? (Number(cogsDoc.data()?.price) || null) : null;
-          const productName = cogsDoc.exists ? (String(cogsDoc.data()?.name ?? "") || null) : null;  // ← add
+          cogs = cogsDoc.exists ? Number(cogsDoc.data()?.price) || null : null;
+          const productName = cogsDoc.exists ? String(cogsDoc.data()?.name ?? "") || null : null; // ← add
 
           return {
             productSku: productId,

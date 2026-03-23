@@ -228,7 +228,10 @@ async function processSalesOrders(
     const order = orderDoc.data();
     const items = order.raw?.line_items || [];
     const itemsArr = Array.isArray(items) ? items : [];
-    const totalMRP = itemsArr.reduce((acc, item) => acc + Number(item.price ?? 0) * Number(item.quantity ?? 0), 0);
+    const totalMRP = itemsArr.reduce(
+      (acc, item) => acc + Number(item.price ?? 0) * Number(item.quantity ?? 0),
+      0,
+    );
 
     for (const item of items) {
       try {
@@ -368,10 +371,7 @@ async function processSalesReturnOrders(
       .where("lastStatusUpdate", ">=", startTs)
       .where("lastStatusUpdate", "<=", endTs)
       .get(),
-    baseQuery
-      .where("pendingRefundsAt", ">=", startTs)
-      .where("pendingRefundsAt", "<=", endTs)
-      .get(),
+    baseQuery.where("pendingRefundsAt", ">=", startTs).where("pendingRefundsAt", "<=", endTs).get(),
     baseQuery
       .where("cancellationRequestedAt", ">=", startTs)
       .where("cancellationRequestedAt", "<=", endTs)
@@ -416,9 +416,7 @@ async function processSalesReturnOrders(
     // Determine dateOfReturn:
     // pendingRefundsAt > cancellationRequestedAt > lastStatusUpdate
     const dateOfReturn =
-      order.cancellationRequestedAt ??
-      order.pendingRefundsAt ??
-      order.lastStatusUpdate;
+      order.cancellationRequestedAt ?? order.pendingRefundsAt ?? order.lastStatusUpdate;
 
     const items = order.raw?.line_items || [];
     const itemsArr = Array.isArray(items) ? items : [];

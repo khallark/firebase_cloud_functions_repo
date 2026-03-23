@@ -20,35 +20,29 @@ export const generateDailyTaxReport = onSchedule(
   },
   async () => {
     // console.log("🚀 Starting Daily Tax Report Generation...");
-
     // try {
     //   // Get current date in IST
     //   const istDateStr = new Date().toLocaleDateString("en-CA", {
     //     timeZone: "Asia/Kolkata",
     //   }); // Returns "2024-12-12" format
-
     //   // Parse and subtract a day
     //   const todayIST = new Date(istDateStr + "T00:00:00+05:30");
     //   const yesterday = new Date(todayIST);
     //   yesterday.setDate(yesterday.getDate() - 1);
-
     //   // Generate report for single day (yesterday to yesterday)
     //   const { workbook, salesRows, returnRows, statePivot, hsnPivot } = await generateTaxReport(
     //     SHARED_STORE_ID,
     //     yesterday,
     //     yesterday,
     //   );
-
     //   // Upload to Firebase Storage
     //   console.log("\n📊 Step 6: Uploading to Firebase Storage...");
     //   const dateStr = yesterday.toLocaleDateString("en-GB").replace(/\//g, "-");
     //   const timestamp = Date.now();
     //   const fileName = `Tax_Report_${dateStr}_${timestamp}.xlsx`;
     //   const filePath = `tax_reports/${SHARED_STORE_ID}/${fileName}`;
-
     //   const bucket = storage.bucket();
     //   const file = bucket.file(filePath);
-
     //   const writeStream = file.createWriteStream({
     //     metadata: {
     //       contentType: "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
@@ -60,24 +54,18 @@ export const generateDailyTaxReport = onSchedule(
     //       },
     //     },
     //   });
-
     //   await workbook.xlsx.write(writeStream);
-
     //   await new Promise<void>((resolve, reject) => {
     //     writeStream.on("finish", () => resolve());
     //     writeStream.on("error", (error) => reject(error));
     //   });
-
     //   await file.makePublic();
     //   const downloadUrl = `${bucket.name}/${filePath}`;
-
     //   console.log(`✅ File uploaded: ${downloadUrl}`);
-
     //   // Send WhatsApp Message
     //   console.log("\n📊 Step 7: Sending WhatsApp Message...");
     //   const shopDoc = await db.collection("accounts").doc(SHARED_STORE_ID).get();
     //   const shopData = shopDoc.data();
-
     //   if (shopData) {
     //     await sendTaxReportWhatsAppMessage(
     //       shopData,
@@ -88,7 +76,6 @@ export const generateDailyTaxReport = onSchedule(
     //     );
     //     console.log(`✅ WhatsApp message sent to ${REPORT_PHONE_NUMBER}`);
     //   }
-
     //   console.log("\n✨ Daily Tax Report Generation Completed Successfully!");
     //   console.log(`📊 Summary:`);
     //   console.log(`   - Sales line items: ${salesRows.length}`);

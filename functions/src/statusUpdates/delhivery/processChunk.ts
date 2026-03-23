@@ -128,6 +128,47 @@ export async function processDelhiveryOrderChunk(
   };
 }
 
+// NDR-eligible NSL status codes for RE-ATTEMPT action
+const NDR_REATTEMPT_CODES = new Set([
+  "EOD-74",
+  "EOD-15",
+  "EOD-104",
+  "EOD-43",
+  "EOD-86",
+  "EOD-11",
+  "EOD-69",
+  "EOD-6",
+]);
+
+async function triggerNDRReAttempt(waybill: string, apiKey: string): Promise<void> {
+  try {
+    const response = await fetch("https://track.delhivery.com/api/p/update", {
+      method: "POST",
+      headers: {
+        Authorization: `Token ${apiKey}`,
+        Accept: "application/json",
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({
+        data: [{ waybill, act: "RE-ATTEMPT" }],
+      }),
+    });
+
+    if (!response.ok) {
+      console.error(`NDR RE-ATTEMPT failed for AWB ${waybill}: HTTP ${response.status}`);
+      return;
+    }
+
+    const result = (await response.json()) as any;
+    // NDR API is async — it returns a UPL ID for tracking the action status
+    const uplId = result?.upl_id ?? result?.UPL_ID ?? null;
+    console.log(`NDR RE-ATTEMPT triggered for AWB ${waybill}. UPL ID: ${uplId ?? "N/A"}`);
+  } catch (error) {
+    // Non-fatal — log and move on; tracking update should still proceed
+    console.error(`NDR RE-ATTEMPT error for AWB ${waybill}:`, error);
+  }
+}
+
 async function fetchAndProcessDelhiveryBatch(
   orders: any[],
   apiKey: string,
@@ -158,6 +199,33 @@ async function fetchAndProcessDelhiveryBatch(
 
     const trackingData = (await response.json()) as any;
     const shipments = trackingData.ShipmentData || [];
+
+    // Trigger NDR RE-ATTEMPT for eligible shipments before preparing updates
+    try {
+      const ndrPromises: Promise<void>[] = [];
+
+      for (const shipmentWrapper of shipments) {
+        const shipment = shipmentWrapper.Shipment;
+        if (!shipment?.ReferenceNo || !shipment.Status) continue;
+
+        const statusCode = shipment.Status.StatusCode ?? shipment.StatusCode ?? null;
+        if (statusCode && NDR_REATTEMPT_CODES.has(statusCode)) {
+          const awb = shipment.Waybill ?? shipment.AWB ?? null;
+          if (awb) {
+            console.log(
+              `NDR-eligible status code "${statusCode}" detected for AWB ${awb} (Order: ${shipment.ReferenceNo})`,
+            );
+            ndrPromises.push(triggerNDRReAttempt(awb, apiKey));
+          }
+        }
+      }
+
+      if (ndrPromises.length > 0) {
+        await Promise.allSettled(ndrPromises);
+      }
+    } catch (ndrError) {
+      console.error("NDR block failed unexpectedly, skipping:", ndrError);
+    }
 
     return prepareDelhiveryOrderUpdates(orders, shipments);
   } catch (error: any) {

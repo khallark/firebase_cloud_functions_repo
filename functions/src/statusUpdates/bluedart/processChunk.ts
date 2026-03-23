@@ -232,16 +232,45 @@ function prepareBlueDartOrderUpdates(orders: any[], shipments: any[]): OrderUpda
     if (order.awb_reverse) ordersByAwb.set(order.awb_reverse, order);
   }
 
+  // First pass — for every "RT" shipment, map its NewWaybillNo → original order
+  // so that when we encounter the sibling entry we know which order it belongs to
+  const ordersByNewWaybill = new Map<string, any>();
+  for (const shipment of shipments) {
+    if (shipment.StatusType === "RT" && shipment.NewWaybillNo) {
+      const order = ordersByAwb.get(shipment.WaybillNo);
+      if (order) {
+        ordersByNewWaybill.set(shipment.NewWaybillNo, order);
+      }
+    }
+  }
+
+  // Second pass — derive updates
   for (const shipment of shipments) {
     const waybillNo = shipment.WaybillNo;
     if (!waybillNo) continue;
 
-    const order = ordersByAwb.get(waybillNo);
+    // Skip the original RT entry — the sibling NewWaybillNo entry carries the real status
+    if (shipment.StatusType === "RT") continue;
+
+    // Determine if this is an RTO sibling or a regular forward shipment
+    const isRtoShipment = ordersByNewWaybill.has(waybillNo);
+    const order = isRtoShipment ? ordersByNewWaybill.get(waybillNo) : ordersByAwb.get(waybillNo);
+
     if (!order) continue;
 
-    const rawStatusType = shipment.StatusType;
+    let newStatus: string | null = null;
 
-    const newStatus = determineNewBlueDartStatus(rawStatusType, order);
+    if (isRtoShipment) {
+      // RTO sibling: only DL means returned to shipper, everything else is in transit
+      if (shipment.StatusType === "DL") {
+        newStatus = "RTO Delivered";
+      } else {
+        newStatus = "RTO In Transit";
+      }
+    } else {
+      newStatus = determineNewBlueDartStatus(shipment.StatusType, order);
+    }
+
     if (!newStatus) continue;
     if (newStatus === order.customStatus) continue;
 

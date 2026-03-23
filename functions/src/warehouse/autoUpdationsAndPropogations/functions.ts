@@ -286,6 +286,7 @@ export const onUpcWritten = onDocumentWritten(
 
           transaction.update(productRef, {
             "inventory.autoDeduction": FieldValue.increment(1),
+            "inventory.blockedStock": FieldValue.increment(-1),
           });
           console.log(`  ✅ Incremented autoDeduction for product ${after.productId}`);
         }

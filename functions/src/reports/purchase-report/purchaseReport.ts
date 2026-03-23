@@ -34,7 +34,11 @@ function calcTax(taxable: number): { sgst: number; cgst: number; igst: number; t
   };
 }
 
-async function buildExcelBuffer(rows: PurchaseReportRow[], startDate: string, endDate: string): Promise<Buffer> {
+async function buildExcelBuffer(
+  rows: PurchaseReportRow[],
+  startDate: string,
+  endDate: string,
+): Promise<Buffer> {
   const workbook = new ExcelJS.Workbook();
   workbook.creator = "Majime";
   workbook.created = new Date();
@@ -115,7 +119,12 @@ async function buildExcelBuffer(rows: PurchaseReportRow[], startDate: string, en
   return Buffer.from(await workbook.xlsx.writeBuffer());
 }
 
-async function uploadToStorage(buffer: Buffer, businessId: string, startDate: string, endDate: string): Promise<string> {
+async function uploadToStorage(
+  buffer: Buffer,
+  businessId: string,
+  startDate: string,
+  endDate: string,
+): Promise<string> {
   const uniqueId = randomUUID();
   const filename = `purchase_report_${startDate}_to_${endDate}_${uniqueId}.xlsx`;
   const storagePath = `purchaseReports/${businessId}/${filename}`;

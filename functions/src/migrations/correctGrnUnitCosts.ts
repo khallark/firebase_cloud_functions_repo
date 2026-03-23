@@ -32,9 +32,7 @@ export const correctGrnUnitCosts = onRequest(
     // ── 3. Fetch all product prices in parallel ──────────────────────────
     const skuList = Array.from(allSkus);
     const productDocs = await Promise.all(
-      skuList.map((sku) =>
-        db.doc(`users/${businessId}/products/${sku}`).get()
-      )
+      skuList.map((sku) => db.doc(`users/${businessId}/products/${sku}`).get()),
     );
 
     const pricesBySku = new Map<string, number>();
@@ -86,11 +84,14 @@ export const correctGrnUnitCosts = onRequest(
       }
 
       const newTotalReceivedValue =
-        Math.round(
-          updatedItems.reduce((sum, item) => sum + Number(item.totalCost ?? 0), 0) * 100
-        ) / 100;
+        Math.round(updatedItems.reduce((sum, item) => sum + Number(item.totalCost ?? 0), 0) * 100) /
+        100;
 
-      updates.push({ ref: doc.ref, items: updatedItems, totalReceivedValue: newTotalReceivedValue });
+      updates.push({
+        ref: doc.ref,
+        items: updatedItems,
+        totalReceivedValue: newTotalReceivedValue,
+      });
       updatedGrnCount++;
     }
 
@@ -118,5 +119,5 @@ export const correctGrnUnitCosts = onRequest(
       skippedGrns: skippedGrnCount,
       missingPriceSkus: Array.from(missingPriceSkus),
     });
-  }
+  },
 );
