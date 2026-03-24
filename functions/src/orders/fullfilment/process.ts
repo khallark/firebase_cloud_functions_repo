@@ -111,6 +111,12 @@ export const processFulfillmentTask = onRequest(
 
         const orderData = order.data() as any;
 
+        if (!orderData.lastPackedAt) {
+          await markJobFailed("order_not_packed", `Business not authorized to process the order ${orderData.name} because its not packed`);
+          res.status(403).json({ error: "order_is_not_packed_yet" });
+          return;
+        }
+
         // Check if order is already fulfilled
         const fulfillmentStatus =
           orderData?.raw?.fulfillment_status || orderData?.fulfillmentStatus;
