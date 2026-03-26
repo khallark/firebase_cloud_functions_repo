@@ -366,10 +366,6 @@ export function updateLocationStatsInTransaction(
   transaction.update(db.doc(`users/${businessId}/warehouses/${placement.warehouseId}`), {
     "stats.totalProducts": increment(quantityDelta),
   });
-
-  transaction.update(db.doc(`users/${businessId}/products/${placement.productId}`), {
-    inShelfQuantity: increment(quantityDelta),
-  });
 }
 
 /**

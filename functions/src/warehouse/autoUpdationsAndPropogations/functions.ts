@@ -100,7 +100,7 @@ async function runTransactionWithRetry<T>(
       const delayMs = Math.min(150 * Math.pow(2, attempt) + jitter, 15_000);
       console.warn(
         `⚠️ [${label}] Transaction outer attempt ${attempt}/${outerAttempts} failed. ` +
-          `Retrying in ${Math.round(delayMs)}ms…`,
+        `Retrying in ${Math.round(delayMs)}ms…`,
         err,
       );
       await new Promise((res) => setTimeout(res, delayMs));
@@ -218,6 +218,11 @@ export const onUpcWritten = onDocumentWritten(
         if (after.putAway === "none" && before.putAway !== "none") {
           const placementRef = db.doc(`users/${businessId}/placements/${after.placementId}`);
           const placementSnap = await transaction.get(placementRef);
+          const productRef = db.doc(`users/${businessId}/products/${after.productId}`);
+
+          transaction.update(productRef, {
+            inShelfQuantity: FieldValue.increment(1),
+          });
 
           if (!placementSnap.exists) {
             console.log(
@@ -261,6 +266,10 @@ export const onUpcWritten = onDocumentWritten(
 
         if (after.putAway === "outbound" && before.putAway === "none") {
           const placementRef = db.doc(`users/${businessId}/placements/${before.placementId}`);
+          const productRef = db.doc(`users/${businessId}/products/${after.productId}`);
+          transaction.update(productRef, {
+            inShelfQuantity: FieldValue.increment(-1),
+          });
           transaction.update(placementRef, {
             quantity: FieldValue.increment(-1),
           });
@@ -486,7 +495,7 @@ export const onShelfWritten = onDocumentWritten(
         if (!placements.empty) {
           console.warn(
             `Shelf ${shelfId} soft deleted with products on it. ` +
-              `This should be blocked at API level.`,
+            `This should be blocked at API level.`,
           );
         }
 
@@ -699,7 +708,7 @@ export const onRackWritten = onDocumentWritten(
         if (!shelves.empty) {
           console.warn(
             `Rack ${rackId} soft deleted with shelves on it. ` +
-              `This should be blocked at API level.`,
+            `This should be blocked at API level.`,
           );
         }
 
@@ -891,7 +900,7 @@ export const onZoneWritten = onDocumentWritten(
         if (!racks.empty) {
           console.warn(
             `Zone ${zoneId} soft deleted with racks in it. ` +
-              `This should be blocked at API level.`,
+            `This should be blocked at API level.`,
           );
         }
 
@@ -1021,7 +1030,7 @@ export const onWarehouseWritten = onDocumentWritten(
         if (!zones.empty) {
           console.warn(
             `Warehouse ${warehouseId} soft deleted with zones in it. ` +
-              `This should be blocked at API level.`,
+            `This should be blocked at API level.`,
           );
         }
       }
