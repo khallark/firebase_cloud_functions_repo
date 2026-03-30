@@ -52,7 +52,7 @@ export const fixInShelfQuantity = onRequest(
 
       // Commit any remaining updates
       if (batchCount > 0) {
-        await batch.commit();
+        if(!dryRun) await batch.commit();
       }
 
       res.status(200).json({
