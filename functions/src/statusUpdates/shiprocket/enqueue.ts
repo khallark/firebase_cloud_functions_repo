@@ -7,7 +7,7 @@ import { db } from "../../firebaseAdmin";
 
 export const enqueueShiprocketStatusUpdateTasksScheduled = onSchedule(
   {
-    schedule: "0 0,4,8,12,16,20 * * *", // 6 times daily
+    schedule: "0 */2 * * *", // every 2 hours
     timeZone: "Asia/Kolkata",
     memory: "512MiB",
     timeoutSeconds: 540,

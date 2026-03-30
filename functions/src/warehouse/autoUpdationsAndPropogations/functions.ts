@@ -213,26 +213,40 @@ export const onUpcWritten = onDocumentWritten(
 
       await runTransactionWithRetry(`CASE3:${upcId}`, async (transaction) => {
         // --------------------------------------------------------
-        // Handle placement quantity changes
+        // ALL READS FIRST — Firestore requires all reads before any writes
         // --------------------------------------------------------
+        const productRef = db.doc(`users/${businessId}/products/${after.productId}`);
+
+        // For placement, the relevant ref depends on the transition:
+        // inbound → none  : uses after.placementId
+        // none → outbound : uses before.placementId
+        const relevantPlacementId =
+          after.putAway === "none"
+            ? after.placementId
+            : before.placementId;
+
+        const placementRef = db.doc(`users/${businessId}/placements/${relevantPlacementId}`);
+
+        const [productDoc, placementSnap] = await Promise.all([
+          transaction.get(productRef),
+          transaction.get(placementRef),
+        ]);
+
+        console.log(`🔍 Product ID: "${after.productId}" | exists: ${productDoc.exists} | inShelfQuantity: ${productDoc.data()?.inShelfQuantity}`);
+
+        // --------------------------------------------------------
+        // ALL WRITES AFTER
+        // --------------------------------------------------------
+
+        // inbound → none : put away into shelf
         if (after.putAway === "none" && before.putAway !== "none") {
-          const productRef = db.doc(`users/${businessId}/products/${after.productId}`);
-          const productSnap = await transaction.get(productRef);
-
-          console.log(`🔍 Product exists: ${productSnap.exists}`);
-          console.log(`🔍 Current inShelfQuantity: ${productSnap.data()?.inShelfQuantity}`);
-          console.log(`🔍 Product ID: "${after.productId}"`);
-          console.log(`🔍 Business ID: "${businessId}"`);
-
           transaction.update(productRef, {
             inShelfQuantity: FieldValue.increment(1),
           });
-          const placementRef = db.doc(`users/${businessId}/placements/${after.placementId}`);
-          const placementSnap = await transaction.get(placementRef);
 
           if (!placementSnap.exists) {
             console.log(
-              `🆕 Placement ${after.placementId} doesn't exist — creating it (put-away from 'inbound' → 'none')`,
+              `🆕 Placement ${relevantPlacementId} doesn't exist — creating it (put-away from 'inbound' → 'none')`,
             );
 
             const newPlacement: Placement = {
@@ -259,47 +273,34 @@ export const onUpcWritten = onDocumentWritten(
             };
 
             transaction.set(placementRef, newPlacement);
-            console.log(`  ✓ Created placement ${after.placementId}`);
+            console.log(`  ✓ Created placement ${relevantPlacementId}`);
           } else {
             transaction.update(placementRef, {
               quantity: FieldValue.increment(1),
               updatedAt: Timestamp.now(),
               updatedBy: after.updatedBy,
             });
-            console.log(`  ✓ Incremented placement quantity for ${after.placementId}`);
+            console.log(`  ✓ Incremented placement quantity for ${relevantPlacementId}`);
           }
         }
 
+        // none → outbound : dispatched from shelf
         if (after.putAway === "outbound" && before.putAway === "none") {
-          const productRef = db.doc(`users/${businessId}/products/${after.productId}`);
-          const productSnap = await transaction.get(productRef);
-
-          console.log(`🔍 Product exists: ${productSnap.exists}`);
-          console.log(`🔍 Current inShelfQuantity: ${productSnap.data()?.inShelfQuantity}`);
-          console.log(`🔍 Product ID: "${after.productId}"`);
-          console.log(`🔍 Business ID: "${businessId}"`);
-
           transaction.update(productRef, {
             inShelfQuantity: FieldValue.increment(-1),
           });
-          const placementRef = db.doc(`users/${businessId}/placements/${before.placementId}`);
           transaction.update(placementRef, {
             quantity: FieldValue.increment(-1),
           });
-          console.log(`  ✓ Decremented placement quantity for ${before.placementId}`);
+          console.log(`  ✓ Decremented placement quantity for ${relevantPlacementId}`);
         }
 
-        // --------------------------------------------------------
-        // Handle inventory auto deduction/addition
-        // --------------------------------------------------------
+        // * → null : auto deduction (dispatched/sold)
         if (after.putAway === null && before.putAway !== null) {
           if (!after.productId) {
             console.warn(`⚠️ UPC ${upcId} has no productId, skipping autoDeduction`);
             return;
           }
-
-          const productRef = db.doc(`users/${businessId}/products/${after.productId}`);
-          const productDoc = await transaction.get(productRef);
 
           if (!productDoc.exists) {
             console.warn(`⚠️ Product ${after.productId} not found for UPC ${upcId}`);
@@ -313,6 +314,7 @@ export const onUpcWritten = onDocumentWritten(
           console.log(`  ✅ Incremented autoDeduction for product ${after.productId}`);
         }
 
+        // * → inbound : auto addition (return/re-inward)
         if (after.putAway === "inbound" && before.putAway !== "inbound") {
           if (before.putAway === "outbound" || before.putAway === "none") {
             return;
@@ -322,9 +324,6 @@ export const onUpcWritten = onDocumentWritten(
             console.warn(`⚠️ UPC ${upcId} has no productId, skipping autoAddition`);
             return;
           }
-
-          const productRef = db.doc(`users/${businessId}/products/${after.productId}`);
-          const productDoc = await transaction.get(productRef);
 
           if (!productDoc.exists) {
             console.warn(`⚠️ Product ${after.productId} not found for UPC ${upcId}`);
