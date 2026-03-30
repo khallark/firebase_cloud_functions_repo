@@ -216,13 +216,19 @@ export const onUpcWritten = onDocumentWritten(
         // Handle placement quantity changes
         // --------------------------------------------------------
         if (after.putAway === "none" && before.putAway !== "none") {
-          const placementRef = db.doc(`users/${businessId}/placements/${after.placementId}`);
-          const placementSnap = await transaction.get(placementRef);
           const productRef = db.doc(`users/${businessId}/products/${after.productId}`);
+          const productSnap = await transaction.get(productRef);
+
+          console.log(`🔍 Product exists: ${productSnap.exists}`);
+          console.log(`🔍 Current inShelfQuantity: ${productSnap.data()?.inShelfQuantity}`);
+          console.log(`🔍 Product ID: "${after.productId}"`);
+          console.log(`🔍 Business ID: "${businessId}"`);
 
           transaction.update(productRef, {
             inShelfQuantity: FieldValue.increment(1),
           });
+          const placementRef = db.doc(`users/${businessId}/placements/${after.placementId}`);
+          const placementSnap = await transaction.get(placementRef);
 
           if (!placementSnap.exists) {
             console.log(
@@ -265,11 +271,18 @@ export const onUpcWritten = onDocumentWritten(
         }
 
         if (after.putAway === "outbound" && before.putAway === "none") {
-          const placementRef = db.doc(`users/${businessId}/placements/${before.placementId}`);
           const productRef = db.doc(`users/${businessId}/products/${after.productId}`);
+          const productSnap = await transaction.get(productRef);
+
+          console.log(`🔍 Product exists: ${productSnap.exists}`);
+          console.log(`🔍 Current inShelfQuantity: ${productSnap.data()?.inShelfQuantity}`);
+          console.log(`🔍 Product ID: "${after.productId}"`);
+          console.log(`🔍 Business ID: "${businessId}"`);
+
           transaction.update(productRef, {
             inShelfQuantity: FieldValue.increment(-1),
           });
+          const placementRef = db.doc(`users/${businessId}/placements/${before.placementId}`);
           transaction.update(placementRef, {
             quantity: FieldValue.increment(-1),
           });
