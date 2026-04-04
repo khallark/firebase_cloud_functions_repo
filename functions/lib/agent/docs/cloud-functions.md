@@ -370,13 +370,13 @@ Frontend consumption: `onSnapshot` on `users/{businessId}.grossProfitData`.
 Calculates seven metric rows in parallel:
 1. **Sale**: all orders in date range by `createdAt`. Excludes ENDORA/STYLE 05 single-vendor orders.
 2. **Sale Return**: RTO Closed (by `lastStatusUpdate`), Pending Refunds (by `pendingRefundsAt`), Cancellation Requested (by `cancellationRequestedAt`), Cancelled (by `lastStatusUpdate` if `cancellationRequestedAt` absent).
-3. **Purchase**: GRNs by `createdAt` date range. Uses `totalReceivedValue` from GRN doc.
+3. **Purchase**: GRNs by `createdAt` date range. Iterates each GRN's `items[]` array. For each item, `taxable = item.unitCost × item.receivedQty` (unit cost is ex-tax). Tax rate is fetched per SKU from `users/{businessId}/products/{sku}.taxRate` via a single `db.getAll()` batch call across all unique SKUs in the result set. Tax is applied **forward** (`taxable × taxRate / 100`), split equally into CGST + SGST (all purchases assumed intra-state Punjab — no IGST). `net = taxable + cgst + sgst`.
 4. **Opening Stock**: `inventory_snapshots` for `startDate - 1 day`. Fetches product `price` (COGS) per product.
 5. **Closing Stock**: `inventory_snapshots` for `endDate`.
 6. **Lost**: orders with `customStatus == "Lost"` by `lastStatusUpdate`.
 7. **Gross Profit**: sum of all above (signs already applied — Sale Return, Purchase, Opening Stock, Lost are negative).
 
-Tax calculation: reverse-calculates from `total_price` using 5% rate, determines IGST vs CGST/SGST by checking `shipping_address.province == "Punjab"`.
+Tax calculation (Sale / Sale Return / Lost rows): reverse-calculates from `total_price` (tax-inclusive) using 5% rate to extract taxable + IGST/CGST/SGST. IGST vs CGST+SGST determined by `shipping_address.province == "Punjab"`. Purchase row uses forward tax calculation (ex-tax unit cost × per-product tax rate), always CGST+SGST (Punjab).
 
 Writes to `users/{businessId}.grossProfitData.{loading, rows, startDate, endDate, error}`.
 

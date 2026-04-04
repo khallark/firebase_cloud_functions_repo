@@ -370,13 +370,13 @@ Frontend consumption: `onSnapshot` on `users/{businessId}.grossProfitData`.
 Calculates seven metric rows in parallel:
 1. **Sale**: all orders in date range by `createdAt`. Excludes ENDORA/STYLE 05 single-vendor orders.
 2. **Sale Return**: RTO Closed (by `lastStatusUpdate`), Pending Refunds (by `pendingRefundsAt`), Cancellation Requested (by `cancellationRequestedAt`), Cancelled (by `lastStatusUpdate` if `cancellationRequestedAt` absent).
-3. **Purchase**: GRNs by `createdAt` date range. Uses `totalReceivedValue` from GRN doc.
+3. **Purchase**: GRNs by `createdAt` date range. Iterates each GRN's `items[]` array. For each item, `taxable = item.unitCost × item.receivedQty` (unit cost is ex-tax). Tax rate is fetched per SKU from `users/{businessId}/products/{sku}.taxRate` via a single `db.getAll()` batch call across all unique SKUs in the result set. Tax is applied **forward** (`taxable × taxRate / 100`), split equally into CGST + SGST (all purchases assumed intra-state Punjab — no IGST). `net = taxable + cgst + sgst`.
 4. **Opening Stock**: `inventory_snapshots` for `startDate - 1 day`. Fetches product `price` (COGS) per product.
 5. **Closing Stock**: `inventory_snapshots` for `endDate`.
 6. **Lost**: orders with `customStatus == "Lost"` by `lastStatusUpdate`.
 7. **Gross Profit**: sum of all above (signs already applied — Sale Return, Purchase, Opening Stock, Lost are negative).
 
-Tax calculation: reverse-calculates from `total_price` using 5% rate, determines IGST vs CGST/SGST by checking `shipping_address.province == "Punjab"`.
+Tax calculation (Sale / Sale Return / Lost rows): reverse-calculates from `total_price` (tax-inclusive) using 5% rate to extract taxable + IGST/CGST/SGST. IGST vs CGST+SGST determined by `shipping_address.province == "Punjab"`. Purchase row uses forward tax calculation (ex-tax unit cost × per-product tax rate), always CGST+SGST (Punjab).
 
 Writes to `users/{businessId}.grossProfitData.{loading, rows, startDate, endDate, error}`.
 
@@ -403,7 +403,7 @@ Creates a tracking doc in `users/{businessId}/tax_reports/{docId}`. Enqueues a C
 **`generateCustomTaxReport`** [onRequest, Cloud Task worker, authenticated with TASKS_SECRET]:
 Generates a 4-sheet Excel workbook:
 1. **Sales Report**: one row per line item, per order created in range. Columns: Bill No., Date, Customer, State, Courier, Payment Gateway, Item Name, Qty, AWB, MRP, Discount, Shipping, Sale Price, HSN, Tax Rate, Taxable, IGST, SGST, CGST, Vendor, State/Courier/Gateway Amount Due.
-2. **Sales Return Report**: same but for return events (RTO Closed, Pending Refunds, Cancellation Requested, Cancelled).
+2. **Sales Return Report**: same but for return events (RTO Closed, Pending Refunds, Cancellation Requested, Cancelled). Columns: same structure as Sales Report plus a **QC Status** column at the end (col 23), sourced from `raw.line_items[].qc_status`. This field is populated by the QC test flow on DTO In Transit / DTO Delivered orders. Empty string for RTO Closed and Cancelled orders that never went through QC.
 3. **State Wise Tax Report**: pivot of gross sales + returns by state with net columns.
 4. **HSN Wise Tax Report**: pivot by HSN code.
 
