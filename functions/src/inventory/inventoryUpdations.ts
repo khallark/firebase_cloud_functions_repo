@@ -153,7 +153,7 @@ async function setInventory(
 export const onProductWritten = onDocumentWritten(
   {
     document: "users/{businessId}/products/{productId}",
-    memory: "1GiB",
+    memory: "512MiB",
     timeoutSeconds: 540,
     maxInstances: 10,
   },
@@ -322,6 +322,182 @@ export const onProductWritten = onDocumentWritten(
                 variantId: mappedVariantData.variantId,
                 error: err,
               });
+            }
+          }
+        }
+      }
+
+      // ============================================================
+      // SCENARIO: Variant mapping removed
+      // Subtract blocked stock for the removed variant
+      // ============================================================
+      if (beforeMappedVariants.length - afterMappedVariants.length === 1) {
+        console.log(`🗑️ Variant mapping removed for product ${productId}`);
+
+        // Find removed mapping
+        const removedMapping = beforeMappedVariants.find(
+          (beforeVar: any) =>
+            !afterMappedVariants.some(
+              (afterVar: any) =>
+                afterVar.variantId === beforeVar.variantId &&
+                afterVar.storeId === beforeVar.storeId,
+            ),
+        );
+
+        if (!removedMapping) {
+          console.warn("⚠️ Could not determine removed mapping");
+        } else {
+          const businessDoc = await db.doc(`users/${businessId}`).get();
+
+          if (!businessDoc.exists) {
+            console.error(`Business ${businessId} not found`);
+          } else {
+            const businessData = businessDoc.data();
+
+            if (businessData?.vendorName) {
+              const storeId = removedMapping.storeId;
+              const isSharedStore = SHARED_STORE_IDS.includes(storeId);
+
+              let ordersQuery = db
+                .collection("accounts")
+                .doc(storeId)
+                .collection("orders")
+                .where("customStatus", "in", ["New", "Confirmed", "Ready To Dispatch"]);
+
+              const isOWR = businessData.vendorName === "OWR";
+
+              // Apply vendor filtering for shared stores
+              if (isSharedStore) {
+                if (isOWR) {
+                  ordersQuery = ordersQuery.where("vendors", "array-contains-any", [
+                    "OWR",
+                    "BBB",
+                    "Ghamand",
+                  ]);
+                } else {
+                  ordersQuery = ordersQuery.where(
+                    "vendors",
+                    "array-contains",
+                    businessData.vendorName,
+                  );
+                }
+              }
+
+              const ordersSnapshot = await ordersQuery.get();
+
+              // Calculate blocked stock for removed variant
+              let blockedItemsCount = 0;
+
+              for (const doc of ordersSnapshot.docs) {
+                if (!doc.exists) continue;
+
+                const orderData = doc.data();
+                const line_items: any[] = orderData?.raw?.line_items || [];
+
+                const totalQuantity = line_items
+                  .filter((item) => item.variant_id === removedMapping.variantId)
+                  .reduce((sum, item) => sum + (Number(item.quantity) || 0), 0);
+
+                blockedItemsCount += totalQuantity;
+              }
+
+              // 🔥 Subtract blocked stock safely
+              const productRef = db.doc(`users/${businessId}/products/${productId}`);
+
+              await db.runTransaction(async (tx) => {
+                const currentDoc = await tx.get(productRef);
+
+                if (!currentDoc.exists) {
+                  console.warn(`Product ${productId} no longer exists`);
+                  return;
+                }
+
+                const currentInventory = currentDoc.data()?.inventory;
+                const currentBlockedStock = currentInventory?.blockedStock || 0;
+
+                const newBlockedStock = Math.max(
+                  0,
+                  currentBlockedStock - blockedItemsCount, // prevent negative
+                );
+
+                tx.update(productRef, {
+                  inventory: {
+                    ...(currentInventory || {
+                      autoAddition: 0,
+                      autoDeduction: 0,
+                      blockedStock: 0,
+                      deduction: 0,
+                      inwardAddition: 0,
+                      openingStock: 0,
+                    }),
+                    blockedStock: newBlockedStock,
+                  },
+                });
+              });
+
+              console.log(
+                `✅ Updated blocked stock for ${productId} (store: ${storeId}): -${blockedItemsCount}`,
+              );
+
+              // 🆕 Sync updated stock to Shopify for remaining mappings
+              try {
+                const updatedProductSnap = await db
+                  .doc(`users/${businessId}/products/${productId}`)
+                  .get();
+
+                const updatedProduct = updatedProductSnap.data();
+                const updatedInv = getInventoryValues(updatedProduct?.inventory);
+
+                const updatedAvailableStock = calculateAvailableStock(
+                  calculatePhysicalStock(updatedInv),
+                  updatedInv.blockedStock,
+                );
+
+                for (const mapping of afterMappedVariants ?? []) {
+                  const { storeId, productId: mappedProductId, variantId } = mapping;
+
+                  if (storeId === SHARED_STORE_ID) continue;
+
+                  const storeSnap = await db.doc(`accounts/${storeId}`).get();
+                  const storeData = storeSnap.data();
+
+                  const accessToken = storeData?.accessToken;
+                  const locationId = storeData?.locationId;
+
+                  if (!accessToken || !locationId) continue;
+
+                  const productSnap = await db
+                    .doc(`accounts/${storeId}/products/${mappedProductId}`)
+                    .get();
+
+                  const product = productSnap.data();
+                  const variant = product?.variants?.find((v: any) => v.id === variantId);
+
+                  if (!variant?.inventoryItemId) continue;
+
+                  await ensureTracking(storeId, accessToken, String(variant.inventoryItemId));
+                  await sleep(150);
+
+                  await setInventory(
+                    storeId,
+                    accessToken,
+                    String(variant.inventoryItemId),
+                    locationId,
+                    updatedAvailableStock,
+                  );
+
+                  console.log(
+                    `🔄 Synced after removal: ${storeId}/${variantId} = ${updatedAvailableStock}`,
+                  );
+
+                  await sleep(200);
+                }
+              } catch (err) {
+                console.error("Failed to sync after mapping removal", {
+                  error: err,
+                  removedVariant: removedMapping.variantId,
+                });
+              }
             }
           }
         }
