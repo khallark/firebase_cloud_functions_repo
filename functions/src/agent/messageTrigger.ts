@@ -7,25 +7,31 @@
 //   1. Ignore if role !== 'user' (prevents re-triggering on own assistant writes)
 //   2. Set session status → 'generating'
 //   3. Fetch full conversation history from messages subcollection
-//   4. Send history to Gemini, get reply
+//   4. Agentic loop: call Gemini → if functionCall, execute tool and loop; if text, done
 //   5. Write assistant message doc to subcollection
 //   6. Set session status → 'idle'
 //   Catch: set session status → 'error'
+//
+// Tool call safety:
+//   - MAX_TOOL_ITERATIONS = 5: hard cap on loop iterations; breaks with fallback on breach
+//   - Tool execution is wrapped in try/catch; errors are returned as { error } in
+//     functionResponse so Gemini handles them gracefully instead of crashing the loop
+//   - limit is hardcoded inside executeTool — not exposed to the model
 
 import { onDocumentCreated } from 'firebase-functions/v2/firestore';
 import { defineSecret } from 'firebase-functions/params';
 import { FieldValue, Timestamp } from 'firebase-admin/firestore';
-import { GoogleGenAI } from '@google/genai';
+import { GoogleGenAI, FunctionDeclaration, Type, Part } from '@google/genai';
 import { db } from '../firebaseAdmin';
+import { getOrdersByStatus } from './tools';
 import * as fs from 'fs';
 import * as path from 'path';
 
 const GEMINI_API_KEY = defineSecret('GEMINI_API_KEY');
 
+const MAX_TOOL_ITERATIONS = 5;
+
 // ── Static docs — loaded once on cold start, cached for warm instances ────────
-// __dirname here is functions/lib/agent/ (compiled JS output directory).
-// The docs/ folder is placed next to the source and copied into lib/ on build,
-// so the relative path from compiled output mirrors the source tree.
 const ROUTE_MAP = fs.readFileSync(
   path.join(__dirname, './docs/routes.md'),
   'utf-8'
@@ -36,19 +42,93 @@ const CLOUD_FUNCTIONS_REF = fs.readFileSync(
   'utf-8'
 );
 
+// ── Tool declarations — schema only, no logic ─────────────────────────────────
+// 'limit' is intentionally omitted: it is hardcoded to 50 inside executeTool.
+const TOOL_DECLARATIONS: FunctionDeclaration[] = [
+  {
+    name: 'getOrdersByStatus',
+    description:
+      'Fetch orders for this business filtered by a custom order status and date range. ' +
+      'Generates an Excel file of the results and returns a download link. ' +
+      'IMPORTANT: If the user has not specified a date range, ask them to provide one before calling this tool. ' +
+      'Do not assume or default a date range — always confirm with the user first. ' +
+      'Returns { downloadUrl, count } where downloadUrl is a direct download link to the Excel file.',
+    parameters: {
+      type: Type.OBJECT,
+      properties: {
+        status: {
+          type: Type.STRING,
+          description:
+            'The customStatus value to filter by. ' +
+            'Valid values: New, Confirmed, Ready To Dispatch, Dispatched, ' +
+            'In Transit, Out For Delivery, Delivered, RTO In Transit, RTO Delivered, ' +
+            'RTO Closed, DTO Requested, DTO Booked, DTO In Transit, DTO Delivered, ' +
+            'Pending Refunds, Cancelled, Lost, Closed.',
+        },
+        dateRange: {
+          type: Type.OBJECT,
+          description: 'Optional date range to filter orders by createdAt.',
+          properties: {
+            startDate: {
+              type: Type.STRING,
+              description: 'Start date in YYYY-MM-DD format (IST).',
+            },
+            endDate: {
+              type: Type.STRING,
+              description: 'End date in YYYY-MM-DD format (IST).',
+            },
+          },
+          required: ['startDate', 'endDate'],
+        },
+      },
+      required: ['status'],
+    },
+  },
+];
+
+// ── Tool executor ─────────────────────────────────────────────────────────────
+// Single dispatch point for all tool calls. Add new tools here as a new case.
+// Always returns a plain object — never throws. Errors go back to Gemini as
+// { error } so it can respond to the user gracefully.
+async function executeTool(
+  name: string,
+  args: Record<string, unknown>,
+  businessId: string,
+): Promise<Record<string, unknown>> {
+  switch (name) {
+    case 'getOrdersByStatus': {
+      const status = args.status as string;
+      let dateRange = args.dateRange as { startDate: string; endDate: string } | undefined;
+
+      if (!dateRange) {
+        const now = new Date(new Date().toLocaleString('en-US', { timeZone: 'Asia/Kolkata' }));
+        const pad = (n: number) => String(n).padStart(2, '0');
+        const today = `${now.getFullYear()}-${pad(now.getMonth() + 1)}-${pad(now.getDate())}`;
+
+        dateRange = { startDate: today, endDate: today };
+        console.warn(`⚠️ getOrdersByStatus called without dateRange — defaulting to today: ${today}`);
+      }
+
+      const result = await getOrdersByStatus({
+        businessId,
+        status,
+        dateRange,
+        limit: 50,
+      });
+
+      return result; // { downloadUrl, count }
+    }
+
+    default:
+      return { error: `Unknown tool: ${name}` };
+  }
+}
+
 // ── System prompt ─────────────────────────────────────────────────────────────
-// A function rather than a constant so businessId can be injected per-invocation.
-// The static parts (ROUTE_MAP, CLOUD_FUNCTIONS_REF, tone rules) are built from
-// module-level strings, so there is no file I/O or heavy work on each call —
-// just string interpolation.
-// Sections:
-//   1. Identity & role
-//   2. Tone & behaviour rules
-//   3. Capability boundaries (what it can and cannot do right now)
-//   4. Current session context (businessId)
-//   5. Platform knowledge — Route Map (frontend pages + API routes)
-//   6. Platform knowledge — Cloud Functions Reference (background logic)
 function buildSystemPrompt(businessId: string): string {
+  const now = new Date(new Date().toLocaleString('en-US', { timeZone: 'Asia/Kolkata' }));
+  const pad = (n: number) => String(n).padStart(2, '0');
+  const todayIST = `${now.getFullYear()}-${pad(now.getMonth() + 1)}-${pad(now.getDate())}`;
   return `
 You are the Majime Assistant — an AI built directly into the Majime platform, a B2B SaaS order management system for e-commerce businesses in India.
 
@@ -135,6 +215,66 @@ Length control:
 - Do not exceed necessary detail.
 
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+TOOL USE RULES
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+Tools give you access to live platform data. Use them whenever the user is asking
+for real numbers, counts, or lists — not explanations or guidance.
+
+General rules:
+- Never use a tool for conceptual, navigational, or how-to questions.
+- Never mention tools, function names, or data fetching to the user.
+- Never call the same tool twice with the same arguments.
+- After a tool returns results, answer the user directly. Do not call another
+  tool unless the first result was clearly insufficient.
+- If the user asks for live data outside the scope of any listed tool, say exactly:
+  "I can only fetch orders by status and date range right now."
+
+Date range rules:
+- If the user does not mention any date or time reference, ask for a date range
+  before calling any tool. Do not call the tool without one.
+- If the user says "today", use today's date (already in your context) as both
+  startDate and endDate. Do not ask for clarification.
+- If the user says "this week", use Monday of the current week as startDate and
+  today as endDate.
+- If the user says "this month", use the 1st of the current month as startDate
+  and today as endDate.
+- If the user says "yesterday", use yesterday's date as both startDate and endDate.
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+TOOL: getOrdersByStatus
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+Use this tool when the user asks for a count or list of orders in a specific status.
+You MUST use this tool for these queries — do not fall back to "I'm not sure."
+After the tool returns the downloadUrl, share the count and the download link naturally. Keep it to one or two sentences maximum.
+
+Trigger keywords and phrases:
+- "how many [status] orders"
+- "list of [status] orders"
+- "show me [status] orders"
+- "give me [status] orders"
+- "dispatched orders today / this week / this month"
+- "confirmed orders"
+- "orders in transit"
+- "delivered orders"
+- "cancelled orders"
+- "RTO orders"
+- "DTO orders"
+- "orders that are [status]"
+- "orders with status [status]"
+- "how many orders were [status]"
+- "which orders are [status]"
+- "pending orders" → map to the closest valid status (e.g. Confirmed, New)
+- "returned orders" → map to RTO Closed or Pending Refunds
+- "lost orders"
+- "closed orders"
+- any question containing a valid status name listed below
+
+Valid status values to pass:
+New, Confirmed, Ready To Dispatch, Dispatched, In Transit, Out For Delivery,
+Delivered, RTO In Transit, RTO Delivered, RTO Closed, DTO Requested, DTO Booked,
+DTO In Transit, DTO Delivered, Pending Refunds, Cancelled, Lost, Closed.
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 HALLUCINATION GUARD
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 - Never invent features, pages, statuses, or workflows.
@@ -169,6 +309,7 @@ WHAT YOU CAN DO
 - Explain batch processes conceptually (grouping, processing, completion).
 - Clarify Majime terminology (GRN, AWB, BOM, Lot, Party, DTO, RTO, NDR).
 - Guide multi-step workflows.
+- Fetch and report live order data using available tools.
 
 Important:
 - You may use backend knowledge internally, but output ONLY user-visible behavior.
@@ -176,9 +317,7 @@ Important:
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 WHAT YOU CANNOT DO
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-- You do not have access to live data.
-- You cannot look up orders, inventory, or activity.
-- You cannot perform actions on behalf of the user.
+- You cannot perform actions on behalf of the user (confirm orders, assign AWBs, etc.).
 
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 CURRENT SESSION CONTEXT
@@ -186,6 +325,7 @@ CURRENT SESSION CONTEXT
 - Business ID: ${businessId}
 - Platform URL: https://www.majime.in
 - Base route: https://www.majime.in/business/${businessId}/
+- Today's date (IST): ${todayIST}
 
 Use this to construct full URLs when guiding navigation.
 
@@ -238,45 +378,125 @@ export const onAgentMessageCreated = onDocumentCreated(
       });
 
       // ── Step 2: Fetch conversation history ──────────────────────────────────
-      // Ordered by createdAt so Gemini gets the conversation in the correct order.
       const historySnap = await messagesRef
         .orderBy('createdAt', 'asc')
         .get();
 
-      // Map to Gemini's Content format.
-      // Gemini uses 'user' and 'model' roles (not 'assistant').
-      // The last message is the current user message — it goes into the contents array
-      // as the final entry, so we slice it off the history.
       const allMessages = historySnap.docs.map((d) => d.data());
-      const historyMessages = allMessages.slice(0, -1); // everything except the last
+      const historyMessages = allMessages.slice(0, -1);
 
-      const geminiHistory = historyMessages.map((m) => ({
+      type Content = {
+        role: string;
+        parts: Part[];
+      }
+
+      const geminiHistory: Content[] = historyMessages.map((m) => ({
         role: m.role === 'assistant' ? 'model' : 'user',
         parts: [{ text: m.content as string }],
       }));
 
-      // ── Step 3: Call Gemini (with fallback) ────────────────────────────────
+
+      // ── Step 3: Agentic loop ────────────────────────────────────────────────
       const FALLBACK_REPLY = "I'm having trouble connecting right now. Please try again in a moment.";
+      const ITERATION_EXCEEDED_REPLY = "I wasn't able to complete that request. Please try rephrasing.";
 
       let replyContent: string;
+
       try {
         const genAI = new GoogleGenAI({ apiKey: GEMINI_API_KEY.value() });
-        const result = await genAI.models.generateContent({
-          model: 'gemini-2.5-flash',
-          config: {
-            systemInstruction: buildSystemPrompt(businessId),
-            temperature: 0.3,
-            maxOutputTokens: 1024,
-          },
-          contents: [
-            ...geminiHistory,
-            { role: 'user', parts: [{ text: message.content as string }] },
-          ],
-        });
-        replyContent = result.text ?? FALLBACK_REPLY;
+
+        // contents grows each iteration as tool call turns are appended
+        let contents: Content[] = [
+          ...geminiHistory,
+          { role: 'user', parts: [{ text: message.content as string }] },
+        ];
+
+        let iterations = 0;
+
+        while (iterations < MAX_TOOL_ITERATIONS) {
+          iterations++;
+
+          const result = await genAI.models.generateContent({
+            model: 'gemini-2.5-flash',
+            config: {
+              systemInstruction: buildSystemPrompt(businessId),
+              temperature: 0.3,
+              maxOutputTokens: 1024,
+              tools: [{ functionDeclarations: TOOL_DECLARATIONS }],
+            },
+            contents,
+          });
+
+          const candidate = result.candidates?.[0];
+          if (!candidate) {
+            console.error('❌ Gemini returned no candidates');
+            replyContent = FALLBACK_REPLY;
+            break;
+          }
+
+          // Find the first meaningful part — could be text or a function call
+          const parts = candidate.content?.parts ?? [];
+          const functionCallPart = parts.find((p) => p.functionCall != null);
+          const textPart = parts.find((p) => p.text != null);
+
+          if (functionCallPart?.functionCall) {
+            // ── Tool call branch ──────────────────────────────────────────────
+            const { name, args } = functionCallPart.functionCall;
+
+            console.log(`🔧 Tool call [iteration ${iterations}]: ${name}`, args);
+
+            let toolResult: Record<string, unknown>;
+            try {
+              toolResult = await executeTool(
+                name as string,
+                (args ?? {}) as Record<string, unknown>,
+                businessId,
+              );
+            } catch (toolErr) {
+              // Should not normally reach here since executeTool never throws,
+              // but catch defensively so the loop doesn't crash.
+              console.error(`❌ executeTool threw unexpectedly for ${name}:`, toolErr);
+              toolResult = { error: 'Tool execution failed unexpectedly.' };
+            }
+
+            console.log(`✅ Tool result [${name}]:`, toolResult);
+
+            // Append the model's function call turn and our result turn,
+            // then loop — Gemini will read both and decide what to do next.
+            contents = [
+              ...contents,
+              {
+                role: 'model',
+                parts: [{ functionCall: { name: name as string, args: args ?? {} } }],
+              },
+              {
+                role: 'user',
+                parts: [{ functionResponse: { name: name as string, response: toolResult } }],
+              },
+            ];
+
+          } else if (textPart?.text) {
+            // ── Text reply branch — loop done ────────────────────────────────
+            replyContent = textPart.text;
+            break;
+
+          } else {
+            // Gemini returned neither text nor a function call — shouldn't happen
+            console.error('❌ Gemini returned a candidate with no usable part:', JSON.stringify(parts));
+            replyContent = FALLBACK_REPLY;
+            break;
+          }
+        }
+
       } catch (geminiErr) {
         console.error('❌ Gemini API error — falling back to default reply:', geminiErr);
         replyContent = FALLBACK_REPLY;
+      }
+
+      // If we exhausted iterations without breaking, set the fallback
+      if (!replyContent!) {
+        console.warn(`⚠️ Tool loop exhausted MAX_TOOL_ITERATIONS (${MAX_TOOL_ITERATIONS})`);
+        replyContent = ITERATION_EXCEEDED_REPLY;
       }
 
       // ── Step 4: Write assistant message ────────────────────────────────────

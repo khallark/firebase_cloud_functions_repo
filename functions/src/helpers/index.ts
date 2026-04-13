@@ -11,3 +11,4 @@ export * from "./handleJobFailure";
 export * from "./chunkArray";
 export * from "./maybeCompleteSummary";
 export * from "./sanitizePin";
+export * from "./toCamelCase";

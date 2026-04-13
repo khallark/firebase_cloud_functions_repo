@@ -45,6 +45,7 @@ function getUPCSnapshot(upc: UPC) {
     rackId: upc.rackId ?? null,
     shelfId: upc.shelfId ?? null,
     placementId: upc.placementId ?? null,
+    creditNoteRef: upc.creditNoteRef ?? null,
     storeId: upc.storeId,
     orderId: upc.orderId,
   };
@@ -57,6 +58,7 @@ const TRACKED_FIELDS = [
   "rackId",
   "shelfId",
   "placementId",
+  "creditNoteRef",
 ] as const;
 
 function hasTrackedFieldChanged(before: UPC, after: UPC): boolean {
@@ -114,7 +116,7 @@ export const onUpcWritten = onDocumentWritten(
   {
     document: "users/{businessId}/upcs/{upcId}",
     secrets: [TASKS_SECRET],
-    memory: "4GiB",
+    memory: "1GiB",
     timeoutSeconds: 540,
     // Cap parallelism — fewer concurrent instances = less contention on hot product docs
     maxInstances: 100,
@@ -221,9 +223,7 @@ export const onUpcWritten = onDocumentWritten(
         // inbound → none  : uses after.placementId
         // none → outbound : uses before.placementId
         const relevantPlacementId =
-          after.putAway === "none"
-            ? after.placementId
-            : before.placementId;
+          after.putAway === "none" ? after.placementId : before.placementId;
 
         const placementRef = db.doc(`users/${businessId}/placements/${relevantPlacementId}`);
 
@@ -232,7 +232,9 @@ export const onUpcWritten = onDocumentWritten(
           transaction.get(placementRef),
         ]);
 
-        console.log(`🔍 Product ID: "${after.productId}" | exists: ${productDoc.exists} | inShelfQuantity: ${productDoc.data()?.inShelfQuantity}`);
+        console.log(
+          `🔍 Product ID: "${after.productId}" | exists: ${productDoc.exists} | inShelfQuantity: ${productDoc.data()?.inShelfQuantity}`,
+        );
 
         // --------------------------------------------------------
         // ALL WRITES AFTER
@@ -295,10 +297,10 @@ export const onUpcWritten = onDocumentWritten(
           console.log(`  ✓ Decremented placement quantity for ${relevantPlacementId}`);
         }
 
-        // * → null : auto deduction (dispatched/sold)
+        // * → null : deduction (order dispatch OR credit note finalisation via put-away)
         if (after.putAway === null && before.putAway !== null) {
           if (!after.productId) {
-            console.warn(`⚠️ UPC ${upcId} has no productId, skipping autoDeduction`);
+            console.warn(`⚠️ UPC ${upcId} has no productId, skipping deduction`);
             return;
           }
 
@@ -307,11 +309,31 @@ export const onUpcWritten = onDocumentWritten(
             return;
           }
 
-          transaction.update(productRef, {
-            "inventory.autoDeduction": FieldValue.increment(1),
-            "inventory.blockedStock": FieldValue.increment(-1),
-          });
-          console.log(`  ✅ Incremented autoDeduction for product ${after.productId}`);
+          if (before.putAway === "outbound") {
+            if (after.creditNoteRef) {
+              // Credit note — UPC was marked outbound by CN complete route.
+              // Never blocked by an order, so no blockedStock touch.
+              transaction.update(productRef, {
+                "inventory.deduction": FieldValue.increment(1),
+              });
+              console.log(`  ✅ deduction++ for product ${after.productId} (outbound→null, creditNoteRef: ${after.creditNoteRef})`);
+            } else {
+              // Order dispatch — UPC was blocked by an order.
+              transaction.update(productRef, {
+                "inventory.autoDeduction": FieldValue.increment(1),
+                "inventory.blockedStock": FieldValue.increment(-1),
+              });
+              console.log(`  ✅ autoDeduction++ + blockedStock-- for product ${after.productId} (outbound→null, order dispatch)`);
+            }
+          } else if (before.putAway === "none") {
+            // Direct none→null — safety fallback, should not occur in normal flows.
+            transaction.update(productRef, {
+              "inventory.deduction": FieldValue.increment(1),
+            });
+            console.log(`  ✅ deduction++ for product ${after.productId} (none→null, direct removal)`);
+          } else {
+            console.warn(`⚠️ UPC ${upcId} transitioned to null from unexpected putAway '${before.putAway}' — no inventory update applied`);
+          }
         }
 
         // * → inbound : auto addition (return/re-inward)

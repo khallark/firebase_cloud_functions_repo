@@ -59,6 +59,7 @@ AWBs (Air Waybill numbers) are fetched in bulk from Delhivery and stored at busi
 - Placements: `users/{businessId}/placements/{productId}_{shelfId}`
 - Warehouses/Zones/Racks/Shelves: `users/{businessId}/warehouses|zones|racks|shelves/{code}`
 - GRNs: `users/{businessId}/grns/{grnId}`
+- Credit Notes: `users/{businessId}/credit_notes/{cnId}`
 - Purchase Orders: `users/{businessId}/purchaseOrders/{poId}`
 - Parties: `users/{businessId}/parties/{partyId}`
 - Agent sessions: `users/{businessId}/agent_sessions/{sessionId}`
@@ -155,7 +156,7 @@ This is the AI-powered in-app assistant. The entire agent UI is rendered into a 
   - **Dashboard** — direct link to `/business/{businessId}/dashboard`, highlighted when exactly on that path. Has a ChevronRight indicator when active.
   - **Reports** (FolderClockIcon) — collapsible. Contains: Tax Reports nav item.
   - **Orders** (Package icon) — collapsible. Contains: All Orders, AWB Processing.
-  - **Warehouse** (Warehouse icon) — collapsible. Contains: Party Master, Purchase Orders, Process GRNs, Put Away, Business Products, Inventory, Warehouses, Movements, Activity Logs.
+  - **Warehouse** (Warehouse icon) — collapsible. Contains: Party Master, Purchase Orders, Process GRNs, Put Away, Credit Notes, Business Products, Inventory, Warehouses, Movements, Activity Logs.
   - **Members** (Users icon) — collapsible. Contains: Requests (super admin only, shown with `isSuperAdmin` check), Invite.
 - **Footer (SidebarFooter):**
   - **Business Switcher** — shown only when `joinedBusinesses.length > 1`. Displays current business name in a pill. Clicking opens an AnimatePresence dropdown (above the button, `bottom-full`) listing all businesses. Clicking another business replaces the `businessId` segment in the current pathname and navigates there.
@@ -282,15 +283,16 @@ This is the AI-powered in-app assistant. The entire agent UI is rendered into a 
 
 **Gross Profit Report Card (`grossProfitData` from Firestore):**
 - Controls: Date preset selector, optional custom calendar Popover, Refresh button (with cooldown countdown), Download Excel button (shown when `downloadUrl` exists and data is loaded).
-- Shows Table with rows: Sale, Sale Return, Purchase, Opening Stock, Closing Stock, Lost (...), Gross Profit.
+- Shows Table with rows: Sale, Sale Return, Purchase, Credit Notes, Opening Stock, Closing Stock, Lost (...), Gross Profit.
 - Columns: Type, Qty, Taxable Amt, IGST, CGST, SGST, Net Amount, [action button column].
-- Row styling: Gross Profit row has green tinted background + bold. Sale Return/Purchase/Opening Stock rows have red text. Lost rows have red text.
+- Row styling: Gross Profit row has green tinted background + bold. Sale Return/Purchase/Opening Stock/Lost rows have red text. Credit Notes row renders in default color (it is a positive/recovery row, not negative).
 - Action buttons (Download icon, last column, per row):
   - **Sale row:** Download icon → calls `POST /api/business/generate-tax-report` (queues tax report job) → shows toast with "View Progress" button linking to `/business/{businessId}/dashboard/reports/tax`.
   - **Purchase row:** Download icon → calls external `purchaseReport` Cloud Function → triggers direct file download.
   - **Opening Stock row:** Download icon → calls `inventorySnapshotOfADate` Cloud Function with `date = grossProfitData.startDate - 1 day` → direct download.
   - **Closing Stock row:** Download icon → calls `inventorySnapshotOfADate` Cloud Function with `date = grossProfitData.endDate` → direct download.
-- Loading skeleton: 7 skeleton rows while `grossProfitData.loading === true`.
+  - **Credit Notes row:** No action button — data is already represented in the CN list page.
+- Loading skeleton: 8 skeleton rows while `grossProfitData.loading === true`.
 
 **Remittance Card (`remittanceTable.blueDart` or `.delhivery` from Firestore):**
 - Controls: Courier selector (Blue Dart / Delhivery), date range calendar Popover (range mode, 2 months), Refresh button (with cooldown and "Select a date range first" tooltip when no dates).
@@ -857,8 +859,10 @@ Warehouses (blue), Zones (emerald), Racks (amber), Shelves (purple), Products (r
 **APIs used:**
 - Firestore `getDocs` on `users/{businessId}/upcs` (all UPCs) via `usePutAwayUPCs` (TanStack Query, refetch 30s).
 - Firestore `getDoc` on individual order docs to resolve order name/status for outbound/dispatched UPCs.
+- Firestore `getDoc` on `users/{businessId}/credit_notes/{cnId}` — to resolve credit note doc IDs to human-readable CN numbers.
 - `GET /api/business/warehouse/list-warehouses`, `list-zones`, `list-racks`, `list-shelves` — for location selector.
-- `POST /api/business/warehouse/put-away-batch` — assigns UPCs to shelf location.
+- `POST /api/business/warehouse/put-away-batch` — assigns inbound UPCs to shelf location. Max 100 UPCs.
+- `POST /api/business/credit-notes/dispatch-upcs` — removes credit note UPCs from inventory (Outbound → To be Removed tab).
 - `GET /api/business/warehouse/grns/{grnId}` (via `getDoc`) — to resolve GRN doc IDs to human-readable GRN numbers.
 
 **Page layout:** `min-h-full p-6 space-y-6`.
@@ -886,7 +890,13 @@ Warehouses (blue), Zones (emerald), Racks (amber), Shelves (purple), Products (r
 - Within each date group: list of UPC rows with order name, store name, order status badge + time.
 - Global "Select All" + "Put Away (N)" button.
 
-**Outbound Tab:** Shows all `putAway === 'outbound'` UPCs (ready for courier pickup). Enriched with order name/status via Firestore lookups. Simple list — purple Package icon per row, order info below UPC id.
+**Outbound Tab:** Shows all `putAway === 'outbound'` UPCs split into two sub-tabs:
+
+- **To be Dispatched** (`creditNoteRef: null`) — UPCs reserved for courier pickup by an active order. Date range filter at top. **Checkboxes and put-away button are hidden** — these UPCs cannot be manually acted on here; they exit the system via the fulfillment dispatch flow. `put-away-batch` also rejects these UPCs at the API level if included.
+
+- **To be Removed** (`creditNoteRef` set) — UPCs reserved for credit note removal. Search bar at top (by CN number, UPC ID, or product SKU). UPCs grouped by Credit Note (each group shows CN number, UPC count, product count, date). "Select CN" button per group toggles all UPCs in that CN. "Select All" and "Dispatch (N)" buttons in the toolbar. Dispatch button calls `POST /api/business/credit-notes/dispatch-upcs` directly — **no location dialog**, no shelf assignment needed. Max 100 UPCs per dispatch (enforced in both UI and API). On success: UPCs are set to `putAway: null` and disappear from this tab.
+
+Selection is capped at 100 UPCs across all inbound and outbound sub-tabs (enforced via toast on overflow).
 
 **Dispatched Tab:** Shows all `putAway === null` UPCs (dispatched orders). Rose Package icon per row with order info + dispatch time.
 
@@ -895,6 +905,50 @@ Warehouses (blue), Zones (emerald), Racks (amber), Shelves (purple), Products (r
 - Shows "Select Put Away Location" with count of selected UPCs.
 - Four sequential dropdowns: Warehouse → Zone → Rack → Shelf. Each subsequent dropdown is disabled until parent is selected. Each fetches its children lazily on first render.
 - "Confirm Location" button (disabled until all 4 selected) → calls `POST /api/business/warehouse/put-away-batch` → on success: invalidates putAway queries and shows toast.
+
+---
+
+### Credit Notes
+**URL:** `/business/{businessId}/warehouse/credit-notes`
+
+**Wraps in:** Warehouse layout
+
+**APIs used:**
+- Firestore `onSnapshot` on `users/{businessId}/credit_notes` (ordered by `createdAt desc`) — real-time list.
+- Firestore `getDocs` on `users/{businessId}/parties` (filtered to `type in ['supplier', 'both']`, `isActive: true`) — for party selector in creation dialog.
+- Warehouse tree APIs: `GET /api/business/warehouse/list-warehouses`, `list-zones`, `list-racks`, `list-shelves` — for UPC picker in Step 2.
+- Firestore `getDocs` on `users/{businessId}/upcs` (filtered to `putAway: 'none'`, `shelfId: selectedShelf.id`) — UPCs available to include in a CN.
+- `POST /api/business/credit-notes/complete` — unified create + complete.
+- `POST /api/business/warehouse/credit-notes/download-bill` → PDF download.
+
+**Page layout:** `p-6`.
+
+**Header:** "Credit Notes" h1 + description. "+ New Credit Note" button opens the creation dialog.
+
+**List table:** CN Number, Party, Reason, Items (count), Total Value (₹), Status badge (always "completed"), Date. Each row has a Download icon button → `POST /api/business/warehouse/credit-notes/download-bill` → PDF download. Shows "Generating PDF…" toast while loading, "PDF Downloaded" on success.
+
+**Creation Dialog (3-step, inline — no separate page):**
+
+**Step 1 — Party:** Select supplier party from dropdown (suppliers/both, active only). Select reason (Damaged / Quality Rejection / Excess Stock / Expired / Wrong Item Received / Other). Optional notes textarea.
+
+**Step 2 — Items:** Two-panel layout.
+- **Left panel — Warehouse tree:** Expandable Warehouse → Zone → Rack → Shelf. Lazy-loaded at each level (click to expand, fetches children on first open). Selected shelf highlighted with blue left-border.
+- **Right panel — Shelf UPCs:** Shows all `putAway: 'none'` UPCs on the selected shelf, sorted by `createdAt` ascending, grouped by `productId`. Click a UPC row to toggle selection (checkbox). Selected UPCs tracked in `draftItems` state keyed by `productId`. Summary pill: "N UPCs selected across M products".
+
+**Step 3 — Confirm:** Summary of party and reason. Per-product price input: unit price (ex-tax, required, must be > 0). Total value preview. "Confirm & Complete" button calls `POST /api/business/credit-notes/complete` — on success, dialog closes and list refreshes via the existing `onSnapshot`.
+
+**No draft state** — Credit Notes are created and completed atomically. There is no cancel or edit action on the list.
+
+**Download Bill PDF:**
+- Opposite of GRN bill: "Billed By" = Business (issuing the credit note), "Billed To" = Party/Supplier.
+- Bank details shown are the **business's bank** (so supplier knows where to send the refund).
+- Amber color scheme (vs purple for GRN bills).
+- Tax rates read directly from `CreditNoteItem.taxRate` — no product fetch needed.
+
+**Logical connections:**
+- Credit Notes created here cause UPCs to appear in Put Away → Outbound → "To be Removed" sub-tab.
+- Dispatching UPCs from the put-away page finalises the stock deduction (`inventory.deduction++`).
+- The CN's `totalValue` and items feed the **Credit Notes row** in the Gross Profit Report on the Dashboard.
 
 ---
 
@@ -1228,12 +1282,22 @@ Warehouses (blue), Zones (emerald), Racks (amber), Shelves (purple), Products (r
 
 ---
 
+### Warehouse — Credit Notes
+
+| Method | Route | Description |
+|---|---|---|
+| POST | `/api/business/credit-notes/complete` | Unified create + complete for a Credit Note. No draft state — CN is created and completed in a single atomic operation. **Pre-flight** (outside transaction): `db.getAll()` batch-reads all UPC docs. Validates each is `putAway: 'none'` — returns 400 immediately if any fail, no locks acquired. **Transaction**: increments `users/{businessId}.creditNoteCount` to generate `creditNoteNumber` (CN-001, CN-002…). Creates CN doc with `status: 'completed'` and `completedAt` set immediately. Sets each UPC `putAway → 'outbound'` and tags `creditNoteRef: cnId`. Setting UPCs to `outbound` triggers `onUpcWritten` `none → outbound` branch: decrements `inShelfQuantity` and placement quantity. UPCs appear in Put Away → Outbound → "To be Removed" tab. Body: `{businessId, partyId, partyName, warehouseId, reason, notes, items[], totalItems, totalValue}`. Returns `{id: cnId}` (201). |
+| POST | `/api/business/credit-notes/dispatch-upcs` | Physically removes credit note UPCs from inventory by setting `putAway → null`. Called from Put Away → Outbound → "To be Removed" tab Dispatch button. Validates each UPC is `putAway: 'outbound'` AND has `creditNoteRef` set — rejects order-dispatch UPCs (no `creditNoteRef`). Sets each validated UPC `putAway: null`. `onUpcWritten` fires and routes to `inventory.deduction++` (since `creditNoteRef` is present). **Max 100 UPCs per request.** Body: `{businessId, upcIds[]}`. Returns `{success: true, count: N}`. |
+| POST | `/api/business/warehouse/credit-notes/download-bill` | Generates a Puppeteer A4 PDF credit note bill. Auth: Bearer token + business membership check. Fetches CN doc and Party doc. **Opposite of GRN bill**: "Billed By" = Business (issuing the CN), "Billed To" = Party/Supplier. Bank details shown are the business's bank (so supplier refunds there). Tax rates come directly from `CreditNoteItem.taxRate` — no product fetch needed (stored at CN creation time). Intra/inter-state determined by party's `address.state` vs Punjab. Amber color scheme. Returns PDF binary (`application/pdf`, `Content-Disposition: attachment`). Body: `{businessId, creditNoteId}`. |
+
+---
+
 ### Warehouse — Inward & Put Away
 
 | Method | Route | Description |
 |---|---|---|
 | POST | `/api/business/warehouse/bulk-inward-products` | Inwars stock from a GRN into warehouse placements. Takes `{businessId, grnId, items[{sku, productName, acceptedQty, unitCost, location: {warehouseId, zoneId, rackId, shelfId}}]}`. Guards: GRN must exist and be `draft`. Each item max 500 units. Validates all SKUs exist in business products. Per item: increments `inventory.inwardAddition`, creates or updates placement doc (`{productId}_{shelfId}`) — toggles `createUPCs` flag on update. Creates audit log on each product. Updates GRN status to `completed`. |
-| POST | `/api/business/warehouse/put-away-batch` | Assigns a batch of UPCs (by ID) from `putAway='inbound'` to a specific shelf. Validates warehouse hierarchy: zone must be in warehouse, rack must be in zone, shelf must be in rack. Removes duplicates from upcIds. Finds each UPC and verifies existence. Batch-updates all UPCs: sets `{warehouseId, zoneId, rackId, shelfId, placementId: '{productId}_{shelfId}', putAway: 'none', orderId: null, storeId: null}`. Max 500 UPCs per call. |
+| POST | `/api/business/warehouse/put-away-batch` | Assigns a batch of UPCs (by ID) from `putAway='inbound'` to a specific shelf. Validates warehouse hierarchy: zone must be in warehouse, rack must be in zone, shelf must be in rack. Removes duplicates from upcIds. **Rejects UPCs that are `putAway: 'outbound'` with `creditNoteRef: null`** (order-dispatch UPCs — returns 400 with `{error, blockedUpcs[]}`). Finds each remaining UPC and verifies existence. Batch-updates all UPCs: sets `{warehouseId, zoneId, rackId, shelfId, placementId: '{productId}_{shelfId}', putAway: 'none', orderId: null, storeId: null}`. **Max 100 UPCs per call.** |
 
 ---
 

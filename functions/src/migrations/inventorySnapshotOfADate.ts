@@ -15,9 +15,10 @@ interface SnapshotRow {
   stock: number;
   blockedStock: number | null;
   variantSku: string | null;
-  productName: string | null; // ← add
+  productName: string | null;
   price: number | null;
   cogs: number | null;
+  category: string | null;
 }
 
 async function buildExcelBuffer(rows: SnapshotRow[], date: string): Promise<Buffer> {
@@ -31,10 +32,11 @@ async function buildExcelBuffer(rows: SnapshotRow[], date: string): Promise<Buff
     { header: "Product SKU", key: "productSku", width: 22 },
     { header: "Stock", key: "stock", width: 12 },
     { header: "Blocked Stock", key: "blockedStock", width: 16 },
-    { header: "Product Name", key: "productName", width: 28 }, // ← add
+    { header: "Product Name", key: "productName", width: 28 },
     { header: "Variant SKU", key: "variantSku", width: 22 },
     { header: "Price", key: "price", width: 14 },
     { header: "COGS", key: "cogs", width: 14 },
+    { header: "Category", key: "category", width: 20 },
   ];
 
   // Header styling
@@ -55,6 +57,7 @@ async function buildExcelBuffer(rows: SnapshotRow[], date: string): Promise<Buff
       row.variantSku,
       row.price,
       row.cogs,
+      row.category,
     ]);
     excelRow.font = { name: "Arial", size: 10 };
     excelRow.alignment = { vertical: "middle" };
@@ -64,7 +67,7 @@ async function buildExcelBuffer(rows: SnapshotRow[], date: string): Promise<Buff
 
   // Thin borders on all cells
   for (let r = 1; r <= ws.rowCount; r++) {
-    for (let c = 1; c <= 7; c++) {
+    for (let c = 1; c <= 8; c++) {
       ws.getRow(r).getCell(c).border = {
         top: { style: "thin" },
         left: { style: "thin" },
@@ -75,8 +78,8 @@ async function buildExcelBuffer(rows: SnapshotRow[], date: string): Promise<Buff
   }
 
   // Add a note with the report date in cell G1
-  ws.getCell("H1").value = `Date: ${date}`;
-  ws.getCell("G1").font = { name: "Arial", size: 10, italic: true };
+  ws.getCell("I1").value = `Date: ${date}`;
+  ws.getCell("I1").font = { name: "Arial", size: 10, italic: true };
 
   return Buffer.from(await workbook.xlsx.writeBuffer());
 }
@@ -170,7 +173,8 @@ export const inventorySnapshotOfADate = onRequest(
 
           price = variantResult;
           cogs = cogsDoc.exists ? Number(cogsDoc.data()?.price) || null : null;
-          const productName = cogsDoc.exists ? String(cogsDoc.data()?.name ?? "") || null : null; // ← add
+          const productName = cogsDoc.exists ? String(cogsDoc.data()?.name ?? "") || null : null;
+          const category = cogsDoc.exists ? String(cogsDoc.data()?.category ?? "") || null : null;
 
           return {
             productSku: productId,
@@ -180,6 +184,7 @@ export const inventorySnapshotOfADate = onRequest(
             variantSku,
             price,
             cogs,
+            category,
           } satisfies SnapshotRow;
         }),
       );

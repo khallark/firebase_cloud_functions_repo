@@ -61,6 +61,7 @@ interface SalesReturnRow {
   vendor: string;
   dateOfReturn: string;
   refundAmount: number;
+  qcStatus: string; // populated from item.qc_status, empty string if not set
 }
 
 interface StatePivot {
@@ -197,25 +198,22 @@ function calculateTaxes(
  */
 async function processSalesOrders(
   storeId: string,
-  startDate: Date,
-  endDate: Date,
+  startDate: string,
+  endDate: string,
 ): Promise<SalesRow[]> {
-  const startOfRange = new Date(startDate);
-  startOfRange.setHours(0, 0, 0, 0);
-
-  const endOfRange = new Date(endDate);
-  endOfRange.setHours(23, 59, 59, 999);
+  const startOfRange = `${startDate}T00:00:00+05:30`;
+  const endOfRange = `${endDate}T23:59:59+05:30`;
 
   console.log(
-    `📊 Fetching sales orders from ${startOfRange.toISOString().slice(0, -1) + "+05:30"} to ${endOfRange.toISOString().slice(0, -1) + "+05:30"}`,
+    `📊 Fetching sales orders from ${startOfRange} to ${endOfRange}`,
   );
 
   const ordersSnapshot = await db
     .collection("accounts")
     .doc(storeId)
     .collection("orders")
-    .where("createdAt", ">=", startOfRange.toISOString().slice(0, -1) + "+05:30")
-    .where("createdAt", "<=", endOfRange.toISOString() + "+05:30")
+    .where("createdAt", ">=", startOfRange)
+    .where("createdAt", "<=", endOfRange)
     .orderBy("createdAt", "asc")
     .get();
 
@@ -345,23 +343,23 @@ async function processSalesOrders(
  *
  * If order.refundedAmount exists: Uses item-wise refundedAmount, skips items with 0 refund
  * If order.refundedAmount doesn't exist: Uses salePrice as the refund amount (full refund)
+ *
+ * qcStatus is populated from item.qc_status (set by the QC test flow on DTO items).
+ * Empty string for orders that did not go through QC.
  */
 async function processSalesReturnOrders(
   storeId: string,
-  startDate: Date,
-  endDate: Date,
+  startDate: string,
+  endDate: string,
 ): Promise<SalesReturnRow[]> {
-  const startOfRange = new Date(startDate);
-  startOfRange.setHours(0, 0, 0, 0);
-
-  const endOfRange = new Date(endDate);
-  endOfRange.setHours(23, 59, 59, 999);
+  const startOfRange = `${startDate}T00:00:00+05:30`;
+  const endOfRange = `${endDate}T23:59:59+05:30`;
 
   console.log(
-    `📊 Fetching sales return orders from ${startOfRange.toDateString()} to ${endOfRange.toDateString()}`,
+    `📊 Fetching sales return orders from ${startOfRange} to ${endOfRange}`,
   );
-  const startTs = Timestamp.fromDate(startOfRange);
-  const endTs = Timestamp.fromDate(endOfRange);
+  const startTs = Timestamp.fromDate(new Date(startOfRange));
+  const endTs = Timestamp.fromDate(new Date(endOfRange));
 
   const baseQuery = db.collection("accounts").doc(storeId).collection("orders");
 
@@ -371,7 +369,10 @@ async function processSalesReturnOrders(
       .where("lastStatusUpdate", ">=", startTs)
       .where("lastStatusUpdate", "<=", endTs)
       .get(),
-    baseQuery.where("pendingRefundsAt", ">=", startTs).where("pendingRefundsAt", "<=", endTs).get(),
+    baseQuery
+      .where("pendingRefundsAt", ">=", startTs)
+      .where("pendingRefundsAt", "<=", endTs)
+      .get(),
     baseQuery
       .where("cancellationRequestedAt", ">=", startTs)
       .where("cancellationRequestedAt", "<=", endTs)
@@ -467,6 +468,10 @@ async function processSalesReturnOrders(
         const taxable = calculateTaxable(refundAmount, productInfo.taxRate);
         const taxes = calculateTaxes(taxable, productInfo.taxRate, state);
 
+        // qc_status is set on the line item by the QC test flow (DTO In Transit / DTO Delivered).
+        // Will be an empty string for RTO Closed and Cancelled orders that never went through QC.
+        const qcStatus = String(item.qc_status ?? "");
+
         salesReturnRows.push({
           srNo: srNo++,
           billNo: String(order.name || ""),
@@ -490,6 +495,7 @@ async function processSalesReturnOrders(
           sgst: taxes.sgst,
           cgst: taxes.cgst,
           vendor: String(item.vendor || ""),
+          qcStatus,
         });
       } catch (error) {
         console.error(`Error processing return item in order ${order.name}:`, error);
@@ -707,7 +713,7 @@ async function createExcelWorkbook(
 ): Promise<ExcelJS.Workbook> {
   const workbook = new ExcelJS.Workbook();
 
-  // Sheet 1: Sales Report
+  // ─── Sheet 1: Sales Report ────────────────────────────────────────────────
   const salesSheet = workbook.addWorksheet("Sales Report");
   salesSheet.columns = [
     { header: "Sr. No.", key: "srNo", width: 10 },
@@ -715,8 +721,8 @@ async function createExcelWorkbook(
     { header: "Date of Bill", key: "dateOfBill", width: 15 },
     { header: "Name of customer", key: "customerName", width: 25 },
     { header: "State", key: "state", width: 20 },
-    { header: "Courier", key: "courier", width: 20 }, // NEW
-    { header: "Payment Gateway", key: "paymentGateway", width: 22 }, // NEW
+    { header: "Courier", key: "courier", width: 20 },
+    { header: "Payment Gateway", key: "paymentGateway", width: 22 },
     { header: "Item Name", key: "itemName", width: 30 },
     { header: "Item Qty", key: "itemQty", width: 10 },
     { header: "Final Status", key: "finalStatus", width: 20 },
@@ -733,47 +739,34 @@ async function createExcelWorkbook(
     { header: "SGST", key: "sgst", width: 12 },
     { header: "CGST", key: "cgst", width: 12 },
     { header: "Vendor", key: "vendor", width: 20 },
-    { header: "State Amount Due", key: "stateAmountDue", width: 20 }, // NEW
-    { header: "Courier Amount Due", key: "courierAmountDue", width: 20 }, // NEW
-    { header: "Payment Gateway Amount Due", key: "paymentGatewayAmountDue", width: 25 }, // NEW
-  ];
+    { header: "State Amount Due", key: "stateAmountDue", width: 20 },
+    { header: "Courier Amount Due", key: "courierAmountDue", width: 20 },
+    { header: "Payment Gateway Amount Due", key: "paymentGatewayAmountDue", width: 25 },
+  ]; // 26 columns
 
   salesRows.forEach((row) => salesSheet.addRow(row));
 
-  // Style header with all borders
   const salesHeaderRow = salesSheet.getRow(1);
   for (let col = 1; col <= 26; col++) {
     const cell = salesHeaderRow.getCell(col);
     cell.font = { bold: true, color: { argb: "FFFFFFFF" } };
-    cell.fill = {
-      type: "pattern",
-      pattern: "solid",
-      fgColor: { argb: "FF4472C4" },
-    };
+    cell.fill = { type: "pattern", pattern: "solid", fgColor: { argb: "FF4472C4" } };
     cell.alignment = { vertical: "middle", horizontal: "center" };
-    cell.border = {
-      top: { style: "thin" },
-      left: { style: "thin" },
-      bottom: { style: "thin" },
-      right: { style: "thin" },
-    };
+    cell.border = { top: { style: "thin" }, left: { style: "thin" }, bottom: { style: "thin" }, right: { style: "thin" } };
   }
 
-  // Add side borders to all data rows
   for (let row = 2; row <= salesRows.length + 1; row++) {
-    for (let col = 1; col <= 25; col++) {
+    for (let col = 1; col <= 26; col++) {
       const cell = salesSheet.getCell(row, col);
-      cell.border = {
-        left: { style: "thin" },
-        right: { style: "thin" },
-      };
-      if (row == salesRows.length + 1) {
-        cell.border.bottom = { style: "thin" };
-      }
+      cell.border = { left: { style: "thin" }, right: { style: "thin" } };
+      if (row === salesRows.length + 1) cell.border.bottom = { style: "thin" };
     }
   }
 
-  // Sheet 2: Sales Return Report
+  // ─── Sheet 2: Sales Return Report ─────────────────────────────────────────
+  // 23 columns: the original 22 + QC Status appended at the end.
+  // QC Status is sourced from raw.line_items[].qc_status, set during the DTO QC flow.
+  // Empty string for orders that never went through QC (RTO, Cancelled, etc.).
   const returnSheet = workbook.addWorksheet("Sales Return Report");
   returnSheet.columns = [
     { header: "Sr. No.", key: "srNo", width: 10 },
@@ -798,97 +791,58 @@ async function createExcelWorkbook(
     { header: "SGST", key: "sgst", width: 12 },
     { header: "CGST", key: "cgst", width: 12 },
     { header: "Vendor", key: "vendor", width: 20 },
-  ];
+    { header: "QC Status", key: "qcStatus", width: 18 },
+  ]; // 23 columns
 
   returnRows.forEach((row) => returnSheet.addRow(row));
 
-  // Style header with all borders
   const returnHeaderRow = returnSheet.getRow(1);
-  for (let col = 1; col <= 21; col++) {
+  for (let col = 1; col <= 23; col++) {
     const cell = returnHeaderRow.getCell(col);
     cell.font = { bold: true, color: { argb: "FFFFFFFF" } };
-    cell.fill = {
-      type: "pattern",
-      pattern: "solid",
-      fgColor: { argb: "FF4472C4" },
-    };
+    cell.fill = { type: "pattern", pattern: "solid", fgColor: { argb: "FF4472C4" } };
     cell.alignment = { vertical: "middle", horizontal: "center" };
-    cell.border = {
-      top: { style: "thin" },
-      left: { style: "thin" },
-      bottom: { style: "thin" },
-      right: { style: "thin" },
-    };
+    cell.border = { top: { style: "thin" }, left: { style: "thin" }, bottom: { style: "thin" }, right: { style: "thin" } };
   }
 
-  // Add side borders to all data rows
   for (let row = 2; row <= returnRows.length + 1; row++) {
-    for (let col = 1; col <= 21; col++) {
+    for (let col = 1; col <= 23; col++) {
       const cell = returnSheet.getCell(row, col);
-      cell.border = {
-        left: { style: "thin" },
-        right: { style: "thin" },
-      };
-      if (row == returnRows.length + 1) {
-        cell.border.bottom = { style: "thin" };
-      }
+      cell.border = { left: { style: "thin" }, right: { style: "thin" } };
+      if (row === returnRows.length + 1) cell.border.bottom = { style: "thin" };
     }
   }
 
-  // Sheet 3: State Wise Tax Report
+  // ─── Sheet 3: State Wise Tax Report ───────────────────────────────────────
   const stateSheet = workbook.addWorksheet("State Wise Tax Report");
 
-  // Create multi-level headers
   stateSheet.mergeCells("A1:A2");
   stateSheet.getCell("A1").value = "State";
-
   stateSheet.mergeCells("B1:G1");
   stateSheet.getCell("B1").value = "Gross Sales";
-
   stateSheet.mergeCells("H1:M1");
   stateSheet.getCell("H1").value = "Refund/Sale Return Amount";
-
   stateSheet.mergeCells("N1:S1");
   stateSheet.getCell("N1").value = "Net Sales";
 
-  // Sub-headers row 2
   const subHeaders = ["Qty", "Taxable Sales", "IGST", "SGST", "CGST", "Invoice Amount"];
 
-  let col = 2; // Column B
-  subHeaders.forEach((header) => {
-    stateSheet.getCell(2, col++).value = header;
-  });
+  let col = 2;
+  subHeaders.forEach((header) => { stateSheet.getCell(2, col++).value = header; });
+  subHeaders.forEach((header) => { stateSheet.getCell(2, col++).value = header; });
+  subHeaders.forEach((header) => { stateSheet.getCell(2, col++).value = header; });
 
-  subHeaders.forEach((header) => {
-    stateSheet.getCell(2, col++).value = header;
-  });
-
-  subHeaders.forEach((header) => {
-    stateSheet.getCell(2, col++).value = header;
-  });
-
-  // Style headers with all borders (rows 1 & 2, columns 1-19)
   [1, 2].forEach((rowNum) => {
     const row = stateSheet.getRow(rowNum);
     for (let col = 1; col <= 19; col++) {
       const cell = row.getCell(col);
       cell.font = { bold: true, color: { argb: "FFFFFFFF" } };
-      cell.fill = {
-        type: "pattern",
-        pattern: "solid",
-        fgColor: { argb: "FF4472C4" },
-      };
+      cell.fill = { type: "pattern", pattern: "solid", fgColor: { argb: "FF4472C4" } };
       cell.alignment = { vertical: "middle", horizontal: "center" };
-      cell.border = {
-        top: { style: "thin" },
-        left: { style: "thin" },
-        bottom: { style: "thin" },
-        right: { style: "thin" },
-      };
+      cell.border = { top: { style: "thin" }, left: { style: "thin" }, bottom: { style: "thin" }, right: { style: "thin" } };
     }
   });
 
-  // Add data rows
   let currentRow = 3;
   statePivot.forEach((pivot) => {
     stateSheet.getCell(currentRow, 1).value = pivot.state;
@@ -913,94 +867,53 @@ async function createExcelWorkbook(
     currentRow++;
   });
 
-  // Add side borders to data rows
   for (let row = 3; row < currentRow; row++) {
     for (let col = 1; col <= 19; col++) {
-      const cell = stateSheet.getCell(row, col);
-      cell.border = {
-        left: { style: "thin" },
-        right: { style: "thin" },
-      };
+      stateSheet.getCell(row, col).border = { left: { style: "thin" }, right: { style: "thin" } };
     }
   }
 
-  // Add grand total row
   const totalRow = currentRow;
   stateSheet.getCell(totalRow, 1).value = "Grand Total";
   stateSheet.getCell(totalRow, 1).font = { bold: true };
-
   for (let col = 2; col <= 19; col++) {
     let sum = 0;
-    for (let row = 3; row < totalRow; row++) {
-      sum += Number(stateSheet.getCell(row, col).value || 0);
-    }
+    for (let row = 3; row < totalRow; row++) sum += Number(stateSheet.getCell(row, col).value || 0);
     stateSheet.getCell(totalRow, col).value = Number(sum.toFixed(2));
     stateSheet.getCell(totalRow, col).font = { bold: true };
   }
-
-  // Add all borders to grand total row
   for (let col = 1; col <= 19; col++) {
-    const cell = stateSheet.getCell(totalRow, col);
-    cell.border = {
-      top: { style: "thin" },
-      left: { style: "thin" },
-      bottom: { style: "thin" },
-      right: { style: "thin" },
-    };
+    stateSheet.getCell(totalRow, col).border = { top: { style: "thin" }, left: { style: "thin" }, bottom: { style: "thin" }, right: { style: "thin" } };
   }
 
-  // Sheet 4: HSN Wise Tax Report
+  // ─── Sheet 4: HSN Wise Tax Report ─────────────────────────────────────────
   const hsnSheet = workbook.addWorksheet("HSN Wise Tax Report");
 
-  // Create multi-level headers (same structure as state sheet)
   hsnSheet.mergeCells("A1:A2");
   hsnSheet.getCell("A1").value = "HSN";
-
   hsnSheet.mergeCells("B1:G1");
   hsnSheet.getCell("B1").value = "Gross Sales";
-
   hsnSheet.mergeCells("H1:M1");
   hsnSheet.getCell("H1").value = "Refund/Sale Return Amount";
-
   hsnSheet.mergeCells("N1:S1");
   hsnSheet.getCell("N1").value = "Net Sales";
 
-  // Sub-headers row 2
   col = 2;
-  subHeaders.forEach((header) => {
-    hsnSheet.getCell(2, col++).value = header;
-  });
+  subHeaders.forEach((header) => { hsnSheet.getCell(2, col++).value = header; });
+  subHeaders.forEach((header) => { hsnSheet.getCell(2, col++).value = header; });
+  subHeaders.forEach((header) => { hsnSheet.getCell(2, col++).value = header; });
 
-  subHeaders.forEach((header) => {
-    hsnSheet.getCell(2, col++).value = header;
-  });
-
-  subHeaders.forEach((header) => {
-    hsnSheet.getCell(2, col++).value = header;
-  });
-
-  // Style headers with all borders (rows 1 & 2, columns 1-19)
   [1, 2].forEach((rowNum) => {
     const row = hsnSheet.getRow(rowNum);
     for (let col = 1; col <= 19; col++) {
       const cell = row.getCell(col);
       cell.font = { bold: true, color: { argb: "FFFFFFFF" } };
-      cell.fill = {
-        type: "pattern",
-        pattern: "solid",
-        fgColor: { argb: "FF4472C4" },
-      };
+      cell.fill = { type: "pattern", pattern: "solid", fgColor: { argb: "FF4472C4" } };
       cell.alignment = { vertical: "middle", horizontal: "center" };
-      cell.border = {
-        top: { style: "thin" },
-        left: { style: "thin" },
-        bottom: { style: "thin" },
-        right: { style: "thin" },
-      };
+      cell.border = { top: { style: "thin" }, left: { style: "thin" }, bottom: { style: "thin" }, right: { style: "thin" } };
     }
   });
 
-  // Add data rows
   currentRow = 3;
   hsnPivot.forEach((pivot) => {
     hsnSheet.getCell(currentRow, 1).value = pivot.hsn;
@@ -1025,56 +938,36 @@ async function createExcelWorkbook(
     currentRow++;
   });
 
-  // Add side borders to data rows
   for (let row = 3; row < currentRow; row++) {
     for (let col = 1; col <= 19; col++) {
-      const cell = hsnSheet.getCell(row, col);
-      cell.border = {
-        left: { style: "thin" },
-        right: { style: "thin" },
-      };
+      hsnSheet.getCell(row, col).border = { left: { style: "thin" }, right: { style: "thin" } };
     }
   }
 
-  // Add grand total row
   const hsnTotalRow = currentRow;
   hsnSheet.getCell(hsnTotalRow, 1).value = "Grand Total";
   hsnSheet.getCell(hsnTotalRow, 1).font = { bold: true };
-
   for (let col = 2; col <= 19; col++) {
     let sum = 0;
-    for (let row = 3; row < hsnTotalRow; row++) {
-      sum += Number(hsnSheet.getCell(row, col).value || 0);
-    }
+    for (let row = 3; row < hsnTotalRow; row++) sum += Number(hsnSheet.getCell(row, col).value || 0);
     hsnSheet.getCell(hsnTotalRow, col).value = Number(sum.toFixed(2));
     hsnSheet.getCell(hsnTotalRow, col).font = { bold: true };
   }
-
-  // Add all borders to grand total row
   for (let col = 1; col <= 19; col++) {
-    const cell = hsnSheet.getCell(hsnTotalRow, col);
-    cell.border = {
-      top: { style: "thin" },
-      left: { style: "thin" },
-      bottom: { style: "thin" },
-      right: { style: "thin" },
-    };
+    hsnSheet.getCell(hsnTotalRow, col).border = { top: { style: "thin" }, left: { style: "thin" }, bottom: { style: "thin" }, right: { style: "thin" } };
   }
 
   return workbook;
 }
 
 /**
- * Core function to generate tax report for a date range
- */
-/**
- * Core function to generate tax report for a date range
- * Accepts a single storeId or an array of storeIds for combined reports
+ * Core function to generate tax report for a date range.
+ * Accepts a single storeId or an array of storeIds for combined reports.
  */
 export async function generateTaxReport(
   storeIds: string | string[],
-  startDate: Date,
-  endDate: Date,
+  startDate: string,
+  endDate: string,
 ): Promise<{
   workbook: ExcelJS.Workbook;
   salesRows: SalesRow[];
@@ -1084,10 +977,9 @@ export async function generateTaxReport(
 }> {
   const storeIdArray = Array.isArray(storeIds) ? storeIds : [storeIds];
 
-  console.log(`📅 Generating report from ${startDate.toDateString()} to ${endDate.toDateString()}`);
+  console.log(`📅 Generating report from ${startDate} to ${endDate}`);
   console.log(`🏪 Stores: ${storeIdArray.join(", ")}`);
 
-  // Step 1: Process Sales Orders from all stores
   console.log("\n📊 Step 1: Processing Sales Orders...");
   const allSalesRows: SalesRow[] = [];
   for (const storeId of storeIdArray) {
@@ -1100,7 +992,6 @@ export async function generateTaxReport(
   allSalesRows.forEach((row, i) => (row.srNo = i + 1));
   console.log(`✅ Total sales line items: ${allSalesRows.length}`);
 
-  // Step 2: Process Sales Return Orders from all stores
   console.log("\n📊 Step 2: Processing Sales Return Orders...");
   const allReturnRows: SalesReturnRow[] = [];
   for (const storeId of storeIdArray) {
@@ -1115,17 +1006,14 @@ export async function generateTaxReport(
   allReturnRows.forEach((row, i) => (row.srNo = i + 1));
   console.log(`✅ Total return line items: ${allReturnRows.length}`);
 
-  // Step 3: Generate State Pivot
   console.log("\n📊 Step 3: Generating State Wise Report...");
   const statePivot = generateStatePivot(allSalesRows, allReturnRows);
   console.log(`✅ Generated data for ${statePivot.length} states`);
 
-  // Step 4: Generate HSN Pivot
   console.log("\n📊 Step 4: Generating HSN Wise Report...");
   const hsnPivot = generateHSNPivot(allSalesRows, allReturnRows);
   console.log(`✅ Generated data for ${hsnPivot.length} HSN codes`);
 
-  // Step 5: Create Excel Workbook
   console.log("\n📊 Step 5: Creating Excel Workbook...");
   const workbook = await createExcelWorkbook(allSalesRows, allReturnRows, statePivot, hsnPivot);
   console.log("✅ Excel workbook created");

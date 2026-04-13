@@ -521,6 +521,7 @@ import {
 import { onDocumentWritten } from "firebase-functions/firestore";
 import { db } from "../../firebaseAdmin";
 import { SHARED_STORE_IDS } from "../../config";
+import { toCamelCase } from "../../helpers";
 
 type InventoryStatus = "NotExists" | "Start" | "Dispatched" | "End" | "Exception";
 
@@ -1005,6 +1006,16 @@ export const updateOrderCounts = onDocumentWritten(
         null,
         newStatus ?? null,
       );
+
+      try {
+        const newField = toCamelCase(newStatus);
+        await change.after.ref.update({
+          [`${newField}At`]: FieldValue.serverTimestamp(),
+        });
+      } catch (error) {
+        console.error(`Failed to write "${newStatus}"At for order ${newOrder.name ?? newOrder.orderId}:`, error);
+      }
+
       return;
     }
 
@@ -1032,6 +1043,15 @@ export const updateOrderCounts = onDocumentWritten(
         console.log(`✅ Updated counts: ${oldStatus} → ${newStatus}`);
       } catch (error) {
         console.error(`❌ Failed to update counts:`, error);
+      }
+
+      try {
+        const newField = toCamelCase(newStatus);
+        await change.after.ref.update({
+          [`${newField}At`]: FieldValue.serverTimestamp(),
+        });
+      } catch (error) {
+        console.error(`Failed to write "${newStatus}"At for order ${newOrder.name ?? newOrder.orderId}:`, error);
       }
     } else {
       console.log(`⏭️ No status change for order ${orderId}`);

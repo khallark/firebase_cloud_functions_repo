@@ -99,46 +99,32 @@ import { Timestamp } from "firebase-admin/firestore";
 export type LotStageStatus = "PENDING" | "IN_PROGRESS" | "COMPLETED" | "BLOCKED";
 export type LotStatus = "ACTIVE" | "COMPLETED" | "CANCELLED" | "ON_HOLD";
 export type OrderStatus = "DRAFT" | "CONFIRMED" | "IN_PRODUCTION" | "COMPLETED" | "CANCELLED";
-export type ReservationStatus = "RESERVED" | "CONSUMED" | "RELEASED";
-export type MaterialTransactionType =
-  | "PURCHASE"
-  | "CONSUMPTION"
-  | "ADJUSTMENT"
-  | "RETURN"
-  | "RESERVATION";
 
-// All possible stage names — loosely coupled, just strings on the lot
+/** Only two transaction types remain — no reservation / consumption / return. */
+export type MaterialTransactionType = "PURCHASE" | "ADJUSTMENT";
+
 export type StageName =
-  | "DESIGN"
-  | "FRAMING"
-  | "SAMPLING"
-  | "CUTTING"
-  | "PRINTING"
-  | "EMBROIDERY"
-  | "STITCHING"
-  | "WASHING"
-  | "FINISHING"
-  | "PACKING";
+  | "DESIGN" | "FRAMING" | "SAMPLING" | "CUTTING"
+  | "PRINTING" | "EMBROIDERY" | "STITCHING"
+  | "WASHING" | "FINISHING" | "PACKING";
 
 // ============================================================================
-// STAGE CONFIG  (/{businessId}/production_stage_config/{stageId})
-// Seed data — defines available stages for the business.
-// Lots copy the stage NAME only, not the ID. Loose coupling.
+// STAGE CONFIG  (users/{businessId}/production_stage_config/{stageId})
 // ============================================================================
 
 export interface ProductionStageConfig {
   id: string;
   name: StageName;
-  label: string; // "Embroidery", "Color Cut", etc.
+  label: string;
   description: string;
-  defaultDurationDays: number; // used to auto-suggest plannedDates at lot creation
+  defaultDurationDays: number;
   canBeOutsourced: boolean;
-  sortOrder: number; // display order in the stage picker UI
+  sortOrder: number;
   createdAt: Timestamp;
 }
 
 // ============================================================================
-// BUYER  (/{businessId}/buyers/{buyerId})
+// BUYER  (users/{businessId}/buyers/{buyerId})
 // ============================================================================
 
 export interface Buyer {
@@ -155,58 +141,89 @@ export interface Buyer {
 }
 
 // ============================================================================
-// PRODUCT  (/{businessId}/b2bProducts/{productId})
-// The finished garment SKU — not raw material.
+// PRODUCT  (users/{businessId}/b2bProducts/{productId})
 // ============================================================================
 
 export interface Product {
   id: string;
   name: string;
   sku: string;
-  category: string; // "Tshirt", "Denim", "Cargo Pants", etc.
+  category: string;
   description: string | null;
-  defaultStages: StageName[]; // suggested stage sequence for this product type
+  defaultStages: StageName[];
   isActive: boolean;
   createdAt: Timestamp;
   updatedAt: Timestamp;
 }
 
 // ============================================================================
-// BOM (Bill of Materials)  (/{businessId}/bom/{bomId})
-// One doc per product-material combination.
-// Flat — query by productId to get all materials for a product.
+// BOM — RESTRUCTURED  (users/{businessId}/bom/{bomId})
+//
+// One BOM doc per product.  At most one active BOM per product at any time.
+// Each BOM defines which raw materials are consumed at which stage.
+// Same material may appear in multiple stages.
 // ============================================================================
 
-export interface BOMEntry {
+export interface BOMStageItem {
+  materialId: string;
+  materialName: string;     // denormalized
+  materialUnit: string;     // denormalized: "metres", "kg", etc.
+  quantityPerPiece: number; // how much of this material per finished piece
+  wastagePercent: number;   // buffer % added on top when snapshotting
+}
+
+export interface BOMStage {
+  stage: StageName;
+  materials: BOMStageItem[];
+}
+
+export interface BOM {
   id: string;
   productId: string;
-  productName: string; // denormalized
-  productSku: string; // denormalized
-  materialId: string;
-  materialName: string; // denormalized
-  materialUnit: string; // denormalized: "metres", "pieces", "grams"
-  quantityPerPiece: number; // e.g. 1.2 (metres of fabric per tshirt)
-  consumedAtStage: StageName; // which stage consumes this material
-  wastagePercent: number; // e.g. 5 → add 5% buffer when reserving
+  productName: string;  // denormalized
+  productSku: string;   // denormalized
+  stages: BOMStage[];   // ordered list of stages with their material requirements
   isActive: boolean;
   createdAt: Timestamp;
   updatedAt: Timestamp;
 }
 
 // ============================================================================
-// RAW MATERIAL  (/{businessId}/raw_materials/{materialId})
+// LOT BOM SNAPSHOT  (embedded inside Lot — not a separate collection)
+//
+// A snapshot of the BOM is taken at the moment a lot is confirmed / created.
+// This freezes the material requirements regardless of future BOM edits.
+// ============================================================================
+
+export interface LotBOMItem {
+  materialId: string;
+  materialName: string;
+  materialUnit: string;
+  quantityPerPiece: number;
+  wastagePercent: number;
+  totalQuantity: number;  // quantityPerPiece × lotQuantity × (1 + wastagePercent/100)
+}
+
+export interface LotBOMStage {
+  stage: StageName;
+  materials: LotBOMItem[];
+}
+
+// ============================================================================
+// RAW MATERIAL  (users/{businessId}/raw_materials/{materialId})
+//
+// No reservedStock field anymore.  availableStock === totalStock always.
 // ============================================================================
 
 export interface RawMaterial {
   id: string;
   name: string;
   sku: string;
-  unit: string; // "metres", "pieces", "kg", "grams"
-  category: string; // "Fabric", "Trim", "Packaging", "Thread"
+  unit: string;
+  category: string;
   totalStock: number;
-  reservedStock: number; // sum of all RESERVED material_reservations
-  availableStock: number; // totalStock - reservedStock (kept in sync via trigger)
-  reorderLevel: number; // alert when availableStock drops below this
+  availableStock: number;  // kept in sync by add-stock / adjust-stock; no reservations
+  reorderLevel: number;
   supplierName: string | null;
   isActive: boolean;
   createdAt: Timestamp;
@@ -214,54 +231,33 @@ export interface RawMaterial {
 }
 
 // ============================================================================
-// MATERIAL RESERVATION  (/{businessId}/material_reservations/{reservationId})
-// Created when a lot is confirmed. One doc per lot-material combination.
-// ============================================================================
-
-export interface MaterialReservation {
-  id: string;
-  lotId: string;
-  lotNumber: string; // denormalized
-  orderId: string;
-  orderNumber: string; // denormalized
-  materialId: string;
-  materialName: string; // denormalized
-  materialUnit: string; // denormalized
-  quantityRequired: number; // BOM qty × lot quantity + wastage buffer
-  quantityConsumed: number; // incremented when stage is marked complete
-  consumedAtStage: StageName;
-  status: ReservationStatus;
-  createdAt: Timestamp;
-  updatedAt: Timestamp;
-}
-
-// ============================================================================
-// MATERIAL TRANSACTION  (/{businessId}/material_transactions/{txId})
-// Audit log for every raw material stock movement.
+// MATERIAL TRANSACTION  (users/{businessId}/material_transactions/{txId})
+//
+// Append-only audit log.  Only PURCHASE (add-stock) and ADJUSTMENT (adjust-stock)
+// are written now.  Reservation / consumption / return transactions are gone.
 // ============================================================================
 
 export interface MaterialTransaction {
   id: string;
   materialId: string;
-  materialName: string; // denormalized
+  materialName: string;
   type: MaterialTransactionType;
-  quantity: number; // positive = in, negative = out
-  stockBefore: number | null;
-  stockAfter: number | null;
-  referenceId: string | null; // lotId, reservationId, PO number, etc.
-  referenceType: "LOT" | "PURCHASE_ORDER" | "ADJUSTMENT" | null;
+  quantity: number;
+  stockBefore: number;
+  stockAfter: number;
+  referenceId: string | null;
+  referenceType: "PURCHASE_ORDER" | "ADJUSTMENT" | null;
   note: string | null;
   createdBy: string;
   createdAt: Timestamp;
 }
 
 // ============================================================================
-// LOT STAGE  (embedded in Lot document — not a separate collection)
-// The full TNA is embedded here. No separate tna collection needed.
+// LOT STAGE  (embedded in Lot)
 // ============================================================================
 
 export interface LotStage {
-  sequence: number; // 1-based
+  sequence: number;
   stage: StageName;
   plannedDate: Timestamp;
   actualDate: Timestamp | null;
@@ -270,47 +266,44 @@ export interface LotStage {
   outsourceVendorName: string | null;
   outsourceSentAt: Timestamp | null;
   outsourceReturnedAt: Timestamp | null;
-  completedBy: string | null; // worker/supervisor name
+  completedBy: string | null;
   note: string | null;
 }
 
 // ============================================================================
-// LOT  (/{businessId}/lots/{lotId})
-// Core production unit. Each lot = one batch of one SKU/color moving
-// through its own defined stage pipeline.
+// LOT  (users/{businessId}/lots/{lotId})
 // ============================================================================
 
 export interface Lot {
   id: string;
-  lotNumber: string; // human-readable, e.g. "877"
+  lotNumber: string;
 
-  // Order linkage (denormalized for queryability)
   orderId: string;
   orderNumber: string;
 
-  // Buyer (denormalized)
   buyerId: string;
   buyerName: string;
 
-  // Product (denormalized)
   productId: string;
   productName: string;
   productSku: string;
   color: string;
-  size: string | null; // if lot is size-specific
-
+  size: string | null;
   quantity: number;
 
-  // Stage pipeline — defined at creation, fully flexible per lot
   stages: LotStage[];
   currentStage: StageName;
-  currentSequence: number; // 1-based index into stages[]
+  currentSequence: number;
   totalStages: number;
 
-  // Dispatch tracking
-  shipDate: Timestamp; // committed to buyer
-  isDelayed: boolean; // true if any upcoming stage is behind plannedDate
-  delayDays: number; // how many days behind (0 if on track)
+  shipDate: Timestamp;
+  isDelayed: boolean;
+  delayDays: number;
+
+  /** Which predefined BOM doc was used.  null if the user supplied a custom BOM. */
+  bomId: string | null;
+  /** Snapshot of material requirements captured at lot creation time. */
+  bomSnapshot: LotBOMStage[];
 
   status: LotStatus;
   createdBy: string;
@@ -319,10 +312,7 @@ export interface Lot {
 }
 
 // ============================================================================
-// DRAFT LOT INPUT
-// Stored on the Order doc while status is DRAFT.
-// Set to null by confirmOrder once lots are created.
-// Not a collection — just an embedded array on the order.
+// DRAFT LOT INPUT  (embedded array on Order while status === DRAFT)
 // ============================================================================
 
 export interface DraftLotInput {
@@ -334,33 +324,37 @@ export interface DraftLotInput {
   quantity: number;
   stages: Array<{
     stage: StageName;
-    plannedDate: string; // ISO string — converted to Timestamp by confirmOrder
+    plannedDate: string;  // ISO string
     isOutsourced: boolean;
     outsourceVendorName: string | null;
   }>;
+  /** ID of the predefined BOM to use.  null means the user is supplying a custom BOM. */
+  bomId: string | null;
+  /**
+   * Inline BOM supplied by the user when bomId is null.
+   * Populated from the order-creation UI.  May be an empty array if the
+   * user chose not to track materials for this lot.
+   */
+  customBOM: LotBOMStage[] | null;
 }
 
 // ============================================================================
-// ORDER  (/{businessId}/orders/{orderId})
-// Parent of lots. Buyer-facing entity.
+// ORDER  (users/{businessId}/orders/{orderId})
 // ============================================================================
 
 export interface Order {
   id: string;
-  orderNumber: string; // e.g. "ORD-2026-001"
+  orderNumber: string;
 
   buyerId: string;
-  buyerName: string; // denormalized
-  buyerContact: string; // denormalized
+  buyerName: string;
+  buyerContact: string;
 
-  shipDate: Timestamp; // overall ship date for the order
+  shipDate: Timestamp;
   deliveryAddress: string;
 
-  // Only present while status === "DRAFT".
-  // Set to null by confirmOrder once lots are created.
   draftLots: DraftLotInput[] | null;
 
-  // Aggregated lot stats (kept in sync via onDocumentWritten on lots)
   totalLots: number;
   totalQuantity: number;
   lotsCompleted: number;
@@ -375,22 +369,20 @@ export interface Order {
 }
 
 // ============================================================================
-// FINISHED GOODS  (/{businessId}/finished_goods/{finishedGoodId})
-// Created when a lot's final stage (PACKING) is marked complete.
-// Ready for dispatch.
+// FINISHED GOOD  (users/{businessId}/finished_goods/{finishedGoodId})
 // ============================================================================
 
 export interface FinishedGood {
   id: string;
   lotId: string;
-  lotNumber: string; // denormalized
+  lotNumber: string;
   orderId: string;
-  orderNumber: string; // denormalized
+  orderNumber: string;
   buyerId: string;
-  buyerName: string; // denormalized
+  buyerName: string;
   productId: string;
-  productName: string; // denormalized
-  productSku: string; // denormalized
+  productName: string;
+  productSku: string;
   color: string;
   size: string | null;
   quantity: number;
@@ -399,24 +391,22 @@ export interface FinishedGood {
   packedAt: Timestamp;
   dispatchedAt: Timestamp | null;
   isDispatched: boolean;
-  courierName: string | null; // handoff to Majime
-  awb: string | null; // filled by Majime after dispatch
+  courierName: string | null;
+  awb: string | null;
   createdAt: Timestamp;
   updatedAt: Timestamp;
 }
 
 // ============================================================================
-// LOT STAGE HISTORY  (/{businessId}/lot_stage_history/{historyId})
-// Immutable audit log — one doc written every time a lot moves stages.
-// Separate from the lot doc so the lot stays lean.
+// LOT STAGE HISTORY  (users/{businessId}/lot_stage_history/{historyId})
 // ============================================================================
 
 export interface LotStageHistory {
   id: string;
   lotId: string;
-  lotNumber: string; // denormalized
+  lotNumber: string;
   orderId: string;
-  fromStage: StageName | null; // null for first stage entry
+  fromStage: StageName | null;
   toStage: StageName;
   fromSequence: number | null;
   toSequence: number;

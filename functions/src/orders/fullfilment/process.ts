@@ -54,30 +54,23 @@ export const processFulfillmentTask = onRequest(
         return;
       }
 
+      if (job.status === "failed") {
+        res.json({ alreadyDone: true });
+        return;
+      }
+
       function httpRetryable(status: number): boolean {
         return status === 408 || status === 429 || (status >= 500 && status <= 599);
       }
 
       // ✅ Helper function to mark job as failed (uses batch for atomicity)
-      const markJobFailed = async (errorCode: string, errorMessage: string) => {
+      const markJobFailed = async (errorCode: string, errorMessage: string, wasProcessing = false) => {
         const batch = db.batch();
-
-        batch.set(
-          jobRef,
-          {
-            status: "failed",
-            errorCode,
-            errorMessage: errorMessage.slice(0, 400),
-            updatedAt: FieldValue.serverTimestamp(),
-          },
-          { merge: true },
-        );
-
+        batch.set(jobRef, { status: "failed", errorCode, errorMessage: errorMessage.slice(0, 400), updatedAt: FieldValue.serverTimestamp() }, { merge: true });
         batch.update(summaryRef, {
-          processing: FieldValue.increment(-1),
+          ...(wasProcessing ? { processing: FieldValue.increment(-1) } : {}),
           failed: FieldValue.increment(1),
         });
-
         await batch.commit();
         await maybeCompleteSummary(summaryRef);
       };
@@ -112,7 +105,10 @@ export const processFulfillmentTask = onRequest(
         const orderData = order.data() as any;
 
         if (!orderData.lastPackedAt) {
-          await markJobFailed("order_not_packed", `Business not authorized to process the order ${orderData.name} because its not packed`);
+          await markJobFailed(
+            "order_not_packed",
+            `Business not authorized to process the order ${orderData.name} because its not packed`,
+          );
           res.status(403).json({ error: "order_is_not_packed_yet" });
           return;
         }
@@ -333,7 +329,7 @@ export const processFulfillmentTask = onRequest(
         }
       } catch (validationError: any) {
         console.error("Validation error:", validationError);
-        await markJobFailed("validation_error", validationError.message || "Validation failed");
+        await markJobFailed("validation_error", validationError.message || "Validation failed", true);
         res.status(500).json({ error: "validation_failed", details: validationError.message });
         return;
       }

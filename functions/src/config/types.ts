@@ -183,6 +183,7 @@ export type UPC =
 
       putAway: "none" | "outbound" | null;
 
+      creditNoteRef: string | null;
       productId: string;
       warehouseId: string;
       zoneId: string;
@@ -204,6 +205,7 @@ export type UPC =
 
       putAway: "inbound";
 
+      creditNoteRef: string | null;
       productId: string;
       warehouseId: string | null;
       zoneId: string | null;

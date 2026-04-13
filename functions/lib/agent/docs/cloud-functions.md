@@ -367,14 +367,15 @@ What it does:
 Called by: `POST /api/business/generate-gross-profit-report` Next.js route.
 Frontend consumption: `onSnapshot` on `users/{businessId}.grossProfitData`.
 
-Calculates seven metric rows in parallel:
+Calculates eight metric rows in parallel:
 1. **Sale**: all orders in date range by `createdAt`. Excludes ENDORA/STYLE 05 single-vendor orders.
 2. **Sale Return**: RTO Closed (by `lastStatusUpdate`), Pending Refunds (by `pendingRefundsAt`), Cancellation Requested (by `cancellationRequestedAt`), Cancelled (by `lastStatusUpdate` if `cancellationRequestedAt` absent).
 3. **Purchase**: GRNs by `createdAt` date range. Iterates each GRN's `items[]` array. For each item, `taxable = item.unitCost × item.receivedQty` (unit cost is ex-tax). Tax rate is fetched per SKU from `users/{businessId}/products/{sku}.taxRate` via a single `db.getAll()` batch call across all unique SKUs in the result set. Tax is applied **forward** (`taxable × taxRate / 100`), split equally into CGST + SGST (all purchases assumed intra-state Punjab — no IGST). `net = taxable + cgst + sgst`.
-4. **Opening Stock**: `inventory_snapshots` for `startDate - 1 day`. Fetches product `price` (COGS) per product.
-5. **Closing Stock**: `inventory_snapshots` for `endDate`.
-6. **Lost**: orders with `customStatus == "Lost"` by `lastStatusUpdate`.
-7. **Gross Profit**: sum of all above (signs already applied — Sale Return, Purchase, Opening Stock, Lost are negative).
+4. **Credit Notes**: completed Credit Notes by `completedAt` in date range. Queries `users/{businessId}/credit_notes` where `status == "completed"`. Value = sum of `items[].unitPrice × items[].quantity` across all matched docs. Represents stock that left the warehouse without generating revenue — treated as a negative row.
+5. **Opening Stock**: `inventory_snapshots` for `startDate - 1 day`. Fetches product `price` (COGS) per product.
+6. **Closing Stock**: `inventory_snapshots` for `endDate`.
+7. **Lost**: orders with `customStatus == "Lost"` by `lastStatusUpdate`.
+8. **Gross Profit**: sum of all above (signs already applied — Sale Return, Purchase, Credit Notes, Opening Stock, Lost are negative).
 
 Tax calculation (Sale / Sale Return / Lost rows): reverse-calculates from `total_price` (tax-inclusive) using 5% rate to extract taxable + IGST/CGST/SGST. IGST vs CGST+SGST determined by `shipping_address.province == "Punjab"`. Purchase row uses forward tax calculation (ex-tax unit cost × per-product tax rate), always CGST+SGST (Punjab).
 
@@ -403,7 +404,7 @@ Creates a tracking doc in `users/{businessId}/tax_reports/{docId}`. Enqueues a C
 **`generateCustomTaxReport`** [onRequest, Cloud Task worker, authenticated with TASKS_SECRET]:
 Generates a 4-sheet Excel workbook:
 1. **Sales Report**: one row per line item, per order created in range. Columns: Bill No., Date, Customer, State, Courier, Payment Gateway, Item Name, Qty, AWB, MRP, Discount, Shipping, Sale Price, HSN, Tax Rate, Taxable, IGST, SGST, CGST, Vendor, State/Courier/Gateway Amount Due.
-2. **Sales Return Report**: same but for return events (RTO Closed, Pending Refunds, Cancellation Requested, Cancelled).
+2. **Sales Return Report**: same but for return events (RTO Closed, Pending Refunds, Cancellation Requested, Cancelled). Columns: same structure as Sales Report plus a **QC Status** column at the end (col 23), sourced from `raw.line_items[].qc_status`. This field is populated by the QC test flow on DTO In Transit / DTO Delivered orders. Empty string for RTO Closed and Cancelled orders that never went through QC.
 3. **State Wise Tax Report**: pivot of gross sales + returns by state with net columns.
 4. **HSN Wise Tax Report**: pivot by HSN code.
 
@@ -418,6 +419,33 @@ Called by: Dashboard Gross Profit table → Purchase row download button (direct
 - Queries `users/{businessId}/grns` by `completedAt` in date range.
 - For each GRN: builds one row per item with `{billNumber, dateOfCompletion, grnNumber, productSku, hsn: "6109", taxRate: 5, unitPrice, quantity, taxableAmount, sgst, cgst, igst, totalAmount}`.
 - Builds Excel, uploads to Storage, returns `{downloadUrl, rowCount}`.
+
+### Credit Notes API Routes (Next.js)
+
+Four Next.js API routes manage the Credit Note lifecycle. No Cloud Function involved — all logic runs in the API routes directly using Firebase Admin SDK. Credit Notes have no draft state — they are created and completed atomically in a single call.
+
+**`POST /api/business/credit-notes/complete`** (unified create + complete):
+- Pre-flight outside transaction: batch-reads all UPC docs via `db.getAll()`. Validates each is `putAway: "none"`. Returns 400 immediately if any fail — no locks acquired yet.
+- Transaction: increments `users/{businessId}.creditNoteCount` to generate `creditNoteNumber` (CN-001, CN-002...). Creates the CN doc with `status: "completed"` and `completedAt` set immediately — no draft state. Sets each UPC `putAway → "outbound"` and tags `creditNoteRef: cnId` on each UPC doc.
+- Setting UPCs to `outbound` triggers `onUpcWritten` `none → outbound` branch: decrements `inShelfQuantity` and placement quantity.
+- UPCs are then physically removed from the put-away page (Outbound → "To be Removed" tab) which sets them to `null`.
+- When put-away sets these UPCs `outbound → null`, `onUpcWritten` checks `creditNoteRef`: present → `inventory.deduction++` only (no `blockedStock` touch, UPC was never order-blocked); absent → `inventory.autoDeduction++, blockedStock--` (normal order dispatch).
+- Body: `{businessId, partyId, partyName, warehouseId, reason, notes, items[], totalItems, totalValue}`.
+
+**`POST /api/business/credit-notes/dispatch-upcs`**:
+- Called from the put-away page "To be Removed" tab Dispatch button.
+- Validates each UPC is `putAway: "outbound"` AND has `creditNoteRef` set. Rejects order-dispatch UPCs (no `creditNoteRef`) — they must go through fulfillment.
+- Sets each validated UPC `putAway → null`. `onUpcWritten` fires and increments `inventory.deduction++`.
+- Capped at 100 UPCs per request.
+- Body: `{businessId, upcIds[]}`.
+
+**`POST /api/business/warehouse/credit-notes/download-bill`**:
+- Generates a PDF credit note bill using Puppeteer + `@sparticuz/chromium`.
+- Fetches: CN doc, Party doc (supplier receiving the CN), business doc.
+- **Opposite of GRN bill**: "Billed By" = Business (issuing the CN), "Billed To" = Party/Supplier. Bank details shown are the **business's** bank (so supplier knows where to send the refund).
+- Tax rates come directly from `CreditNoteItem.taxRate` — no product fetch needed (rate stored at CN creation time). Intra/inter-state determined by party's address state vs Punjab.
+- Returns PDF binary with `Content-Disposition: attachment`.
+- Body: `{businessId, creditNoteId}`.
 
 ### `inventorySnapshotOfADate` [onRequest, no auth guard]
 
@@ -459,10 +487,14 @@ The most critical warehouse trigger. Uses exponential backoff retry wrapper (`ru
 3. Transitions (ALL READS BEFORE ALL WRITES in transaction):
    - `inbound → none` (put away onto shelf): increments product `inShelfQuantity`, creates placement if not exists (sets `quantity: 1`) or increments `quantity`.
    - `none → outbound` (picked for dispatch): decrements product `inShelfQuantity`, decrements placement `quantity`.
-   - `* → null` (dispatched/sold): increments `inventory.autoDeduction`, decrements `inventory.blockedStock`.
+   - `outbound → null` (order dispatch OR credit note finalisation via put-away page):
+     - If UPC has `creditNoteRef` set → increments `inventory.deduction` only (credit note, never blocked by an order).
+     - If UPC has no `creditNoteRef` → increments `inventory.autoDeduction`, decrements `inventory.blockedStock` (normal order dispatch).
+   - `none → null` (direct removal, safety fallback): increments `inventory.deduction` only.
+   - Any other `before → null`: logs a warning, no inventory update applied.
    - `* → inbound` (returned, but NOT from `outbound` or `none` — those are transient states): increments `inventory.autoAddition`.
 
-**Key connection**: When `processFulfillmentTask` sets UPCs from `outbound → null`, this trigger fires and performs the `autoDeduction + blockedStock decrement`. This is why `updateOrderCounts` skips the `Ready To Dispatch → Dispatched` blocked stock transition — to avoid double-counting.
+**Key connection**: When `processFulfillmentTask` sets UPCs from `outbound → null`, this trigger fires. It checks `creditNoteRef` on the UPC: absent → `autoDeduction + blockedStock--` (order dispatch); present → `deduction++` only (credit note finalised via put-away). This is why `updateOrderCounts` skips the `Ready To Dispatch → Dispatched` blocked stock transition — to avoid double-counting with the UPC trigger.
 
 ### `onPlacementWritten` [onDocumentWritten: users/{businessId}/placements/{placementId}]
 
@@ -503,17 +535,15 @@ Each task processes one chunk of 500 documents from the target collection (`plac
 
 Fires on every business product write. Handles two scenarios:
 
-**SCENARIO 1 — New variant mapping added** (exactly one more item in `mappedVariants` than before):
-1. Queries all orders in `[New, Confirmed, Ready To Dispatch]` from the newly mapped store (with vendor filtering for shared stores / OWR logic).
-2. Counts items matching the new `variantId` across those orders → `blockedItemsCount`.
-3. Increments `inventory.blockedStock` by `blockedItemsCount` in a transaction.
-4. Fetches `inventoryItemId` from the store product variant. Calls Shopify GraphQL:
-   - `inventoryItemUpdate` to enable tracking.
-   - `inventorySetQuantities` to set the available stock quantity to the newly calculated value.
+**SCENARIO 1 — Mapping array changed** (any addition, removal, or swap in `mappedVariants`):
+- Detected by comparing before/after arrays via a Set diff — handles length changes and same-length swaps, not just ±1 changes.
+- **Full recompute**: queries `[New, Confirmed, Ready To Dispatch]` orders across every mapping in `afterMappedVariants` (with vendor filtering for shared stores / OWR logic). Sums all matching line item quantities across all mappings. Overwrites `blockedStock` with this total — no incremental delta math. This prevents drift over time.
+- Writes updated `blockedStock` in a transaction, computes new `availableStock`, then syncs to Shopify for all current mappings (skips `SHARED_STORE_ID`).
+- Returns early after Scenario 1 completes — Scenario 2 does not run in the same invocation to avoid double Shopify sync.
 
 **SCENARIO 2 — Available stock changed** (`beforeAvailable !== availableStock`):
 - `availableStock = physicalStock − blockedStock` where `physicalStock = openingStock + inwardAddition − deduction + autoAddition − autoDeduction`.
-- For each mapped variant (skips the main `SHARED_STORE_ID`): fetches `inventoryItemId`, calls `inventoryItemUpdate` (ensure tracking), then `inventorySetQuantities` (absolute overwrite with `ignoreCompareQuantity: true`).
+- For each mapped variant (skips `SHARED_STORE_ID`): fetches `inventoryItemId`, calls `inventoryItemUpdate` (ensure tracking), then `inventorySetQuantities` (absolute overwrite with `ignoreCompareQuantity: true`).
 - 150ms pause between tracking mutation and set, 200ms pause between variants (rate limiting).
 
 **This is the link between warehouse operations and Shopify inventory**: Every time a UPC is put away, picked up, dispatched, or returned (all via `onUpcWritten` → product inventory fields change → `onProductWritten` fires → Shopify inventory updates).
@@ -568,14 +598,23 @@ Only reacts to `role === "user"` messages (ignores own assistant writes to preve
 
 Flow:
 1. Sets session `status: "generating"`, `generatingStartedAt: now`.
-2. Fetches full message history ordered by `createdAt asc`.
-3. Slices off the last message (the current one). Maps history to Gemini's `{role: "user"|"model", parts: [{text}]}` format.
-4. Calls Gemini 2.5 Flash via `@google/genai` SDK with the full system prompt (injected with `businessId`). Temperature 0.3, max 1024 tokens. Falls back to a default error message if Gemini fails.
-5. Writes assistant reply as a new doc in the messages subcollection.
-6. Sets session `status: "idle"`, clears `generatingStartedAt`.
-7. On any error: sets `status: "error"`.
+2. Fetches full message history ordered by `createdAt asc`. Slices off the last message (the current one). Maps history to Gemini's `{role: "user"|"model", parts: [{text}]}` format.
+3. **Agentic tool-calling loop** (`while` capped at `MAX_TOOL_ITERATIONS = 5`):
+   - Calls Gemini 2.5 Flash with full `contents` array, system prompt, tool declarations, temperature 0.3, max 1024 tokens.
+   - If response part is `functionCall`: executes the tool via `executeTool()`, appends `{role: "model", parts: [{functionCall}]}` and `{role: "user", parts: [{functionResponse}]}` to `contents`, loops again.
+   - If response part is `text`: exits loop with the reply.
+   - If iterations exceed cap or no usable part: exits with fallback message.
+4. Writes assistant reply as a new doc in the messages subcollection.
+5. Sets session `status: "idle"`, clears `generatingStartedAt`.
+6. On any error: sets `status: "error"`.
 
-The system prompt is loaded once at cold start from `./docs/routes.md` and `./docs/cloud-functions.md` (injected at module level, cached across warm instances).
+**Tool declarations** (schema-only, passed in `config.tools[].functionDeclarations[]`):
+
+- **`getOrdersByStatus`**: Fetches orders for the business filtered by `customStatus` and date range. If no date range provided, the model is instructed to ask the user before calling. Falls back to today's date if model calls without one anyway. Generates an Excel file of results (order name, status, date/time IST), uploads to Firebase Storage at `majime_agent/getOrdersByStatus/{filename}.xlsx`, returns `{downloadUrl, count}`. The model presents this as a download link. Queried via the `{status}At` Timestamp field on order docs (e.g. `confirmedAt`, `readyToDispatchAt`) — requires Firestore composite index per status field. Limit: 50 orders per store, applied after client-side result collection across all business stores. Tool execution is wrapped in try/catch — errors returned as `{error}` in `functionResponse` so Gemini handles them gracefully.
+
+**System prompt** is loaded once at cold start from `./docs/routes.md` and `./docs/cloud-functions.md` (module-level, cached across warm instances). Today's IST date is injected per-invocation so the model can correctly resolve "today", "this week", etc.
+
+**Migration utility**: `migrateCreditNoteRef` [onRequest] — one-time migration that backfills `creditNoteRef: null` on all existing UPC docs, UPC subcollection logs, and flat `upcsLogs` docs that predate the credit note system. Run with `dryRun=true` first to verify counts.
 
 ---
 
@@ -625,7 +664,9 @@ Template parameters are sent from `shop.whatsappPhoneNumberId` and `shop.whatsap
 - Status update batches: `status_update_batches/{batchId}/jobs/{accountId}` (root-level, not under users)
 - Tax reports: `users/{businessId}/tax_reports/{docId}`
 - Inventory snapshots: `users/{businessId}/inventory_snapshots/{productId}_{date}`
-- UPC logs: `users/{businessId}/upcs/{upcId}/logs/{logId}` AND `users/{businessId}/upcsLogs/{logId}` (flat copy)
+- UPC logs: `users/{businessId}/upcs/{upcId}/logs/{logId}` AND `users/{businessId}/upcsLogs/{logId}` (flat copy). Both include `snapshot.creditNoteRef` field since the credit note system was added.
+- Credit notes: `users/{businessId}/credit_notes/{cnId}`
+- Agent tool output (Excel files): `majime_agent/getOrdersByStatus/{filename}.xlsx` (Firebase Storage)
 - Propagation trackers: `users/{businessId}/propagation_trackers/{propagationId}`
 - Placement logs: `users/{businessId}/placements/{placementId}/logs/{logId}`
 - B2B Material reservations: `users/{businessId}/material_reservations/{reservationId}`

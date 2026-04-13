@@ -187,7 +187,7 @@ function roundTableData(tableData: TableData): void {
 export const generateTableData = onRequest(
   {
     timeoutSeconds: 540, // 9 minutes max
-    memory: "1GiB",
+    memory: "512MiB",
     secrets: [ENQUEUE_FUNCTION_SECRET],
   },
   async (req, res) => {

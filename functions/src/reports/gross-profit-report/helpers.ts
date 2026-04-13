@@ -59,6 +59,8 @@ export async function calcSaleMetric(
   const startTs = Timestamp.fromDate(new Date(formattedStartDate));
   const endTs = Timestamp.fromDate(new Date(formattedEndDate));
 
+  let totalDTORefunded = 0;
+  const dtoDiffs = [];
   for (const storeId of storeIds) {
     const baseQuery = db.collection("accounts").doc(storeId).collection("orders");
 
@@ -122,18 +124,61 @@ export async function calcSaleMetric(
         continue;
       if (!a[order.customStatus]) a[order.customStatus] = [];
       a[order.customStatus].push(order.name);
-      const netPrice = Number(order?.raw?.total_price ?? 0);
+      const netPrice = (() => {
+        if (isReturn && order.customStatus === "DTO Refunded") {
+          const refundedAmount = Number(order?.refundedAmount ?? 0);
+          totalDTORefunded += Number(order?.refundedAmount ?? order?.raw?.total_price ?? 0);
+          const itemWiseTotalDTORefunded = Number(order?.raw?.line_items?.reduce((sum: number, item: any) => sum + Number(item.refundedAmount ?? 0), 0) ?? 0);
+          if (itemWiseTotalDTORefunded !== refundedAmount) dtoDiffs.push(order?.name ?? order?.raw?.name);
+          return Number(order?.refundedAmount ?? order?.raw?.total_price ?? 0);
+        }
+        if (isReturn && order.customStatus === "Pending Refunds") {
+          const items = order?.raw?.line_items
+            ? Array.isArray(order.raw.line_items)
+              ? order.raw.line_items
+              : []
+            : [];
+          const totalMRP = items.reduce(
+            (acc: number, item: any) => acc + Number(item.price ?? 0),
+            0,
+          );
+          return Number(
+            items?.reduce((sum: number, item: any) => {
+              const itemQty = Number(item.quantity || 0);
+              const itemPrice = Number(item.price || 0);
+              const mrp = Number((itemQty * itemPrice).toFixed(2));
+              const discountArr = item.discount_allocations;
+              const discountLinewise = (Array.isArray(discountArr) ? discountArr : []).reduce(
+                (a: number, i: any) => a + Number(i.amount ?? 0),
+                0,
+              );
+              const proportionateShippingPrice = Number(
+                (
+                  (Number(order.raw.total_shipping_price_set.presentment_money.amount ?? 0) * mrp) /
+                  totalMRP
+                ).toFixed(2),
+              );
+              return sum + Number((mrp - discountLinewise + proportionateShippingPrice).toFixed(2));
+            }, 0),
+          );
+        }
+        return Number(order?.raw?.total_price ?? 0);
+      })();
       const isPunjab = order?.raw?.shipping_address?.province === "Punjab";
       const tax = reverseCalculateTax(netPrice, isPunjab);
       const numItems =
         isReturn && ["Pending Refunds", "DTO Refunded"].includes(order.customStatus)
-          ? order?.raw?.line_items
+          ? Number(
+            order?.raw?.line_items
               ?.filter((item: any) => item?.qc_status === "QC Pass")
-              ?.reduce((sum: number, item: any) => sum + Number(item?.quantity ?? 0), 0)
-          : order?.raw?.line_items?.reduce(
+              ?.reduce((sum: number, item: any) => sum + Number(item?.quantity ?? 0), 0),
+          )
+          : Number(
+            order?.raw?.line_items?.reduce(
               (sum: number, item: any) => sum + Number(item?.quantity ?? 0),
               0,
-            );
+            ),
+          );
 
       totalQty += numItems;
       totalNet += netPrice;
@@ -157,6 +202,10 @@ export async function calcSaleMetric(
   }
 
   const sign = isReturn ? -1 : 1;
+  if (isReturn) {
+    console.log(`Total DTO Refunded amount = ${totalDTORefunded}`);
+    console.log(`DTO Refunded diffs: ${dtoDiffs}`);
+  }
   return {
     type: isReturn ? "Sale Return" : "Sale",
     qty: sign * totalQty,
@@ -232,7 +281,11 @@ export async function calcLostMetric(
 }
 
 /**
- * Calculates Purchase metric from GRNs (all assumed Punjab).
+ * Calculates Purchase metric from GRNs.
+ * totalReceivedValue on each GRN item is the TAXABLE (ex-tax) amount.
+ * Tax is applied FORWARD: taxable * taxRate / 100.
+ * Tax rate is fetched per product SKU from users/{businessId}/products/{sku}.
+ * All purchases assumed intra-state Punjab → CGST + SGST, no IGST.
  */
 export async function calcPurchaseMetric(
   businessId: string,
@@ -250,24 +303,109 @@ export async function calcPurchaseMetric(
     .where("createdAt", "<=", endTs)
     .get();
 
+  // Collect all unique SKUs across all GRN items so we can batch-fetch tax rates
+  const skuSet = new Set<string>();
+  for (const doc of snapshot.docs) {
+    const grn = doc.data();
+    for (const item of (grn.items ?? [])) {
+      if (item.sku) skuSet.add(item.sku);
+    }
+  }
+
+  // Batch-fetch product docs to get taxRate per SKU
+  const taxRateMap = new Map<string, number>();
+  if (skuSet.size > 0) {
+    const productRefs = Array.from(skuSet).map((sku) =>
+      db.collection("users").doc(businessId).collection("products").doc(sku)
+    );
+    const productDocs = await db.getAll(...productRefs);
+    for (const doc of productDocs) {
+      if (doc.exists) {
+        taxRateMap.set(doc.id, Number(doc.data()?.taxRate ?? 0));
+      }
+    }
+  }
+
   let totalQty = 0;
-  let totalNet = 0;
+  let totalTaxable = 0;
+  let totalCgst = 0;
+  let totalSgst = 0;
 
   for (const doc of snapshot.docs) {
     const grn = doc.data();
-    totalQty += Number(grn.totalReceivedQty ?? 0);
-    totalNet += Number(grn.totalReceivedValue ?? 0);
+    for (const item of (grn.items ?? [])) {
+      const sku: string = item.sku ?? "";
+      const qty = Number(item.receivedQty ?? 0);
+      // unitCost is the taxable (ex-tax) price per unit
+      const taxable = Number(item.unitCost ?? 0) * qty;
+      const taxRate = taxRateMap.get(sku) ?? 0;
+      const totalTax = round2(taxable * taxRate / 100);
+      const half = round2(totalTax / 2);
+
+      totalQty += qty;
+      totalTaxable += taxable;
+      totalCgst += half;
+      totalSgst += half;
+    }
   }
 
-  const tax = reverseCalculateTax(totalNet, true);
   return {
     type: "Purchase",
     qty: -totalQty,
-    taxable: round2(-tax.taxable),
+    taxable: round2(-totalTaxable),
     igst: 0,
-    cgst: round2(-tax.cgst),
-    sgst: round2(-tax.sgst),
-    net: round2(-totalNet),
+    cgst: round2(-totalCgst),
+    sgst: round2(-totalSgst),
+    net: round2(-(totalTaxable + totalCgst + totalSgst)),
+  };
+}
+
+export async function calcCreditNoteMetric(
+  businessId: string,
+  startDate: string,
+  endDate: string,
+): Promise<MetricRow> {
+  const startTs = Timestamp.fromDate(new Date(`${startDate}T00:00:00+05:30`));
+  const endTs = Timestamp.fromDate(new Date(`${endDate}T23:59:59+05:30`));
+
+  const snapshot = await db
+    .collection('users')
+    .doc(businessId)
+    .collection('credit_notes')
+    .where('status', '==', 'completed')
+    .where('completedAt', '>=', startTs)
+    .where('completedAt', '<=', endTs)
+    .get();
+
+  let totalQty = 0;
+  let totalTaxable = 0;
+  let totalCgst = 0;
+  let totalSgst = 0;
+
+  for (const doc of snapshot.docs) {
+    const cn = doc.data();
+    for (const item of (cn.items ?? [])) {
+      const qty = Number(item.quantity ?? 0);
+      const taxable = Number(item.unitPrice ?? 0) * qty;
+      const taxRate = Number(item.taxRate ?? 0);
+      const totalTax = round2(taxable * taxRate / 100);
+      const half = round2(totalTax / 2);
+
+      totalQty += qty;
+      totalTaxable += taxable;
+      totalCgst += half;
+      totalSgst += half;
+    }
+  }
+
+  return {
+    type: 'Credit Notes',
+    qty: totalQty,
+    taxable: round2(totalTaxable),
+    igst: 0,
+    cgst: round2(totalCgst),
+    sgst: round2(totalSgst),
+    net: round2(totalTaxable + totalCgst + totalSgst),
   };
 }
 

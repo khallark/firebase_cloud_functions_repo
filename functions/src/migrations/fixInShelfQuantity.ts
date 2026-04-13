@@ -43,7 +43,7 @@ export const fixInShelfQuantity = onRequest(
 
           // Commit and start a new batch before hitting the 500 limit
           if (batchCount === 499) {
-            if(!dryRun) await batch.commit();
+            if (!dryRun) await batch.commit();
             batch = db.batch();
             batchCount = 0;
           }
@@ -52,7 +52,7 @@ export const fixInShelfQuantity = onRequest(
 
       // Commit any remaining updates
       if (batchCount > 0) {
-        if(!dryRun) await batch.commit();
+        if (!dryRun) await batch.commit();
       }
 
       res.status(200).json({

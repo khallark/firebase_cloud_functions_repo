@@ -149,7 +149,7 @@ function getDelhiveryDeliveredRange(remDate: Date): { start: Date; end: Date } {
 export const generateRemittanceTable = onRequest(
   {
     timeoutSeconds: 540,
-    memory: "1GiB",
+    memory: "512MiB",
     secrets: [ENQUEUE_FUNCTION_SECRET],
   },
   async (req, res) => {

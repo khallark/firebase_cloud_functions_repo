@@ -3,7 +3,7 @@
   "scripts": {
     "lint": "eslint \"src/**/*.{ts,js}\"",
     "lint:fix": "eslint \"src/**/*.{ts,js}\" --fix",
-    "build": "tsc",
+    "build": "tsc && xcopy /E /I /Y src\\agent\\docs lib\\agent\\docs",
     "build:watch": "tsc --watch",
     "serve": "npm run build && firebase emulators:start --only functions",
     "shell": "npm run build && firebase functions:shell",
@@ -22,6 +22,7 @@
     "@genkit-ai/vertexai": "^1.21.0",
     "@google-cloud/firestore": "^7.11.6",
     "@google-cloud/tasks": "^6.2.0",
+    "@google/genai": "^1.48.0",
     "@shopify/shopify-api": "^12.0.0",
     "exceljs": "^4.4.0",
     "firebase-admin": "^13.7.0",

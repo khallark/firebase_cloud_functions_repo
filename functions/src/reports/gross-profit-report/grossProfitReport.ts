@@ -1,6 +1,7 @@
 import { onRequest } from "firebase-functions/https";
 import { db } from "../../firebaseAdmin";
 import {
+  calcCreditNoteMetric,
   calcGrossProfit,
   calcLostMetric,
   calcPurchaseMetric,
@@ -15,8 +16,8 @@ import { Timestamp } from "firebase-admin/firestore";
 export const grossProfitReport = onRequest(
   {
     cors: true,
-    timeoutSeconds: 3600,
-    memory: "4GiB",
+    timeoutSeconds: 540,
+    memory: "1GiB",
   },
   async (req, res) => {
     try {
@@ -60,10 +61,11 @@ export const grossProfitReport = onRequest(
       const formattedEndDate = `${endDate}T23:59:59+05:30`;
 
       // ── 3. Calculate all metrics in parallel ───────────────────────────────
-      const [sale, saleReturn, purchase, openingStock, closingStock, lost] = await Promise.all([
+      const [sale, saleReturn, purchase, creditNotes, openingStock, closingStock, lost] = await Promise.all([
         calcSaleMetric(storeIds, formattedStartDate, formattedEndDate, false),
         calcSaleMetric(storeIds, formattedStartDate, formattedEndDate, true),
         calcPurchaseMetric(businessId, startDate, endDate),
+        calcCreditNoteMetric(businessId, startDate, endDate),
         calcStockMetric(businessId, startDate, true),
         calcStockMetric(businessId, endDate, false),
         calcLostMetric(storeIds, formattedStartDate, formattedEndDate),
@@ -73,6 +75,7 @@ export const grossProfitReport = onRequest(
         sale,
         saleReturn,
         purchase,
+        creditNotes,
         openingStock,
         closingStock,
         lost,
@@ -82,6 +85,7 @@ export const grossProfitReport = onRequest(
         sale,
         saleReturn,
         purchase,
+        creditNotes,
         openingStock,
         closingStock,
         lost,

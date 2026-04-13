@@ -2,10 +2,11 @@
 import { onSchedule } from "firebase-functions/v2/scheduler";
 import { db, storage } from "../../firebaseAdmin";
 import { ENQUEUE_FUNCTION_SECRET, TASKS_SECRET } from "../../config";
-import { createTask, sendTaxReportWhatsAppMessage } from "../../services";
+import { createTask } from "../../services";
 import { onRequest } from "firebase-functions/v2/https";
 import { generateTaxReport } from "./helpers";
 import { requireHeaderSecret } from "../../helpers";
+import { FieldValue } from "firebase-admin/firestore";
 
 /**
  * Scheduled function - runs daily at 12:00 AM
@@ -104,7 +105,7 @@ export const generateDailyTaxReport = onSchedule(
 export const generateCustomTaxReportPreliminary = onRequest(
   {
     cors: true,
-    memory: "512MiB",
+    memory: "256MiB",
     timeoutSeconds: 60,
     secrets: [ENQUEUE_FUNCTION_SECRET, TASKS_SECRET],
   },
@@ -127,6 +128,15 @@ export const generateCustomTaxReportPreliminary = onRequest(
         startDate?: string;
         endDate?: string;
       };
+
+      if (!businessId) {
+        res.status(400).json({ error: "Invalid businessId" });
+        return;
+      }
+
+      // Create the tax_reports doc upfront — worker will update it
+      const taxReportRef = db.collection(`users/${businessId}/tax_reports`).doc();
+      const docId = taxReportRef.id;
 
       // Support both single storeId and array of storeIds
       const resolvedStoreIds: string[] = storeIds || (storeId ? [storeId] : []);
@@ -160,15 +170,6 @@ export const generateCustomTaxReportPreliminary = onRequest(
         });
         return;
       }
-      if (!businessDoc.data()?.primaryContact?.phone) {
-        res.status(400).json({
-          error: "Missing Phone Number",
-          message: "This business doesn't have a Phone Number in the Settings > Primary Contact",
-        });
-        return;
-      }
-
-      const phone = businessDoc.data()?.primaryContact?.phone;
 
       // Validate all storeIds
       const invalidStoreId = resolvedStoreIds.find(
@@ -243,6 +244,14 @@ export const generateCustomTaxReportPreliminary = onRequest(
       console.log("✅ Validation passed");
       console.log(`📅 Date Range: ${startDate} to ${endDate} (${daysDiff + 1} days)`);
 
+      await taxReportRef.set({
+        status: "generating",
+        startedAt: FieldValue.serverTimestamp(),
+        startDate,
+        endDate,
+        storeIds: resolvedStoreIds,
+      });
+
       // Get the worker function URL from environment
       const workerUrl = process.env.GENERATE_CUSTOM_TAX_REPORT_WORKER_URL;
       if (!workerUrl) {
@@ -255,10 +264,10 @@ export const generateCustomTaxReportPreliminary = onRequest(
       const taskName = await createTask(
         {
           businessId,
-          phone,
           storeIds: resolvedStoreIds,
           startDate,
           endDate,
+          docId,
         },
         {
           tasksSecret: TASKS_SECRET.value() || "",
@@ -274,6 +283,7 @@ export const generateCustomTaxReportPreliminary = onRequest(
         success: true,
         message: "Tax report generation has been queued successfully",
         taskName,
+        docId,
         dateRange: {
           storeIds: resolvedStoreIds,
           startDate,
@@ -304,88 +314,88 @@ export const generateCustomTaxReportPreliminary = onRequest(
 export const generateCustomTaxReport = onRequest(
   {
     cors: true,
-    memory: "4GiB",
-    timeoutSeconds: 3600,
+    memory: "1GiB",
+    timeoutSeconds: 1800,
     secrets: [TASKS_SECRET],
   },
   async (req, res) => {
+    const { storeId, storeIds, startDate, endDate, businessId, docId } = req.body as {
+      storeId?: string;
+      storeIds?: string[];
+      startDate?: string;
+      endDate?: string;
+      businessId?: string;
+      docId?: string;
+    };
+
+    // Helper: update the Firestore doc if docId is present (best-effort)
+    const updateDoc = async (data: Record<string, unknown>) => {
+      if (!businessId || !docId) return;
+      try {
+        await db.collection(`users/${businessId}/tax_reports`).doc(docId).update(data);
+      } catch (e) {
+        console.error("Failed to update tax_report doc:", e);
+      }
+    };
+
     try {
       requireHeaderSecret(req, "x-tasks-secret", TASKS_SECRET.value() || "");
 
-      // Validate request method
       if (req.method !== "POST") {
         res.status(405).json({ error: "Method not allowed. Use POST." });
         return;
       }
 
-      // Extract dates from request body
-      const { phone, storeId, storeIds, startDate, endDate } = req.body as {
-        phone?: string;
-        storeId?: string;
-        storeIds?: string[];
-        startDate?: string;
-        endDate?: string;
-      };
-
       const resolvedStoreIds: string[] = storeIds || (storeId ? [storeId] : []);
 
-      if (!phone || resolvedStoreIds.length === 0 || !startDate || !endDate) {
-        res.status(400).json({
-          error: "Missing required parameters",
-          message: "Please provide storeId, startDate and endDate in YYYY-MM-DD format",
-          example: {
-            startDate: "2025-12-04",
-            endDate: "2025-12-06",
-          },
+      if (!resolvedStoreIds.length || !startDate || !endDate) {
+        await updateDoc({
+          status: "failed",
+          failedAt: FieldValue.serverTimestamp(),
+          error: "Missing required parameters (storeIds, startDate, endDate)",
         });
+        res.status(200).json({ error: "Missing required parameters" });
         return;
       }
 
-      // Parse dates
       const start = new Date(startDate);
       const end = new Date(endDate);
 
-      // Validate dates
       if (isNaN(start.getTime()) || isNaN(end.getTime())) {
-        res.status(400).json({
-          error: "Invalid date format",
-          message: "Dates must be in YYYY-MM-DD format",
-          example: "2025-12-04",
+        await updateDoc({
+          status: "failed",
+          failedAt: FieldValue.serverTimestamp(),
+          error: "Invalid date values",
         });
+        res.status(200).json({ error: "Invalid date values" });
         return;
       }
 
       if (start > end) {
-        res.status(400).json({
-          error: "Invalid date range",
-          message: "startDate must be before or equal to endDate",
+        await updateDoc({
+          status: "failed",
+          failedAt: FieldValue.serverTimestamp(),
+          error: "startDate must be before or equal to endDate",
         });
+        res.status(200).json({ error: "Invalid date range" });
         return;
       }
 
-      // Check if range is too large (optional: limit to 31 days)
       const daysDiff = Math.ceil((end.getTime() - start.getTime()) / (1000 * 60 * 60 * 24));
-      // if (daysDiff > 31) {
-      //   res.status(400).json({
-      //     error: "Date range too large",
-      //     message: "Please limit the date range to 31 days or less",
-      //     requestedDays: daysDiff,
-      //   });
-      //   return;
-      // }
-
-      // console.log(`🚀 Starting Custom Tax Report Generation...`);
       console.log(`📅 Date Range: ${startDate} to ${endDate} (${daysDiff + 1} days)`);
 
-      // Generate report for custom date range
+      // Generate the report
       const { workbook, salesRows, returnRows, statePivot, hsnPivot } = await generateTaxReport(
         resolvedStoreIds,
-        start,
-        end,
+        startDate,
+        endDate,
       );
 
+      // Update status: uploading
+      await updateDoc({ status: "uploading" });
+
       // Upload to Firebase Storage
-      console.log("\n📊 Step 6: Uploading to Firebase Storage...");
+      console.log("\n📊 Uploading to Firebase Storage...");
       const startStr = start.toLocaleDateString("en-GB").replace(/\//g, "-");
       const endStr = end.toLocaleDateString("en-GB").replace(/\//g, "-");
       const timestamp = Date.now();
@@ -410,39 +420,35 @@ export const generateCustomTaxReport = onRequest(
       });
 
       await workbook.xlsx.write(writeStream);
-
       await new Promise<void>((resolve, reject) => {
         writeStream.on("finish", () => resolve());
         writeStream.on("error", (error) => reject(error));
       });
 
       await file.makePublic();
-      const downloadUrl = `${bucket.name}/${filePath}`;
-
+      const downloadUrl = `https://storage.googleapis.com/${bucket.name}/${filePath}`;
       console.log(`✅ File uploaded: ${downloadUrl}`);
 
-      // Send WhatsApp Message
-      console.log("\n📊 Step 7: Sending WhatsApp Message...");
-      // Use first store's data for WhatsApp message template
-      const shopDoc = await db.collection("accounts").doc(resolvedStoreIds[0]).get();
-      const shopData = shopDoc.data();
-
-      if (shopData) {
-        await sendTaxReportWhatsAppMessage(shopData, startDate, endDate, downloadUrl, phone);
-        console.log(`✅ WhatsApp message sent to ${phone}`);
-      }
+      // Update doc: completed
+      await updateDoc({
+        status: "completed",
+        completedAt: FieldValue.serverTimestamp(),
+        downloadUrl,
+        fileName,
+        summary: {
+          salesLineItems: salesRows.length,
+          returnLineItems: returnRows.length,
+          statesCovered: statePivot.length,
+          hsnCodes: hsnPivot.length,
+        },
+      });
 
       console.log("\n✨ Custom Tax Report Generation Completed Successfully!");
 
-      // Return response
       res.status(200).json({
         success: true,
         message: "Tax report generated successfully",
-        dateRange: {
-          startDate,
-          endDate,
-          days: daysDiff + 1,
-        },
+        dateRange: { startDate, endDate, days: daysDiff + 1 },
         summary: {
           salesLineItems: salesRows.length,
           returnLineItems: returnRows.length,
@@ -454,7 +460,13 @@ export const generateCustomTaxReport = onRequest(
       });
     } catch (error: any) {
       console.error("❌ Error generating custom tax report:", error);
-      res.status(500).json({
+      await updateDoc({
+        status: "failed",
+        failedAt: FieldValue.serverTimestamp(),
+        error: error.message || String(error),
+      });
+      // Return 200 so Cloud Tasks does not retry
+      res.status(200).json({
         error: "Report generation failed",
         message: error.message || String(error),
       });
