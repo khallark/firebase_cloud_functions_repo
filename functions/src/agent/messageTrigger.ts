@@ -22,7 +22,7 @@ const MAX_TOOL_ITERATIONS = 10;
 
 const ROUTE_MAP = fs.readFileSync(path.join(__dirname, './docs/routes.md'), 'utf-8');
 const CLOUD_FUNCTIONS_REF = fs.readFileSync(path.join(__dirname, './docs/cloud-functions.md'), 'utf-8');
-const DB_SCHEMA = "fs.readFileSync(path.join(__dirname, './docs/database-schema.md'), 'utf-8');"
+const DB_SCHEMA = fs.readFileSync(path.join(__dirname, './docs/database-schema.md'), 'utf-8');
 
 // ── Tool declarations ─────────────────────────────────────────────────────────
 
