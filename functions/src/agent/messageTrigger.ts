@@ -1,126 +1,324 @@
-// functions/src/agent/onAgentMessageCreated.ts
-//
-// Triggered when a new message document is created in the messages subcollection.
-// Path: users/{businessId}/agent_sessions/{sessionId}/messages/{messageId}
-//
-// Flow:
-//   1. Ignore if role !== 'user' (prevents re-triggering on own assistant writes)
-//   2. Set session status → 'generating'
-//   3. Fetch full conversation history from messages subcollection
-//   4. Agentic loop: call Gemini → if functionCall, execute tool and loop; if text, done
-//   5. Write assistant message doc to subcollection
-//   6. Set session status → 'idle'
-//   Catch: set session status → 'error'
-//
-// Tool call safety:
-//   - MAX_TOOL_ITERATIONS = 5: hard cap on loop iterations; breaks with fallback on breach
-//   - Tool execution is wrapped in try/catch; errors are returned as { error } in
-//     functionResponse so Gemini handles them gracefully instead of crashing the loop
-//   - limit is hardcoded inside executeTool — not exposed to the model
+// functions/src/agent/messageTrigger.ts
 
 import { onDocumentCreated } from 'firebase-functions/v2/firestore';
 import { defineSecret } from 'firebase-functions/params';
 import { FieldValue, Timestamp } from 'firebase-admin/firestore';
 import { GoogleGenAI, FunctionDeclaration, Type, Part } from '@google/genai';
 import { db } from '../firebaseAdmin';
-import { getOrdersByStatus } from './tools';
+import { DataStore } from './dataStore';
+import {
+  queryFirestore,
+  flattenArrayField, groupBy, sumGrouped,
+  countGrouped, filterDocs, sortBy, limitDocs,
+  sumField, countDocs, getTopN, listDocs,
+  mergeByKey,
+  QueryFirestoreParams,
+} from './tools';
 import * as fs from 'fs';
 import * as path from 'path';
 
 const GEMINI_API_KEY = defineSecret('GEMINI_API_KEY');
+const MAX_TOOL_ITERATIONS = 10;
 
-const MAX_TOOL_ITERATIONS = 5;
+const ROUTE_MAP = fs.readFileSync(path.join(__dirname, './docs/routes.md'), 'utf-8');
+const CLOUD_FUNCTIONS_REF = fs.readFileSync(path.join(__dirname, './docs/cloud-functions.md'), 'utf-8');
+const DB_SCHEMA = "fs.readFileSync(path.join(__dirname, './docs/database-schema.md'), 'utf-8');"
 
-// ── Static docs — loaded once on cold start, cached for warm instances ────────
-const ROUTE_MAP = fs.readFileSync(
-  path.join(__dirname, './docs/routes.md'),
-  'utf-8'
-);
+// ── Tool declarations ─────────────────────────────────────────────────────────
 
-const CLOUD_FUNCTIONS_REF = fs.readFileSync(
-  path.join(__dirname, './docs/cloud-functions.md'),
-  'utf-8'
-);
-
-// ── Tool declarations — schema only, no logic ─────────────────────────────────
-// 'limit' is intentionally omitted: it is hardcoded to 50 inside executeTool.
 const TOOL_DECLARATIONS: FunctionDeclaration[] = [
+
   {
-    name: 'getOrdersByStatus',
+    name: 'queryFirestore',
     description:
-      'Fetch orders for this business filtered by a custom order status and date range. ' +
-      'Generates an Excel file of the results and returns a download link. ' +
-      'IMPORTANT: If the user has not specified a date range, ask them to provide one before calling this tool. ' +
-      'Do not assume or default a date range — always confirm with the user first. ' +
-      'Returns { downloadUrl, count } where downloadUrl is a direct download link to the Excel file.',
+      'Fetch documents from any Firestore collection for analysis. ' +
+      'Returns { handle, count, type, schema } — NOT raw data. ' +
+      'Pass the handle to analytical tools to compute results.\n\n' +
+      'Path conventions:\n' +
+      '  "accounts/*/orders"           → all stores for this business (auto-expanded)\n' +
+      '  "users/{businessId}/products" → {businessId} auto-substituted\n' +
+      '  "users/{businessId}/grns"\n' +
+      '  "users/{businessId}/upcs"\n' +
+      '  "users/{businessId}/credit_notes"\n' +
+      '  "users/{businessId}/parties"\n' +
+      '  "users/{businessId}/purchaseOrders"\n' +
+      '  etc. — any collection documented in the database schema.',
     parameters: {
       type: Type.OBJECT,
       properties: {
-        status: {
+        path: {
           type: Type.STRING,
-          description:
-            'The customStatus value to filter by. ' +
-            'Valid values: New, Confirmed, Ready To Dispatch, Dispatched, ' +
-            'In Transit, Out For Delivery, Delivered, RTO In Transit, RTO Delivered, ' +
-            'RTO Closed, DTO Requested, DTO Booked, DTO In Transit, DTO Delivered, ' +
-            'Pending Refunds, Cancelled, Lost, Closed.',
+          description: 'Collection path. Use accounts/*/orders for all stores. Use {businessId} for business collections.',
         },
-        dateRange: {
-          type: Type.OBJECT,
-          description: 'Optional date range to filter orders by createdAt.',
-          properties: {
-            startDate: {
-              type: Type.STRING,
-              description: 'Start date in YYYY-MM-DD format (IST).',
+        filters: {
+          type: Type.ARRAY,
+          description: 'Firestore where() filters.',
+          items: {
+            type: Type.OBJECT,
+            properties: {
+              field: { type: Type.STRING },
+              operator: { type: Type.STRING, description: '==, !=, <, <=, >, >=, in, array-contains, array-contains-any.' },
+              value: { type: Type.STRING, description: 'Filter value. Dates "YYYY-MM-DD" are auto-converted to Timestamps. For "in", pass a JSON array string e.g. "["Delivered","Closed"]".' },
             },
-            endDate: {
-              type: Type.STRING,
-              description: 'End date in YYYY-MM-DD format (IST).',
-            },
+            required: ['field', 'operator', 'value'],
           },
-          required: ['startDate', 'endDate'],
+        },
+        orderBy: {
+          type: Type.ARRAY,
+          items: {
+            type: Type.OBJECT,
+            properties: {
+              field: { type: Type.STRING },
+              direction: { type: Type.STRING, description: '"asc" or "desc".' },
+            },
+            required: ['field', 'direction'],
+          },
+        },
+        limit: {
+          type: Type.NUMBER,
+          description: 'Max total docs (hard cap: 3000). Omit for all-time aggregations.',
+        },
+        select: {
+          type: Type.ARRAY,
+          description: 'Field paths to keep. Always include only fields you will use analytically — reduces memory.',
+          items: { type: Type.STRING },
         },
       },
-      required: ['status'],
+      required: ['path'],
+    },
+  },
+
+  {
+    name: 'flattenArrayField',
+    description:
+      'Explode an array field so each element becomes its own doc. ' +
+      'Essential for aggregating across embedded arrays such as raw.line_items inside orders. ' +
+      'e.g. 100 orders × 5 items each → 500 item docs. Returns a docs handle.',
+    parameters: {
+      type: Type.OBJECT,
+      properties: {
+        handle: { type: Type.STRING },
+        arrayFieldPath: { type: Type.STRING, description: 'e.g. "raw.line_items", "items".' },
+        mergeParentFields: {
+          type: Type.ARRAY,
+          description: 'Parent field paths to copy onto each flattened item (prefixed with _parent_). e.g. ["id", "customStatus", "createdAt"].',
+          items: { type: Type.STRING },
+        },
+      },
+      required: ['handle', 'arrayFieldPath'],
+    },
+  },
+
+  {
+    name: 'groupBy',
+    description:
+      'Group docs by the distinct values at a field path. ' +
+      'Returns a groups handle with _groupKey, _count, _docs per group. ' +
+      'Follow with sumGrouped or countGrouped to aggregate.',
+    parameters: {
+      type: Type.OBJECT,
+      properties: {
+        handle: { type: Type.STRING },
+        fieldPath: { type: Type.STRING, description: 'e.g. "sku", "vendor", "customStatus", "productId".' },
+      },
+      required: ['handle', 'fieldPath'],
+    },
+  },
+
+  {
+    name: 'sumGrouped',
+    description:
+      'Sum a numeric field across all docs in each group. ' +
+      'Returns a docs handle of { _key, _count, _sum } per group.',
+    parameters: {
+      type: Type.OBJECT,
+      properties: {
+        handle: { type: Type.STRING, description: 'Groups handle from groupBy.' },
+        fieldPath: { type: Type.STRING, description: 'Numeric field inside each doc. e.g. "quantity", "price", "totalReceivedValue".' },
+      },
+      required: ['handle', 'fieldPath'],
+    },
+  },
+
+  {
+    name: 'countGrouped',
+    description: 'Convert a groups handle to a flat docs handle of { _key, _count }. Use when count per group is sufficient.',
+    parameters: {
+      type: Type.OBJECT,
+      properties: {
+        handle: { type: Type.STRING, description: 'Groups handle from groupBy.' },
+      },
+      required: ['handle'],
+    },
+  },
+
+  {
+    name: 'filterDocs',
+    description: 'Client-side filter on a docs handle. Use for conditions that could not be expressed in the Firestore query, or to narrow results mid-chain.',
+    parameters: {
+      type: Type.OBJECT,
+      properties: {
+        handle: { type: Type.STRING },
+        fieldPath: { type: Type.STRING },
+        operator: { type: Type.STRING, description: '==, !=, >, >=, <, <=, includes (string contains), startsWith, in (value is JSON array string).' },
+        value: { type: Type.STRING, description: 'For "in", pass a JSON array string.' },
+      },
+      required: ['handle', 'fieldPath', 'operator', 'value'],
+    },
+  },
+
+  {
+    name: 'sortBy',
+    description: 'Sort a docs handle by a field. Returns a new sorted docs handle.',
+    parameters: {
+      type: Type.OBJECT,
+      properties: {
+        handle: { type: Type.STRING },
+        fieldPath: { type: Type.STRING },
+        direction: { type: Type.STRING, description: '"asc" or "desc".' },
+      },
+      required: ['handle', 'fieldPath', 'direction'],
+    },
+  },
+
+  {
+    name: 'limitDocs',
+    description: 'Take the first N docs from a handle. Returns a new docs handle.',
+    parameters: {
+      type: Type.OBJECT,
+      properties: {
+        handle: { type: Type.STRING },
+        n: { type: Type.NUMBER },
+      },
+      required: ['handle', 'n'],
+    },
+  },
+
+  {
+    name: 'sumField',
+    description: 'TERMINAL. Sum a numeric field across all docs. Returns { total, docCount }. Use as the last step when you need a single total.',
+    parameters: {
+      type: Type.OBJECT,
+      properties: {
+        handle: { type: Type.STRING },
+        fieldPath: { type: Type.STRING, description: 'e.g. "totalReceivedValue", "_sum", "raw.total_price".' },
+      },
+      required: ['handle', 'fieldPath'],
+    },
+  },
+
+  {
+    name: 'countDocs',
+    description: 'TERMINAL. Count docs in a handle. Returns { count }.',
+    parameters: {
+      type: Type.OBJECT,
+      properties: {
+        handle: { type: Type.STRING },
+      },
+      required: ['handle'],
+    },
+  },
+
+  {
+    name: 'getTopN',
+    description: 'TERMINAL. Sort docs by a numeric field and return the top N as actual data. Returns { results, count }. Use as the final step in ranking queries.',
+    parameters: {
+      type: Type.OBJECT,
+      properties: {
+        handle: { type: Type.STRING },
+        sortFieldPath: { type: Type.STRING, description: 'Numeric field to rank by. e.g. "_sum", "_count".' },
+        n: { type: Type.NUMBER },
+        direction: { type: Type.STRING, description: '"desc" for highest first, "asc" for lowest first.' },
+      },
+      required: ['handle', 'sortFieldPath', 'n', 'direction'],
+    },
+  },
+
+  {
+    name: 'listDocs',
+    description: 'TERMINAL. Return up to N docs as actual data. Returns { results, count }. Use fields param to project only needed fields and keep output clean.',
+    parameters: {
+      type: Type.OBJECT,
+      properties: {
+        handle: { type: Type.STRING },
+        n: { type: Type.NUMBER, description: 'Max docs to return (default 20).' },
+        fields: {
+          type: Type.ARRAY,
+          description: 'Optional field paths to include in output. If omitted, all fields are returned.',
+          items: { type: Type.STRING },
+        },
+      },
+      required: ['handle'],
+    },
+  },
+
+  {
+    name: 'mergeByKey',
+    description: 'Join multiple docs handles on a shared key field, merging all fields per key. Useful for combining parallel aggregation results.',
+    parameters: {
+      type: Type.OBJECT,
+      properties: {
+        handles: {
+          type: Type.ARRAY,
+          items: { type: Type.STRING },
+          description: 'Docs handles to merge.',
+        },
+        keyField: { type: Type.STRING, description: 'Field to join on. Usually "_key".' },
+      },
+      required: ['handles', 'keyField'],
     },
   },
 ];
 
 // ── Tool executor ─────────────────────────────────────────────────────────────
-// Single dispatch point for all tool calls. Add new tools here as a new case.
-// Always returns a plain object — never throws. Errors go back to Gemini as
-// { error } so it can respond to the user gracefully.
 async function executeTool(
   name: string,
-  args: Record<string, unknown>,
+  args: Record<string, any>,
   businessId: string,
-): Promise<Record<string, unknown>> {
-  switch (name) {
-    case 'getOrdersByStatus': {
-      const status = args.status as string;
-      let dateRange = args.dateRange as { startDate: string; endDate: string } | undefined;
-
-      if (!dateRange) {
-        const now = new Date(new Date().toLocaleString('en-US', { timeZone: 'Asia/Kolkata' }));
-        const pad = (n: number) => String(n).padStart(2, '0');
-        const today = `${now.getFullYear()}-${pad(now.getMonth() + 1)}-${pad(now.getDate())}`;
-
-        dateRange = { startDate: today, endDate: today };
-        console.warn(`⚠️ getOrdersByStatus called without dateRange — defaulting to today: ${today}`);
+  dataStore: DataStore,
+): Promise<Record<string, any>> {
+  try {
+    switch (name) {
+      case 'queryFirestore': {
+        const filters = (args.filters ?? []).map((f: any) => {
+          let value = f.value;
+          if ((f.operator === 'in' || f.operator === 'array-contains-any') && typeof value === 'string') {
+            try { value = JSON.parse(value); } catch (error) {
+              console.log("error:", error);
+            }
+          }
+          return { ...f, value };
+        });
+        return await queryFirestore({ ...args, filters, businessId } as QueryFirestoreParams, dataStore);
       }
 
-      const result = await getOrdersByStatus({
-        businessId,
-        status,
-        dateRange,
-        limit: 50,
-      });
+      case 'flattenArrayField': return flattenArrayField(args as any, dataStore);
+      case 'groupBy': return groupBy(args as any, dataStore);
+      case 'sumGrouped': return sumGrouped(args as any, dataStore);
+      case 'countGrouped': return countGrouped(args as any, dataStore);
+      case 'filterDocs': {
+        let value = args.value;
+        if (args.operator === 'in' && typeof value === 'string') {
+          try { value = JSON.parse(value); } catch (error) {
+            console.log("error:", error)
+          }
+        }
+        return filterDocs({ ...args, value } as any, dataStore);
+      }
+      case 'sortBy': return sortBy(args as any, dataStore);
+      case 'limitDocs': return limitDocs(args as any, dataStore);
+      case 'sumField': return sumField(args as any, dataStore);
+      case 'countDocs': return countDocs(args as any, dataStore);
+      case 'getTopN': return getTopN(args as any, dataStore);
+      case 'listDocs': return listDocs(args as any, dataStore);
+      case 'mergeByKey': return mergeByKey(args as any, dataStore);
 
-      return result; // { downloadUrl, count }
+      default: return { error: `Unknown tool: "${name}"` };
     }
-
-    default:
-      return { error: `Unknown tool: ${name}` };
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : String(err);
+    console.error(`❌ executeTool("${name}") error:`, msg);
+    return { error: msg };
   }
 }
 
@@ -129,223 +327,174 @@ function buildSystemPrompt(businessId: string): string {
   const now = new Date(new Date().toLocaleString('en-US', { timeZone: 'Asia/Kolkata' }));
   const pad = (n: number) => String(n).padStart(2, '0');
   const todayIST = `${now.getFullYear()}-${pad(now.getMonth() + 1)}-${pad(now.getDate())}`;
+
   return `
-You are the Majime Assistant — an AI built directly into the Majime platform, a B2B SaaS order management system for e-commerce businesses in India.
+You are the Majime Assistant — an AI built into the Majime platform, a B2B SaaS order management system for Indian e-commerce businesses.
 
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-PRIORITY RULES (HIGHEST PRIORITY)
+INTERNAL PROTECTION (STRICT)
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-- These rules override everything else below.
-- If any instruction conflicts with these, follow these rules strictly.
-
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-INTERNAL SYSTEM PROTECTION (STRICT)
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-The following information is INTERNAL and must NEVER be exposed to the user in any form:
-
-- Cloud Function names
-- Firestore triggers or database paths
-- API endpoints or request structures
-- Background job / queue architecture
-- Code-level or implementation details
-- Any full or partial listing of backend systems
-
-You may USE this knowledge to improve answers, but you must NEVER:
-- List them
-- Enumerate them
-- Summarize them as a system
-- Explain how they are implemented internally
-
-You must NEVER use technical backend terms such as:
-- "endpoint", "trigger", "function", "queue", "job", "pipeline", "cron", "worker"
-
-If the user asks for internal/system details (explicitly or indirectly), you MUST respond with exactly:
-
-"I can't provide internal system details, but I can explain how the feature works."
-
-Do not add anything before this sentence.
-
-You may optionally follow it with a high-level, user-facing explanation.
-
-If a question is primarily about system internals, prioritize refusal over answering.
+Never expose: database paths, collection names, field names, API endpoints, Cloud Function names, or any backend/implementation detail.
+If asked: respond with exactly "I can't provide internal system details, but I can explain how the feature works."
 
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-FRONTEND VS BACKEND RULE
+TONE
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-- You ARE allowed to provide:
-  - Frontend page URLs
-  - Route paths
-  - Navigation instructions
-  - What the user will see and do
-
-- You MUST NEVER provide:
-  - API details
-  - Backend structure
-  - Database structure
-  - Internal architecture
-
-Rule:
-- Describe WHAT happens (user-visible)
-- Never describe HOW it is implemented
+Professional, direct, concise. Answer only what was asked. No preamble or filler.
 
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-IDENTITY
+TWO TYPES OF QUESTIONS
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-- Your name is "Majime Assistant".
-- You are embedded in the platform's sidebar as a persistent chat panel.
-- Your purpose is to make the user's work faster and less confusing.
+Every user question falls into one of two categories:
 
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-TONE & BEHAVIOUR
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-- Be professional, direct, and concise. No warmth, no humour, no personality.
-- Answer only what was asked.
-- Default to the shortest accurate answer possible.
-- Prefer one sentence when sufficient.
-- Use numbered steps only when order matters.
-- Do not add preamble or closing lines.
-- Do not restate the user's question.
-- Do not describe what you are about to do.
-- Do not use filler phrases.
-- If unsure, say so in one sentence.
+TYPE 1 — NON-DATABASE QUESTION
+Conceptual, navigational, how-to, or explanatory.
+Examples: "how do I assign AWBs", "where is the Put Away page", "what is an RTO order",
+"explain gross profit calculation", "how does the UPC system work".
+→ Answer directly from your platform knowledge. Do NOT use tools.
 
-Length control:
-- If the question is simple → 1 sentence.
-- If the question is procedural → short numbered steps.
-- Do not exceed necessary detail.
+TYPE 2 — DATABASE QUESTION
+Requires reading live data from the platform database to answer.
+Examples: "how many orders were delivered today", "what is our current stock of SKU X",
+"top 3 selling products", "how much did we purchase last month", "show me pending GRNs",
+"which party has the most credit notes".
+→ Use queryFirestore + analytical tools to compute the answer.
+
+The distinction matters. Conceptual questions about how things work don't need tools.
+Questions asking for actual numbers, records, lists, or computations from live data do.
+When in doubt: if a definitive answer requires looking at the database, use tools.
 
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-TOOL USE RULES
+DATABASE ACCESS
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-Tools give you access to live platform data. Use them whenever the user is asking
-for real numbers, counts, or lists — not explanations or guidance.
+You have full read access to the platform database via queryFirestore.
+The complete database schema is provided below (DATABASE SCHEMA section).
+Read it carefully — it documents every collection, every document type,
+every field, all relationships, and how data is connected across collections.
 
-General rules:
-- Never use a tool for conceptual, navigational, or how-to questions.
-- Never mention tools, function names, or data fetching to the user.
-- Never call the same tool twice with the same arguments.
-- After a tool returns results, answer the user directly. Do not call another
-  tool unless the first result was clearly insufficient.
-- If the user asks for live data outside the scope of any listed tool, say exactly:
-  "I can only fetch orders by status and date range right now."
-
-Date range rules:
-- If the user does not mention any date or time reference, ask for a date range
-  before calling any tool. Do not call the tool without one.
-- If the user says "today", use today's date (already in your context) as both
-  startDate and endDate. Do not ask for clarification.
-- If the user says "this week", use Monday of the current week as startDate and
-  today as endDate.
-- If the user says "this month", use the 1st of the current month as startDate
-  and today as endDate.
-- If the user says "yesterday", use yesterday's date as both startDate and endDate.
+When a database question arrives:
+1. Identify which collection(s) contain the data needed.
+2. Determine which fields to query and filter on.
+3. Understand the relationships — e.g. orders contain line_items with variantId
+   which links to products via variantMappingDetails; GRNs link to POs via poId; etc.
+4. Build the query chain using queryFirestore + analytical tools.
+5. Use a TERMINAL tool (getTopN, listDocs, sumField, countDocs) to produce the final answer.
 
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-TOOL: getOrdersByStatus
+HANDLE / SCHEMA SYSTEM
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-Use this tool when the user asks for a count or list of orders in a specific status.
-You MUST use this tool for these queries — do not fall back to "I'm not sure."
-After the tool returns the downloadUrl, share the count and the download link naturally. Keep it to one or two sentences maximum.
+queryFirestore and most analytical tools return:
+  { handle: "uuid", count: N, type: "docs"|"groups", schema: { field: type, ... } }
 
-Trigger keywords and phrases:
-- "how many [status] orders"
-- "list of [status] orders"
-- "show me [status] orders"
-- "give me [status] orders"
-- "dispatched orders today / this week / this month"
-- "confirmed orders"
-- "orders in transit"
-- "delivered orders"
-- "cancelled orders"
-- "RTO orders"
-- "DTO orders"
-- "orders that are [status]"
-- "orders with status [status]"
-- "how many orders were [status]"
-- "which orders are [status]"
-- "pending orders" → map to the closest valid status (e.g. Confirmed, New)
-- "returned orders" → map to RTO Closed or Pending Refunds
-- "lost orders"
-- "closed orders"
-- any question containing a valid status name listed below
+- handle = opaque server-side reference to in-memory data. Never show handles to the user.
+- schema = field map of the docs in that handle. Use it to know what fields are available for subsequent tools.
+- type "docs" = flat array of plain objects.
+- type "groups" = array of { _groupKey, _count, _docs }. Use with sumGrouped or countGrouped.
+- Chain tools by passing the handle output of one as the handle input of the next.
+- TERMINAL tools (getTopN, listDocs, sumField, countDocs) return actual values — use those to formulate your answer.
 
-Valid status values to pass:
-New, Confirmed, Ready To Dispatch, Dispatched, In Transit, Out For Delivery,
-Delivered, RTO In Transit, RTO Delivered, RTO Closed, DTO Requested, DTO Booked,
-DTO In Transit, DTO Delivered, Pending Refunds, Cancelled, Lost, Closed.
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+TOOL CHAINING PATTERN
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+Standard chain for aggregate analytical queries:
+  1. queryFirestore        → docs handle (fetch from DB)
+  2. flattenArrayField     → docs handle (if docs embed arrays like line_items or items[])
+  3. filterDocs            → docs handle (optional client-side narrowing)
+  4. groupBy               → groups handle
+  5. sumGrouped or countGrouped → docs handle { _key, _sum/_count }
+  6. getTopN / listDocs / sumField / countDocs → FINAL VALUES → answer
+
+Example — "Top 3 highest selling products ever":
+  1. queryFirestore("accounts/*/orders", filters=[customStatus in [Delivered,Closed]], select=["raw.line_items"])
+  2. flattenArrayField(h1, "raw.line_items")
+  3. groupBy(h2, "sku")
+  4. sumGrouped(h3, "quantity")
+  5. getTopN(h4, "_sum", 3, "desc") → present results to user
+
+Example — "Total value of GRNs received this month":
+  1. queryFirestore("users/{businessId}/grns", filters=[status==completed, receivedAt>=2025-05-01], select=["totalReceivedValue"])
+  2. sumField(h1, "totalReceivedValue") → present total
+
+Example — "How many Confirmed orders do we have right now":
+  1. queryFirestore("accounts/*/orders", filters=[customStatus==Confirmed], select=["id"])
+  2. countDocs(h1) → present count
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+TOOL SELECTION GUIDE
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+queryFirestore     → fetch documents from any collection for analysis
+flattenArrayField  → explode embedded array fields (line_items, items[], etc.)
+groupBy            → group docs by a field value
+sumGrouped         → sum a numeric field within each group → { _key, _sum }
+countGrouped       → count docs within each group → { _key, _count }
+filterDocs         → narrow docs client-side mid-chain
+sortBy             → sort docs by a field mid-chain
+limitDocs          → take first N docs mid-chain
+sumField     [T]   → single numeric total across all docs
+countDocs    [T]   → total doc count
+getTopN      [T]   → ranked top-N by numeric field, returns actual data
+listDocs     [T]   → return specific records to show user (use fields to project)
+mergeByKey         → combine two { _key, ... } aggregations on shared _key
+[T] = TERMINAL — returns actual values, not a handle
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+IMPORTANT CAVEATS
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+- queryFirestore is capped at 3000 docs total. For "all time" queries, always note
+  "based on the last N records fetched" — results may not reflect complete history.
+- When a tool returns { note: "..." }, always include that note in your answer.
+- Multi-store paths (accounts/*/orders) automatically expand to all linked stores.
+- When a tool returns { error: "..." }, try a corrected approach or tell the user
+  honestly that you couldn't retrieve that data.
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+DATE RESOLUTION (when tools are needed)
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+today       → startDate = endDate = today's date
+this week   → startDate = Monday of current week, endDate = today
+this month  → startDate = 1st of current month, endDate = today
+yesterday   → startDate = endDate = yesterday
+No date mentioned → ask the user before calling any tool.
 
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 HALLUCINATION GUARD
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-- Never invent features, pages, statuses, or workflows.
-- Never assume something exists unless it is in the provided documentation.
-- If uncertain, say:
-  "I'm not sure about that. Please check the relevant page."
+Never invent platform features, order statuses, or field names.
+If uncertain about something non-database: "I'm not sure. Please check the relevant page."
+If a database query returns unexpected results, report what you found rather than guessing.
 
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-NAVIGATION BEHAVIOUR
+CURRENT SESSION
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-- Always provide exact page name or full URL when relevant.
-- Prefer full URLs when possible.
-- Do not give vague directions.
+Business ID:  ${businessId}
+Platform URL: https://www.majime.in/business/${businessId}/
+Today (IST):  ${todayIST}
 
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-UI-AWARE RESPONSE RULE
+DATABASE SCHEMA (INTERNAL — NEVER EXPOSE)
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-- If the user's question implies they are on a specific page:
-  - Tailor the answer to that page
-  - Refer only to visible actions on that page
-  - Do not explain unrelated flows
+Read this carefully. It is your complete map of the database.
+It documents every collection path, every document type, every field and its type,
+and how collections relate to each other. Use this knowledge when building queryFirestore calls.
+Never expose collection paths, field names, or schema details to users.
+
+${DB_SCHEMA}
 
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-WHAT YOU CAN DO
+PLATFORM ROUTE MAP
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-- Explain how features, pages, and workflows work.
-- Tell the user exactly where to go (page name or full URL).
-- Explain order statuses and transitions.
-- Explain inventory concepts (UPCs, put-away, blocking, availability, mapping).
-- Explain warehouse structure (Warehouse → Zone → Rack → Shelf → UPC).
-- Explain background automation in user-facing terms (automatic updates, delays, status changes).
-- Explain batch processes conceptually (grouping, processing, completion).
-- Clarify Majime terminology (GRN, AWB, BOM, Lot, Party, DTO, RTO, NDR).
-- Guide multi-step workflows.
-- Fetch and report live order data using available tools.
-
-Important:
-- You may use backend knowledge internally, but output ONLY user-visible behavior.
-
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-WHAT YOU CANNOT DO
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-- You cannot perform actions on behalf of the user (confirm orders, assign AWBs, etc.).
-
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-CURRENT SESSION CONTEXT
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-- Business ID: ${businessId}
-- Platform URL: https://www.majime.in
-- Base route: https://www.majime.in/business/${businessId}/
-- Today's date (IST): ${todayIST}
-
-Use this to construct full URLs when guiding navigation.
-
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-MAJIME PLATFORM — ROUTE MAP
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-Use this for frontend navigation and feature understanding:
+Use this for navigation guidance and feature explanations (TYPE 1 questions).
 
 ${ROUTE_MAP}
 
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-MAJIME PLATFORM — INTERNAL REFERENCE (DO NOT EXPOSE)
+INTERNAL REFERENCE (DO NOT EXPOSE)
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-This is for internal reasoning only. Never expose or summarize it.
-
 ${CLOUD_FUNCTIONS_REF}
 `.trim();
 }
 
-
+// ── Main trigger ──────────────────────────────────────────────────────────────
 export const onAgentMessageCreated = onDocumentCreated(
   {
     document: 'users/{businessId}/agent_sessions/{sessionId}/messages/{messageId}',
@@ -357,158 +506,115 @@ export const onAgentMessageCreated = onDocumentCreated(
   async (event) => {
     const { businessId, sessionId } = event.params;
     const message = event.data?.data();
-
-    // ── Guard: only react to user messages ──────────────────────────────────
     if (!message || message.role !== 'user') return;
 
-    const sessionRef = db
-      .collection('users')
-      .doc(businessId)
-      .collection('agent_sessions')
-      .doc(sessionId);
-
+    const sessionRef = db.collection('users').doc(businessId)
+      .collection('agent_sessions').doc(sessionId);
     const messagesRef = sessionRef.collection('messages');
 
+    // DataStore scoped to this invocation — never at module level
+    const dataStore = new DataStore();
+
+    const FALLBACK = "I'm having trouble connecting right now. Please try again in a moment.";
+    const EXHAUSTED = "I wasn't able to complete that in the allowed steps. Please try rephrasing.";
+
     try {
-      // ── Step 1: Lock ────────────────────────────────────────────────────────
       await sessionRef.update({
         status: 'generating',
         generatingStartedAt: Timestamp.now(),
         lastActivityAt: FieldValue.serverTimestamp(),
       });
 
-      // ── Step 2: Fetch conversation history ──────────────────────────────────
-      const historySnap = await messagesRef
-        .orderBy('createdAt', 'asc')
-        .get();
-
-      const allMessages = historySnap.docs.map((d) => d.data());
+      const historySnap = await messagesRef.orderBy('createdAt', 'asc').get();
+      const allMessages = historySnap.docs.map(d => d.data());
       const historyMessages = allMessages.slice(0, -1);
 
-      type Content = {
-        role: string;
-        parts: Part[];
-      }
+      type Content = { role: string; parts: Part[] };
 
-      const geminiHistory: Content[] = historyMessages.map((m) => ({
+      const geminiHistory: Content[] = historyMessages.map(m => ({
         role: m.role === 'assistant' ? 'model' : 'user',
         parts: [{ text: m.content as string }],
       }));
 
-
-      // ── Step 3: Agentic loop ────────────────────────────────────────────────
-      const FALLBACK_REPLY = "I'm having trouble connecting right now. Please try again in a moment.";
-      const ITERATION_EXCEEDED_REPLY = "I wasn't able to complete that request. Please try rephrasing.";
-
-      let replyContent: string;
+      let replyContent = '';
 
       try {
         const genAI = new GoogleGenAI({ apiKey: GEMINI_API_KEY.value() });
-
-        // contents grows each iteration as tool call turns are appended
         let contents: Content[] = [
           ...geminiHistory,
           { role: 'user', parts: [{ text: message.content as string }] },
         ];
 
-        let iterations = 0;
-
-        while (iterations < MAX_TOOL_ITERATIONS) {
-          iterations++;
-
+        for (let i = 0; i < MAX_TOOL_ITERATIONS; i++) {
           const result = await genAI.models.generateContent({
             model: 'gemini-2.5-flash',
             config: {
               systemInstruction: buildSystemPrompt(businessId),
               temperature: 0.3,
-              maxOutputTokens: 1024,
+              maxOutputTokens: 2048,
               tools: [{ functionDeclarations: TOOL_DECLARATIONS }],
             },
             contents,
           });
 
           const candidate = result.candidates?.[0];
-          if (!candidate) {
-            console.error('❌ Gemini returned no candidates');
-            replyContent = FALLBACK_REPLY;
-            break;
-          }
+          if (!candidate) { replyContent = FALLBACK; break; }
 
-          // Find the first meaningful part — could be text or a function call
           const parts = candidate.content?.parts ?? [];
-          const functionCallPart = parts.find((p) => p.functionCall != null);
-          const textPart = parts.find((p) => p.text != null);
+          const fnPart = parts.find(p => p.functionCall != null);
+          const txtPart = parts.find(p => p.text != null);
 
-          if (functionCallPart?.functionCall) {
-            // ── Tool call branch ──────────────────────────────────────────────
-            const { name, args } = functionCallPart.functionCall;
+          if (fnPart?.functionCall) {
+            const { name, args } = fnPart.functionCall;
+            console.log(`🔧 Tool [${i + 1}/${MAX_TOOL_ITERATIONS}]: ${name}`);
 
-            console.log(`🔧 Tool call [iteration ${iterations}]: ${name}`, args);
+            const toolResult = await executeTool(
+              name as string,
+              (args ?? {}) as Record<string, any>,
+              businessId,
+              dataStore,
+            );
 
-            let toolResult: Record<string, unknown>;
-            try {
-              toolResult = await executeTool(
-                name as string,
-                (args ?? {}) as Record<string, unknown>,
-                businessId,
-              );
-            } catch (toolErr) {
-              // Should not normally reach here since executeTool never throws,
-              // but catch defensively so the loop doesn't crash.
-              console.error(`❌ executeTool threw unexpectedly for ${name}:`, toolErr);
-              toolResult = { error: 'Tool execution failed unexpectedly.' };
-            }
+            const resultPreview = (toolResult as any).count
+              ?? (toolResult as any).total
+              ?? (toolResult as any).results?.length
+              ?? (toolResult as any).error
+              ?? '?';
+            console.log(`✅ [${name}] → ${resultPreview}`);
 
-            console.log(`✅ Tool result [${name}]:`, toolResult);
-
-            // Append the model's function call turn and our result turn,
-            // then loop — Gemini will read both and decide what to do next.
             contents = [
               ...contents,
-              {
-                role: 'model',
-                parts: [{ functionCall: { name: name as string, args: args ?? {} } }],
-              },
-              {
-                role: 'user',
-                parts: [{ functionResponse: { name: name as string, response: toolResult } }],
-              },
+              { role: 'model', parts: [{ functionCall: { name: name as string, args: args ?? {} } }] },
+              { role: 'user', parts: [{ functionResponse: { name: name as string, response: toolResult } }] },
             ];
 
-          } else if (textPart?.text) {
-            // ── Text reply branch — loop done ────────────────────────────────
-            replyContent = textPart.text;
+          } else if (txtPart?.text) {
+            replyContent = txtPart.text;
             break;
-
           } else {
-            // Gemini returned neither text nor a function call — shouldn't happen
-            console.error('❌ Gemini returned a candidate with no usable part:', JSON.stringify(parts));
-            replyContent = FALLBACK_REPLY;
+            replyContent = FALLBACK;
             break;
           }
         }
 
+        if (!replyContent) {
+          console.warn(`⚠️ Exhausted ${MAX_TOOL_ITERATIONS} iterations`);
+          replyContent = EXHAUSTED;
+        }
+
       } catch (geminiErr) {
-        console.error('❌ Gemini API error — falling back to default reply:', geminiErr);
-        replyContent = FALLBACK_REPLY;
+        console.error('❌ Gemini API error:', geminiErr);
+        replyContent = FALLBACK;
       }
 
-      // If we exhausted iterations without breaking, set the fallback
-      if (!replyContent!) {
-        console.warn(`⚠️ Tool loop exhausted MAX_TOOL_ITERATIONS (${MAX_TOOL_ITERATIONS})`);
-        replyContent = ITERATION_EXCEEDED_REPLY;
-      }
-
-      // ── Step 4: Write assistant message ────────────────────────────────────
-      const assistantMessageRef = messagesRef.doc();
-      await assistantMessageRef.set({
-        id: assistantMessageRef.id,
+      const assistantRef = messagesRef.doc();
+      await assistantRef.set({
+        id: assistantRef.id,
         role: 'assistant',
         content: replyContent,
         createdAt: Timestamp.now(),
       });
 
-      // ── Step 5: Unlock ──────────────────────────────────────────────────────
       await sessionRef.update({
         status: 'idle',
         generatingStartedAt: null,
@@ -517,14 +623,11 @@ export const onAgentMessageCreated = onDocumentCreated(
 
     } catch (err) {
       console.error('❌ onAgentMessageCreated error:', err);
-
       await sessionRef.update({
         status: 'error',
         generatingStartedAt: null,
         lastActivityAt: FieldValue.serverTimestamp(),
-      }).catch(() => {
-        console.error('❌ Failed to set session status to error');
-      });
+      }).catch(() => { });
     }
-  }
+  },
 );

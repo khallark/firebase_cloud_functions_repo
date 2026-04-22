@@ -245,7 +245,7 @@ For each vendor job:
 
 Fires on every Shopify order document write (created, updated, deleted).
 
-What it does — two responsibilities:
+What it does — three responsibilities:
 
 **1. Order counts (via `updateOrderCountsWithIncrement`):**
 - Updates `accounts/{storeId}/metadata/orderCounts.counts.{status}` using `FieldValue.increment`.
@@ -257,6 +257,17 @@ What it does — two responsibilities:
 - Uses a transition matrix `POSSIBLE_INVENTORY_CHANGES` to decide if `blockedStock` should increment or decrement.
 - For each line item: looks up `variantMappingDetails[variantId]` on the store product to find `businessId` + `businessProductSku`, then updates `users/{businessId}/products/{businessProductSku}.inventory.blockedStock`.
 - **Critical skip**: If transition is `Ready To Dispatch → Dispatched`, skips the blockedStock update entirely — this is handled atomically by `onUpcWritten` when UPCs go from `outbound → null` to avoid double-decrement.
+
+**3. Status timestamp sync (on new order created or status change):**
+- **No API route writes `lastStatusUpdate` or `{status}At` fields directly.** This trigger is the single owner of all status timestamp fields on order documents.
+- Reads the order's `customStatusesLogs` array (each entry: `{status, createdAt}`).
+- Filters logs to valid statuses only (the 21 known statuses: New, Confirmed, Ready To Dispatch, Dispatched, In Transit, Out For Delivery, Delivered, RTO In Transit, RTO Delivered, DTO Requested, DTO Booked, DTO In Transit, DTO Delivered, Pending Refunds, DTO Refunded, Lost, Closed, RTO Closed, Cancellation Requested, Cancelled). Invalid/unknown statuses are ignored.
+- Finds the latest valid log entry by `createdAt` (highest `toMillis()` value).
+- Sets `{toCamelCase(latestLog.status)}At = latestLog.createdAt` on the order doc (e.g. `confirmedAt`, `readyToDispatchAt`, `pendingRefundsAt`, `dtoRefundedAt`).
+- Sets `lastStatusUpdate = latestLog.createdAt` — always equal to the most recent valid log's timestamp.
+- **Stale field cleanup:** iterates all 21 valid statuses. For any `{status}At` field that exists on the order document but has no matching entry in `customStatusesLogs`, deletes it via `FieldValue.delete()`. This handles revert flows (e.g. `revert-to-confirmed` trims the log array, and the trigger cleans up the now-orphaned `readyToDispatchAt` field).
+- All writes (set + deletes) are batched into a single `.update()` call on the order doc.
+- Runs on both CASE 2 (new order create
 
 ---
 
@@ -331,7 +342,7 @@ Flow:
 2. Worker processes two queues with cursor-based pagination (max 25,000 orders, 500 per write batch):
    - **Store credit orders** (`payment_gateway_names` contains `"shopify_store_credit"`): close after 48h of Delivered.
    - **Regular orders**: close after 120h of Delivered. Store credit orders in this second query are filtered out client-side (`hasStoreCredit()`).
-3. Closing means: `{customStatus: "Closed", lastStatusUpdate, customStatusesLogs append}`.
+3. Closing means: `{customStatus: "Closed", customStatusesLogs append}`. The `closedAt` and `lastStatusUpdate` fields are set automatically by the `updateOrderCounts` trigger when it detects the status change.
 
 ### `dailyInventorySnapshot` [onSchedule: daily 23:59 IST]
 
@@ -369,7 +380,7 @@ Frontend consumption: `onSnapshot` on `users/{businessId}.grossProfitData`.
 
 Calculates eight metric rows in parallel:
 1. **Sale**: all orders in date range by `createdAt`. Excludes ENDORA/STYLE 05 single-vendor orders.
-2. **Sale Return**: RTO Closed (by `lastStatusUpdate`), Pending Refunds (by `pendingRefundsAt`), Cancellation Requested (by `cancellationRequestedAt`), Cancelled (by `lastStatusUpdate` if `cancellationRequestedAt` absent).
+2. **Sale Return**: RTO Closed (by `lastStatusUpdate`), Pending Refunds (by `pendingRefundsAt`), Cancellation Requested (by `cancellationRequestedAt`), Cancelled (by `lastStatusUpdate` if `cancellationRequestedAt` absent). All `{status}At` and `lastStatusUpdate` fields used in these queries are maintained automatically by the `updateOrderCounts` trigger from `customStatusesLogs`.
 3. **Purchase**: GRNs by `createdAt` date range. Iterates each GRN's `items[]` array. For each item, `taxable = item.unitCost × item.receivedQty` (unit cost is ex-tax). Tax rate is fetched per SKU from `users/{businessId}/products/{sku}.taxRate` via a single `db.getAll()` batch call across all unique SKUs in the result set. Tax is applied **forward** (`taxable × taxRate / 100`), split equally into CGST + SGST (all purchases assumed intra-state Punjab — no IGST). `net = taxable + cgst + sgst`.
 4. **Credit Notes**: completed Credit Notes by `completedAt` in date range. Queries `users/{businessId}/credit_notes` where `status == "completed"`. Value = sum of `items[].unitPrice × items[].quantity` across all matched docs. Represents stock that left the warehouse without generating revenue — treated as a negative row.
 5. **Opening Stock**: `inventory_snapshots` for `startDate - 1 day`. Fetches product `price` (COGS) per product.

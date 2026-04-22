@@ -394,7 +394,6 @@ export const processShipmentTask3 = onRequest(
             courierProvider: "Xpressbees",
             customStatus: "Ready To Dispatch",
             shippingMode,
-            lastStatusUpdate: FieldValue.serverTimestamp(),
             customStatusesLogs: FieldValue.arrayUnion({
               status: "Ready To Dispatch",
               createdAt: Timestamp.now(),

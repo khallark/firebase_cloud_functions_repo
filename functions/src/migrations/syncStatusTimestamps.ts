@@ -1,5 +1,5 @@
 import { onRequest } from "firebase-functions/v2/https";
-import { DocumentReference, Timestamp } from "firebase-admin/firestore";
+import { DocumentReference, FieldValue, Timestamp } from "firebase-admin/firestore";
 import { db } from "../firebaseAdmin";
 import { SHARED_STORE_IDS } from "../config";
 import { toCamelCase } from "../helpers";
@@ -58,7 +58,7 @@ export const syncStatusTimestamps = onRequest(
             totalOrders += ordersSnap.size;
 
             const BATCH_SIZE = 499;
-            let batchOps: Array<{ ref: DocumentReference; fields: Record<string, Timestamp> }> = [];
+            let batchOps: Array<{ ref: DocumentReference; fields: Record<string, Timestamp | FieldValue> }> = [];
 
             const flush = async () => {
                 if (batchOps.length === 0) return;
@@ -77,26 +77,31 @@ export const syncStatusTimestamps = onRequest(
                 const order = doc.data();
                 const logs: Array<{ status: string; createdAt: Timestamp }> = order.customStatusesLogs ?? [];
 
-                if (logs.length === 0) {
-                    skippedOrders++;
-                    continue;
-                }
-
                 const sortedLogs = [...logs].sort((a, b) => {
                     const aMs = a.createdAt?.toMillis?.() ?? 0;
                     const bMs = b.createdAt?.toMillis?.() ?? 0;
                     return aMs - bMs;
                 });
 
-                const fields: Record<string, Timestamp> = {};
+                const fields: Record<string, Timestamp | FieldValue> = {};
+                const loggedStatuses = new Set(logs.map((l) => l.status));
                 const seen = new Set<string>();
 
+                // 1. Set {status}At from first occurrence in logs
                 for (const log of sortedLogs) {
                     if (!VALID_STATUSES.has(log.status)) continue;
                     if (seen.has(log.status)) continue;
                     seen.add(log.status);
                     if (log.createdAt) {
                         fields[statusToFieldName(log.status as CustomStatus)] = log.createdAt;
+                    }
+                }
+
+                // 2. Delete stale {status}At fields not backed by a log entry
+                for (const status of VALID_STATUSES) {
+                    const fieldName = statusToFieldName(status as CustomStatus);
+                    if (!loggedStatuses.has(status) && order[fieldName] != null) {
+                        fields[fieldName] = FieldValue.delete();
                     }
                 }
 

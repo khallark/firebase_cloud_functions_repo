@@ -401,7 +401,6 @@ export const processShipmentTask = onRequest(
             courierProvider: "Delhivery",
             customStatus: "Ready To Dispatch",
             shippingMode,
-            lastStatusUpdate: FieldValue.serverTimestamp(),
             customStatusesLogs: FieldValue.arrayUnion({
               status: "Ready To Dispatch",
               createdAt: Timestamp.now(),

@@ -347,7 +347,6 @@ export const processBlueDartReturnShipmentTask = onRequest(
             courier_reverse: "Blue Dart",
             courierReverseProvider: "Blue Dart",
             customStatus: "DTO Booked",
-            lastStatusUpdate: FieldValue.serverTimestamp(),
             customStatusesLogs: FieldValue.arrayUnion({
               status: "DTO Booked",
               createdAt: Timestamp.now(),

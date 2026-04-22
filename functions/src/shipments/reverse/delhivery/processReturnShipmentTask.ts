@@ -495,7 +495,6 @@ export const processReturnShipmentTask = onRequest(
             courier_reverse: "Delhivery",
             courierReverseProvider: "Delhivery",
             customStatus: "DTO Booked",
-            lastStatusUpdate: FieldValue.serverTimestamp(),
             customStatusesLogs: FieldValue.arrayUnion({
               status: "DTO Booked",
               createdAt: Timestamp.now(),

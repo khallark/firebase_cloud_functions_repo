@@ -1008,12 +1008,41 @@ export const updateOrderCounts = onDocumentWritten(
       );
 
       try {
-        const newField = toCamelCase(newStatus);
-        await change.after.ref.update({
-          [`${newField}At`]: FieldValue.serverTimestamp(),
-        });
+        const logs: Array<{ status: string; createdAt: any }> = newOrder.customStatusesLogs || [];
+        const updateFields: Record<string, any> = {};
+
+        // 1. Set the latest log's timestamp
+        if (logs.length > 0) {
+          const latestLog = logs.reduce((a, b) =>
+            (a.createdAt?.toMillis?.() ?? 0) >= (b.createdAt?.toMillis?.() ?? 0) ? a : b,
+          );
+          const field = toCamelCase(latestLog.status);
+          updateFields[`${field}At`] = latestLog.createdAt;
+          updateFields.lastStatusUpdate = latestLog.createdAt;
+        }
+
+        // 2. Delete stale {status}At fields not backed by a log entry
+        const loggedStatuses = new Set(logs.map((l) => l.status));
+        const ALL_STATUSES = [
+          "New", "Confirmed", "Ready To Dispatch", "Dispatched", "In Transit",
+          "Out For Delivery", "Delivered", "RTO In Transit", "RTO Delivered",
+          "DTO Requested", "DTO Booked", "DTO In Transit", "DTO Delivered",
+          "Pending Refunds", "DTO Refunded", "Lost", "Closed", "RTO Closed",
+          "Cancellation Requested", "Cancelled",
+        ];
+
+        for (const status of ALL_STATUSES) {
+          const fieldName = `${toCamelCase(status)}At`;
+          if (!loggedStatuses.has(status) && newOrder[fieldName] != null) {
+            updateFields[fieldName] = FieldValue.delete();
+          }
+        }
+
+        if (Object.keys(updateFields).length > 0) {
+          await change.after.ref.update(updateFields);
+        }
       } catch (error) {
-        console.error(`Failed to write "${newStatus}"At for order ${newOrder.name ?? newOrder.orderId}:`, error);
+        console.error(`Failed to sync statusAt fields for order ${newOrder.name ?? newOrder.orderId}:`, error);
       }
 
       return;
@@ -1046,12 +1075,41 @@ export const updateOrderCounts = onDocumentWritten(
       }
 
       try {
-        const newField = toCamelCase(newStatus);
-        await change.after.ref.update({
-          [`${newField}At`]: FieldValue.serverTimestamp(),
-        });
+        const logs: Array<{ status: string; createdAt: any }> = newOrder.customStatusesLogs || [];
+        const updateFields: Record<string, any> = {};
+
+        // 1. Set the latest log's timestamp
+        if (logs.length > 0) {
+          const latestLog = logs.reduce((a, b) =>
+            (a.createdAt?.toMillis?.() ?? 0) >= (b.createdAt?.toMillis?.() ?? 0) ? a : b,
+          );
+          const field = toCamelCase(latestLog.status);
+          updateFields[`${field}At`] = latestLog.createdAt;
+          updateFields.lastStatusUpdate = latestLog.createdAt;
+        }
+
+        // 2. Delete stale {status}At fields not backed by a log entry
+        const loggedStatuses = new Set(logs.map((l) => l.status));
+        const ALL_STATUSES = [
+          "New", "Confirmed", "Ready To Dispatch", "Dispatched", "In Transit",
+          "Out For Delivery", "Delivered", "RTO In Transit", "RTO Delivered",
+          "DTO Requested", "DTO Booked", "DTO In Transit", "DTO Delivered",
+          "Pending Refunds", "DTO Refunded", "Lost", "Closed", "RTO Closed",
+          "Cancellation Requested", "Cancelled",
+        ];
+
+        for (const status of ALL_STATUSES) {
+          const fieldName = `${toCamelCase(status)}At`;
+          if (!loggedStatuses.has(status) && newOrder[fieldName] != null) {
+            updateFields[fieldName] = FieldValue.delete();
+          }
+        }
+
+        if (Object.keys(updateFields).length > 0) {
+          await change.after.ref.update(updateFields);
+        }
       } catch (error) {
-        console.error(`Failed to write "${newStatus}"At for order ${newOrder.name ?? newOrder.orderId}:`, error);
+        console.error(`Failed to sync statusAt fields for order ${newOrder.name ?? newOrder.orderId}:`, error);
       }
     } else {
       console.log(`⏭️ No status change for order ${orderId}`);

@@ -259,7 +259,6 @@ function prepareDelhiveryOrderUpdates(orders: any[], shipments: any[]): OrderUpd
           data: {
             customStatus: "Delivered",
             awb_reverse: FieldValue.delete(),
-            lastStatusUpdate: FieldValue.serverTimestamp(),
             customStatusesLogs: FieldValue.arrayUnion({
               status: "Delivered",
               createdAt: Timestamp.now(),
@@ -275,7 +274,6 @@ function prepareDelhiveryOrderUpdates(orders: any[], shipments: any[]): OrderUpd
             customStatus: "Confirmed",
             courier: FieldValue.delete(),
             awb: FieldValue.delete(),
-            lastStatusUpdate: FieldValue.serverTimestamp(),
             customStatusesLogs: FieldValue.arrayUnion({
               status: "Confirmed",
               createdAt: Timestamp.now(),
@@ -291,7 +289,6 @@ function prepareDelhiveryOrderUpdates(orders: any[], shipments: any[]): OrderUpd
       ref: order.ref,
       data: {
         customStatus: newStatus,
-        lastStatusUpdate: FieldValue.serverTimestamp(),
         customStatusesLogs: FieldValue.arrayUnion({
           status: newStatus,
           createdAt: Timestamp.now(),

@@ -210,7 +210,6 @@ function prepareShiprocketOrderUpdates(orders: any[], trackingData: any): OrderU
       ref: order.ref,
       data: {
         customStatus: newStatus,
-        lastStatusUpdate: FieldValue.serverTimestamp(),
         customStatusesLogs: FieldValue.arrayUnion({
           status: newStatus,
           createdAt: Timestamp.now(),

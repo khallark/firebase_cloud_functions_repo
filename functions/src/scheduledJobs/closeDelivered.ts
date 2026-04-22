@@ -97,7 +97,6 @@ async function closeOrdersBatch(
     chunk.forEach((doc) => {
       batch.update(doc.ref, {
         customStatus: "Closed",
-        lastStatusUpdate: FieldValue.serverTimestamp(),
         customStatusesLogs: FieldValue.arrayUnion({
           status: "Closed",
           createdAt: Timestamp.now(),

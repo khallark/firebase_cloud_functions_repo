@@ -209,7 +209,6 @@ function prepareXpressbeesOrderUpdates(orders: any[], trackingDataArray: any[]):
       ref: order.ref,
       data: {
         customStatus: newStatus,
-        lastStatusUpdate: FieldValue.serverTimestamp(),
         customStatusesLogs: FieldValue.arrayUnion({
           status: newStatus,
           createdAt: Timestamp.now(),

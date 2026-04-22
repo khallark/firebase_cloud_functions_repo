@@ -276,7 +276,6 @@ function prepareBlueDartOrderUpdates(orders: any[], shipments: any[]): OrderUpda
 
     const updateData: any = {
       customStatus: newStatus,
-      lastStatusUpdate: FieldValue.serverTimestamp(),
       customStatusesLogs: FieldValue.arrayUnion({
         status: newStatus,
         createdAt: Timestamp.now(),

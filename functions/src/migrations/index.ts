@@ -34,3 +34,5 @@ export * from "./auditDTORefundedAmounts";
 export * from "./syncStatusTimestamps";
 export * from "./findOrdersByAwb";
 export * from "./migrateCreditNoteRef";
+export * from "./calcLostMetric";
+export * from "./getRawOrders";

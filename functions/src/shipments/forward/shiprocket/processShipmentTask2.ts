@@ -521,7 +521,6 @@ export const processShipmentTask2 = onRequest(
             courier: `Shiprocket: ${courierName ?? "Unknown"}`,
             courierProvider: "Shiprocket",
             customStatus: "Ready To Dispatch",
-            lastStatusUpdate: FieldValue.serverTimestamp(),
             customStatusesLogs: FieldValue.arrayUnion({
               status: "Ready To Dispatch",
               createdAt: Timestamp.now(),

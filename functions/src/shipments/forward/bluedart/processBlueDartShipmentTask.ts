@@ -428,7 +428,6 @@ export const processBlueDartShipmentTask = onRequest(
 
             customStatus: "Ready To Dispatch",
             shippingMode,
-            lastStatusUpdate: FieldValue.serverTimestamp(),
             customStatusesLogs: FieldValue.arrayUnion({
               status: "Ready To Dispatch",
               createdAt: Timestamp.now(),
