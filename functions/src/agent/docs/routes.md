@@ -323,7 +323,7 @@ This is the AI-powered in-app assistant. The entire agent UI is rendered into a 
 - `useRtoInTransitCounts` hook → computes RTO In Transit tag breakdowns.
 - `useAwbCount` hook → counts `users/{businessId}/unused_awbs` docs.
 - `useAllOrderIds` hook → fetches all order IDs matching current filters (triggered by "Select all N orders" click).
-- Multiple mutations via `useUpdateOrderStatus`, `useBulkUpdateStatus`, `useRevertOrderStatus`, `useDispatchOrders`, `useOrderSplit`, `useReturnBooking`, `useDownloadSlips`, `useDownloadExcel`, `useDownloadProductsExcel`.
+- Multiple mutations via `useUpdateOrderStatus`, `useBulkUpdateStatus`, `useRevertOrderStatus`, `useDispatchOrders`, `useOrderSplit`, `useReturnBooking`, `useDownloadSlips`, - `useDownloadManifest`, `useDownloadExcel`, `useDownloadProductsExcel`.
 - `POST /api/shopify/orders/bulk-update-status` — Confirm, Close, RTO Close, Lost.
 - `POST /api/shopify/orders/dispatch` — enqueues dispatch Cloud Tasks.
 - `POST /api/shopify/courier/assign-awb` — via `processAwbAssignments` from context.
@@ -332,6 +332,7 @@ This is the AI-powered in-app assistant. The entire agent UI is rendered into a 
 - `POST /api/shopify/orders/split-order` — order split.
 - `POST /api/shopify/orders/export` → .xlsx download.
 - `POST /api/shopify/orders/download-slips` → PDF download.
+- `POST /api/shopify/orders/download-manifest` → Manifest PDF download.
 - `POST /api/shopify/orders/export-products` → products .xlsx download.
 - `POST /api/shopify/orders/mark-packed` — from StartPackagingDialog.
 - `POST /api/shopify/orders/make-pickup-ready` — from PerformPickupDialog.
@@ -373,6 +374,7 @@ This is the AI-powered in-app assistant. The entire agent UI is rendered into a 
 - "Download" dropdown (Download icon + ChevronDown):
   - Download Excel (always visible)
   - Download Slips (hidden for All Orders/New/Confirmed/Cancellation Requested/Cancelled)
+  - Download Manifest (Dispatched tab only)
   - Download Products (Confirmed + Ready To Dispatch tabs only)
 - "Actions" dropdown (ChevronDown):
   - Confirm — New tab
@@ -1177,6 +1179,7 @@ Selection is capped at 100 UPCs across all inbound and outbound sub-tabs (enforc
 | POST | `/api/shopify/orders/delete` | Calls Shopify REST API `DELETE /admin/api/2024-07/orders/{orderId}.json`. Firestore deletion is handled by the `orders/delete` webhook. Returns 200 if Shopify responds 200 or 404. |
 | POST | `/api/shopify/orders/export` | Fetches selected orders in chunks of 30 (Firestore `in` query limit). One Excel row per line item. On shared stores: filters by vendor auth. Per-item columns include: orderName, isPickedUp, AWB, returnAWB, courier, orderDate, lastStatusUpdate, customer, email, phone, itemTitle, itemSku, returnRequested, itemQty, itemPrice (less discounts), proportionate totalPrice, proportionate totalOutstanding, discount, vendor, currency, paymentStatus (Prepaid/COD), status, billing address fields, shipping address fields. |
 | POST | `/api/shopify/orders/download-slips` | Puppeteer PDF (A4) with one page per order. Shows: courier name (header), AWB as CODE128 barcode (JsBarcode), ship-to name + address + PIN, phone (masked for Blue Dart: `X{digits}XXXXX{last3}`). Blue Dart only: shows `bdDestinationArea` and `bdClusterCode` next to PIN, mode forced to "Express". Payment info: Prepaid/COD, total price, **Collectable Amount** (from `raw.total_outstanding`) in numbers and words (Indian numeral system). Seller name, GST (03AAQCM9385B1Z8). Product table: HSN, qty, taxable price (total / 1.05), taxes (5%), total. Return address from `businessData.companyAddress`. |
+| POST | `/api/shopify/orders/download-manifest` | Generates a Puppeteer A4 landscape PDF courier manifest (handover document) for selected orders. Same auth pattern as download-slips: chunks orderIds into groups of 30 for Firestore `in` queries, filters by vendor auth on shared stores. Manifest layout: header with seller name/GST/address and a generated manifest ID (`MFT-YYYYMMDD-XXXXXX`) + date/time. Summary strip: total shipments, prepaid count, COD count, total COD collectible. Shipment table columns: #, Order, AWB Number, Courier, Customer, City, State, PIN, Items, Payment (Prepaid/COD), COD Amount, Total. Courier-wise summary table: courier name, shipment count, COD total, prepaid total. Signature blocks for warehouse handler and courier pickup agent. Footer note about proof-of-handover. |
 | POST | `/api/shopify/orders/generate-purchase-order` | Generates a compact A4 PDF purchase order for a single vendor. Aggregates all line items matching `item.vendor === vendor` across selected orders, groups by SKU. Columns: Sr No, Item SKU, Qty. Shows PO number format `{vendor}-{poNumber}`, date, total pcs. |
 | POST | `/api/shopify/orders/update-confirmed-orders-availability-tag` | Tags a Confirmed order's availability. Writes to `tags_confirmed` as an array keeping only the last 2 entries (new tag at front, old entries shifted by slice(1)). Used by the Availability Dialog to mark each order as Available / Unavailable / Pending. |
 | POST | `/api/shopify/orders/export-products` | Exports a products list Excel from selected orders. One row per line item: srNo, itemSku, itemQty, vendor, orderName, availability (blank — to be filled manually). On shared stores: vendor auth applied. |
