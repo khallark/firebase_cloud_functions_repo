@@ -1,6 +1,5 @@
 import { onDocumentWritten } from "firebase-functions/firestore";
 import { db } from "../firebaseAdmin";
-import { SHARED_STORE_ID, SHARED_STORE_IDS } from "../config";
 import { sleep } from "../helpers";
 
 interface Inventory {
@@ -176,25 +175,15 @@ async function recomputeBlockedStock(
   businessData: any,
 ): Promise<number> {
   let totalBlocked = 0;
-
+  console.log(businessData)
   for (const mapping of afterMappedVariants) {
     const { storeId, variantId } = mapping;
-    const isSharedStore = SHARED_STORE_IDS.includes(storeId);
-    const isOWR = businessData.vendorName === "OWR";
 
     let ordersQuery = db
       .collection("accounts")
       .doc(storeId)
       .collection("orders")
       .where("customStatus", "in", ["New", "Confirmed", "Ready To Dispatch"]);
-
-    if (isSharedStore) {
-      if (isOWR) {
-        ordersQuery = ordersQuery.where("vendors", "array-contains-any", ["OWR", "BBB", "Ghamand"]);
-      } else {
-        ordersQuery = ordersQuery.where("vendors", "array-contains", businessData.vendorName);
-      }
-    }
 
     const ordersSnapshot = await ordersQuery.get();
 
@@ -212,8 +201,7 @@ async function recomputeBlockedStock(
 }
 
 /**
- * Syncs availableStock to Shopify for all mappings in afterMappedVariants,
- * skipping SHARED_STORE_ID.
+ * Syncs availableStock to Shopify for all mappings in afterMappedVariants
  */
 async function syncAllMappingsToShopify(
   businessId: string,
@@ -223,8 +211,6 @@ async function syncAllMappingsToShopify(
 ): Promise<void> {
   for (const mapping of afterMappedVariants) {
     const { storeId, productId: mappedProductId, variantId } = mapping;
-
-    if (storeId === SHARED_STORE_ID) continue;
 
     try {
       const storeSnap = await db.doc(`accounts/${storeId}`).get();
@@ -296,59 +282,58 @@ export const onProductWritten = onDocumentWritten(
           console.error(`Business ${businessId} not found`);
         } else {
           const businessData = businessDoc.data();
+          
+          // Recompute full blocked stock across all current mappings
+          const recomputedBlockedStock = await recomputeBlockedStock(
+            businessId,
+            afterMappedVariants,
+            businessData,
+          );
 
-          if (businessData?.vendorName) {
-            // Recompute full blocked stock across all current mappings
-            const recomputedBlockedStock = await recomputeBlockedStock(
-              businessId,
-              afterMappedVariants,
-              businessData,
+          console.log(
+            `🔢 Recomputed blockedStock for ${productId}: ${recomputedBlockedStock}`,
+          );
+
+          // Overwrite blockedStock in a transaction
+          const productRef = db.doc(`users/${businessId}/products/${productId}`);
+          let availableStock = 0;
+
+          await db.runTransaction(async (tx) => {
+            const currentDoc = await tx.get(productRef);
+            if (!currentDoc.exists) {
+              console.warn(`Product ${productId} no longer exists`);
+              return;
+            }
+
+            const currentInventory = currentDoc.data()?.inventory;
+            const inv = getInventoryValues(currentInventory);
+            inv.blockedStock = recomputedBlockedStock;
+
+            availableStock = calculateAvailableStock(
+              calculatePhysicalStock(inv),
+              inv.blockedStock,
             );
 
-            console.log(
-              `🔢 Recomputed blockedStock for ${productId}: ${recomputedBlockedStock}`,
-            );
-
-            // Overwrite blockedStock in a transaction
-            const productRef = db.doc(`users/${businessId}/products/${productId}`);
-            let availableStock = 0;
-
-            await db.runTransaction(async (tx) => {
-              const currentDoc = await tx.get(productRef);
-              if (!currentDoc.exists) {
-                console.warn(`Product ${productId} no longer exists`);
-                return;
-              }
-
-              const currentInventory = currentDoc.data()?.inventory;
-              const inv = getInventoryValues(currentInventory);
-              inv.blockedStock = recomputedBlockedStock;
-
-              availableStock = calculateAvailableStock(
-                calculatePhysicalStock(inv),
-                inv.blockedStock,
-              );
-
-              tx.update(productRef, {
-                inventory: {
-                  ...currentInventory,
-                  blockedStock: recomputedBlockedStock,
-                },
-              });
+            tx.update(productRef, {
+              inventory: {
+                ...currentInventory,
+                blockedStock: recomputedBlockedStock,
+              },
             });
+          });
 
-            console.log(
-              `✅ blockedStock overwritten for ${productId}: ${recomputedBlockedStock} → availableStock: ${availableStock}`,
-            );
+          console.log(
+            `✅ blockedStock overwritten for ${productId}: ${recomputedBlockedStock} → availableStock: ${availableStock}`,
+          );
 
-            // Sync to Shopify for all current mappings
-            await syncAllMappingsToShopify(
-              businessId,
-              productId,
-              afterMappedVariants,
-              availableStock,
-            );
-          }
+          // Sync to Shopify for all current mappings
+          await syncAllMappingsToShopify(
+            businessId,
+            productId,
+            afterMappedVariants,
+            availableStock,
+          );
+
         }
 
         // Mapping change is fully handled above — skip Scenario 2 to avoid

@@ -1,43 +1,19 @@
-import { SUPER_ADMIN_ID } from "../config";
-
 /**
  * Checks if business is authorized to process this order
  */
 export function BusinessIsAuthorisedToProcessThisOrder(
-  businessId: string,
-  vendorName: string,
-  vendors: any,
+  businessData: any,
+  storeId: string,
 ) {
   try {
-    if (businessId === SUPER_ADMIN_ID) {
+    if (!businessData || !storeId) {
       return {
         authorised: true,
       };
     }
-    if (!vendorName) {
-      return {
-        authorised: false,
-        error: "No vendorName provided",
-        status: 400,
-      };
-    }
-    if (!vendors || !Array.isArray(vendors) || !vendors.length) {
-      return {
-        authorised: false,
-        error: "Invalid vendors array",
-        status: 400,
-      };
-    }
 
-    const isAuthorized =
-      vendorName !== "OWR"
-        ? vendors.includes(vendorName)
-        : (vendors.includes(vendorName) ||
-            vendors.includes("Ghamand") ||
-            vendors.includes("BBB")) &&
-          !vendors.includes("ENDORA") &&
-          !vendors.includes("STYLE 05");
-
+    const isAuthorized = (businessData?.stores ?? [])?.includes(storeId);
+    
     if (!isAuthorized) {
       return {
         authorised: false,

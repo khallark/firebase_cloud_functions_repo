@@ -1,4 +1,4 @@
-import { FieldValue, Filter, QueryDocumentSnapshot, Timestamp } from "firebase-admin/firestore";
+import { DocumentSnapshot, FieldValue, Filter, QueryDocumentSnapshot, Timestamp } from "firebase-admin/firestore";
 import {
   API_BATCH_SIZE,
   CHUNK_SIZE,
@@ -12,8 +12,8 @@ import { sleep } from "../../helpers";
 import { db } from "../../firebaseAdmin";
 
 export async function processShiprocketOrderChunk(
+  businessDoc: DocumentSnapshot,
   accountId: string,
-  apiKey: string,
   cursor: string | null,
 ): Promise<ChunkResult> {
   const excludedStatuses = new Set([
@@ -31,10 +31,40 @@ export async function processShiprocketOrderChunk(
     "Cancelled",
   ]);
 
-  const shopRef = db.collection("accounts").doc(accountId);
+  const businessData = businessDoc.data()!;
+  const shiprocket = businessData.integrations?.couriers?.shiprocket;
 
-  const shopDoc = await shopRef.get();
-  const shopData = (shopDoc.data() as any) || null;
+  if (!shiprocket?.email || !shiprocket?.password) {
+    throw new Error("SHIPROCKET_CREDENTIALS_MISSING");
+  }
+
+  const response = await fetch(
+    "https://apiv2.shiprocket.in/v1/external/auth/login",
+    {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({
+        email: shiprocket.email,
+        password: shiprocket.password,
+      }),
+    },
+  );
+
+  if (!response.ok) {
+    const errorBody = await response.text();
+    console.error("Shiprocket auth failed", response.status, errorBody);
+    throw new Error(`Shiprocket auth failed: ${response.status}`);
+  }
+
+  const authData = await response.json() as any;
+
+  if (!authData?.token) {
+    throw new Error("Shiprocket token missing");
+  }
+
+  const apiKey = authData.token;
 
   // Build paginated query with OR condition for both courierProvider and courierReverseProvider
   let query = db
@@ -94,6 +124,11 @@ export async function processShiprocketOrderChunk(
 
   // Process in API batches
   let totalUpdated = 0;
+
+  const shopRef = db.collection("accounts").doc(accountId);
+
+  const shopDoc = await shopRef.get();
+  const shopData = (shopDoc.data() as any) || null;
 
   for (let i = 0; i < eligibleOrders.length; i += API_BATCH_SIZE) {
     const batch = eligibleOrders.slice(i, Math.min(i + API_BATCH_SIZE, eligibleOrders.length));

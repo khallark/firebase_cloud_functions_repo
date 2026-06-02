@@ -8,7 +8,7 @@ import {
   evaluateBlueDartResponse,
   getBlueDartToken,
 } from "../../../couriers";
-import { NON_RETRYABLE_ERROR_CODES, SHARED_STORE_IDS, TASKS_SECRET } from "../../../config";
+import { NON_RETRYABLE_ERROR_CODES, TASKS_SECRET } from "../../../config";
 import {
   BusinessIsAuthorisedToProcessThisOrder,
   httpRetryable,
@@ -127,44 +127,41 @@ export const processBlueDartReturnShipmentTask = onRequest(
       // ── Load order ──────────────────────────────────────────────────────
       const ordSnap = await orderRef.get();
       if (!ordSnap.exists) throw new Error("ORDER_NOT_FOUND");
-      const order = ordSnap.data();
+      const order = ordSnap.data()!;
 
       const businessDoc = await businessRef.get();
       const businessData = businessDoc.data();
       const shopData = (await db.collection("accounts").doc(shop).get()).data() as any;
 
-      // ── Authorization check for shared/multi-vendor stores ──────────────
-      if (SHARED_STORE_IDS.includes(shop)) {
-        const vendorName = businessData?.vendorName;
-        const vendors = order?.vendors;
-        const canProcess = BusinessIsAuthorisedToProcessThisOrder(businessId, vendorName, vendors);
+      // Check authorization for each order
+      const canProcess = BusinessIsAuthorisedToProcessThisOrder(businessData, order?.storeId);
 
-        if (!canProcess.authorised) {
-          const failure = await handleReturnJobFailure({
-            shop,
-            batchRef,
-            jobRef,
-            jobId,
-            errorCode: "NOT_AUTHORIZED_TO_PROCESS_THIS_ORDER",
-            errorMessage:
-              canProcess.status === 500
-                ? "Some internal error occurred while checking for authorization"
-                : "The current business is not authorized to process this Order.",
-            isRetryable: false,
+      if (!canProcess.authorised) {
+        const failure = await handleReturnJobFailure({
+          shop,
+          batchRef,
+          jobRef,
+          jobId,
+          errorCode: "NOT_AUTHORIZED_TO_PROCESS_THIS_ORDER",
+          errorMessage:
+            canProcess.status === 500
+              ? "Some internal error occurred while checking for authorization"
+              : "The current business is not authorized to process this Order.",
+          isRetryable: false,
+        });
+
+        if (failure.shouldReturnFailure) {
+          res.status(failure.statusCode).json({
+            ok: false,
+            reason: failure.reason,
+            code: "NOT_AUTHORIZED_TO_PROCESS_THIS_ORDER",
           });
-
-          if (failure.shouldReturnFailure) {
-            res.status(failure.statusCode).json({
-              ok: false,
-              reason: failure.reason,
-              code: "NOT_AUTHORIZED_TO_PROCESS_THIS_ORDER",
-            });
-          } else {
-            res.status(failure.statusCode).json({ ok: true, action: failure.reason });
-          }
-          return;
+        } else {
+          res.status(failure.statusCode).json({ ok: true, action: failure.reason });
         }
+        return;
       }
+
 
       // ── Order status gate ───────────────────────────────────────────────
       const status = order?.customStatus;
@@ -358,6 +355,9 @@ export const processBlueDartReturnShipmentTask = onRequest(
       });
 
       await maybeCompleteBatch(batchRef);
+      order.awb_reverse = awb;
+      order.courier_reverse = "Blue Dart";
+      order.courierReverseProvider = "Blue Dart";
       await sendDTOBookedOrderWhatsAppMessage(shopData, order);
 
       res.json({

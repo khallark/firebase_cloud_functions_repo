@@ -316,14 +316,13 @@ This is the AI-powered in-app assistant. The entire agent UI is rendered into a 
 
 **Wraps in:** `BusinessLayout` (dashboard sidebar), `ProcessingQueueProvider`
 
-**APIs used:**
-- `useOrders` hook → Firestore queries on `accounts/{storeId}/orders` across all stores in parallel.
-- `useOrderCounts` hook → `onSnapshot` on `accounts/{storeId}/metadata/orderCounts`.
+**APIs/hooks used:**
+- `useOrders` hook → Firestore queries on `accounts/{storeId}/orders` across all stores available to the business, narrowed by the active store filter when selected. Uses **business-wide cursor pagination** instead of fixed total-page pagination: each store query is ordered by `createdAt desc` normally, or `lastStatusUpdate desc` for RTO Delivered / RTO Closed, then the results are merged and globally sorted client-side. Supports explicit search modes from the Orders page search dropdown: Forward AWB (`awb` prefix), Order Number (`name` exact), Reverse AWB (`awb_reverse` prefix), and General Search (client-side filtering across customer/order/vendor/status fields).
+- `useOrderCounts` hook → `onSnapshot` on `accounts/{storeId}/metadata/orderCounts` for tab count badges.
 - `useAvailabilityCounts` hook → computes Confirmed tab availability breakdowns.
 - `useRtoInTransitCounts` hook → computes RTO In Transit tag breakdowns.
 - `useAwbCount` hook → counts `users/{businessId}/unused_awbs` docs.
-- `useAllOrderIds` hook → fetches all order IDs matching current filters (triggered by "Select all N orders" click).
-- Multiple mutations via `useUpdateOrderStatus`, `useBulkUpdateStatus`, `useRevertOrderStatus`, `useDispatchOrders`, `useOrderSplit`, `useReturnBooking`, `useDownloadSlips`, - `useDownloadManifest`, `useDownloadExcel`, `useDownloadProductsExcel`.
+- Multiple mutations via `useUpdateOrderStatus`, `useBulkUpdateStatus`, `useRevertOrderStatus`, `useDispatchOrders`, `useOrderSplit`, `useReturnBooking`, `useDownloadSlips`, `useDownloadManifest`, `useDownloadExcel`, `useDownloadProductsExcel`.
 - `POST /api/shopify/orders/bulk-update-status` — Confirm, Close, RTO Close, Lost.
 - `POST /api/shopify/orders/dispatch` — enqueues dispatch Cloud Tasks.
 - `POST /api/shopify/courier/assign-awb` — via `processAwbAssignments` from context.
@@ -342,50 +341,85 @@ This is the AI-powered in-app assistant. The entire agent UI is rendered into a 
 - `POST /api/shopify/orders/generate-purchase-order` — from GeneratePODialog.
 - `POST /api/shopify/orders/update-confirmed-orders-availability-tag` — from AvailabilityDialog.
 
-**Page layout:** Flex column, full height, no overflow-y (inner sections scroll independently).
+**Pagination model:**
+- The page no longer calculates a fixed `totalPages` or relies on a fixed global order fetch limit.
+- `useOrders` returns only the current page's merged results plus `hasMore` and `nextCursor`.
+- `page.tsx` stores `pageCursors` by page number. Clicking Next stores the returned `nextCursor` for `currentPage + 1`; clicking Previous reuses the already-known cursor for the previous page.
+- Prev/Next navigation is therefore open-ended until `hasMore === false`.
+- The UI only renders the active page's orders. Previously visited page results may be served from TanStack Query cache, but they are not kept rendered in the table.
+- Pagination footer shows `Page {currentPage} • Showing {orders.length} orders`; it does not show total result count or `Page X of Y`.
+
+**Selection model:**
+- There is no global “Select all matching orders across all pages” flow anymore, and `useAllOrderIds` is no longer used by this page.
+- The page supports **cross-page manual multi-select**: the user can select some/all visible orders on page 1, move to page 2, select more, and continue.
+- Selected IDs are kept in `selectedOrders`; order ID → store ID is kept in `selectedOrdersMap`; full selected order objects are kept in `selectedOrdersDataMap` so actions that need full order details still work after leaving the page where the order was selected.
+- Header/page checkbox selects or deselects only the currently visible page's orders.
+- Bulk actions that need only ID + store ID use `selectedOrdersMap` and work across selected pages.
+- AWB assignment uses `selectedOrdersDataMap` and stores selected full orders in `ordersForAwb`, so cross-page selected orders can be assigned AWBs correctly.
+- Generate PO validation uses `selectedOrdersMap` to ensure selected orders belong to a single store even if selected across pages, and the dialog receives selected full order objects from `selectedOrdersDataMap`.
+
+**Page layout:** Flex column, full height, no outer overflow-y; inner sections scroll independently.
 
 **Sticky top header (bg-card/80, backdrop blur):**
-- Left: "Orders" h1 + stores count subtitle (e.g. "All 2 stores").
+- Left: "Orders" h1 + stores count subtitle. Store count reflects the current tab's store filter state (e.g. "All 2 stores" or "1 of 2 stores").
 - Right: Refresh button (RefreshCw, spins when fetching), More menu (VerticalDots DropdownMenu):
   - **Tax Report** (FileSpreadsheet) — super admin only → opens TaxReportDialog.
   - **Perform Items Availability** (Shirt) — Confirmed tab only → opens AvailabilityDialog.
-  - **AWB Bulk Select** (AlignLeft) — Ready To Dispatch / RTO Delivered / RTO In Transit tabs → opens AwbBulkSelectionDialog (barcode scanner to bulk-select orders by AWB).
+  - **AWB Bulk Select** (AlignLeft) — Ready To Dispatch / RTO Delivered / RTO In Transit tabs → opens AwbBulkSelectionDialog (barcode scanner to bulk-select orders by AWB from the currently loaded result set).
   - **Start Packaging** (Package) — Ready To Dispatch tab only → opens StartPackagingDialog.
-- Below: Search bar (Search icon left, X clear button right, "Search orders..." placeholder).
-- Filters Sheet trigger button (Filter icon + "Filters" text + count badge of active filters).
+- Below: Search controls with a search-type dropdown followed by the search input.
+  - Dropdown options:
+    - Forward AWB — server-side prefix search on `order.awb`
+    - Order Number — server-side exact search on `order.name`
+    - Reverse AWB — server-side prefix search on `order.awb_reverse`
+    - General Search — client-side search across order name, customer name, status on All Orders, forward AWB, reverse AWB, Shopify order ID, and line-item vendor names.
+  - Changing the dropdown clears the current search query for that tab.
+  - The search input placeholder changes based on the selected search type.
+- Search controls are responsive: on desktop/tablet the search-type dropdown, search input, and Filters button sit in one row; on narrow mobile screens they stack vertically to avoid layout overflow.
+- Filters Sheet trigger button (Filter icon + "Filters" text + count badge of active filters). The count is calculated from the currently active tab's filter state only.
 
-**Filters Sheet (slides in from right, `sm:max-w-md`):**
+**Per-tab filter state:**
+- Filters are stored per status tab in `filtersByTab`; switching tabs does not share or reset filters from other tabs.
+- Example: All Orders can show `Filter 3`, Dispatched can show `Filter 1`, and switching between them restores each tab's own filter count and values.
+- Changing any filter resets `currentPage` to 1, clears cursor history, and clears selected orders.
+- Filter state persists only while the Orders page remains mounted.
+
+**Filters Sheet (slides in from right, `sm:max-w-md`, scrollable body):**
+- Sheet uses fixed header/footer with only the filter body scrollable (`flex flex-col`, scrollable middle content).
 - Payment Type: All / Prepaid / COD (Select).
+- Order Status filter (All Orders tab only): checkbox list of all statuses except All Orders.
 - State: All States / dynamic provinces populated from current result set (Select).
-- Stores: Clear All / Select All buttons + checkbox list of all stores.
+- Stores: Clear / Select All buttons + checkbox list of all stores.
 - Date Range: two native `<input type="date">` inputs (From / To), Clear Date Range button.
 - Courier filter (hidden for New/Confirmed/Cancelled tabs): All / Blue Dart / Delhivery / Shiprocket / Xpressbees.
 - Packed Status (Ready To Dispatch tab only): All / Packed / Not Packed.
 - Availability filter (Confirmed tab only): All Items / Picked up (count) / Pickup Eligible (count) / Not Pickup Eligible (count) / Unmapped (count).
 - RTO Status filter (RTO In Transit tab only): All / Re-attempt (count) / Refused (count) / No Reply (count).
 - Invert Search toggle (Switch).
-- "Apply Filters" button closes the sheet.
+- "Clear All Filters" button resets all filters for the currently active tab only. Filters apply immediately as the user changes them, so there is no separate apply step.
+- Filters are stored independently per status tab while the Orders page remains mounted. For example, All Orders can show "Filters 3" while Dispatched shows "Filters 1"; switching tabs restores that tab's own filter state and filter count.
 
 **Status tabs (horizontal scroll, pill buttons below header):**
 21 tabs: All Orders, New, Confirmed, Ready To Dispatch, Dispatched, In Transit, Out For Delivery, Delivered, RTO In Transit, RTO Delivered, DTO Requested, DTO Booked, DTO In Transit, DTO Delivered, Pending Refunds, DTO Refunded, Lost, Closed, RTO Closed, Cancellation Requested, Cancelled. Each shows count from `orderCounts` snapshot. Active tab: primary bg + primary-foreground text.
 
 **Bulk Actions Bar (shown when `selectedOrders.length > 0`):**
-- Checkbox (select/deselect all on current page), "{N} selected" text, Clear button.
+- Checkbox selects/deselects all orders on the current visible page only, `{N} selected` text, Clear button.
 - "Download" dropdown (Download icon + ChevronDown):
   - Download Excel (always visible)
   - Download Slips (hidden for All Orders/New/Confirmed/Cancellation Requested/Cancelled)
-  - Download Manifest (Dispatched tab only)
-  - Download Products (Confirmed + Ready To Dispatch tabs only)
+  - Download Manifest (Dispatched + Ready To Dispatch tabs)
+  - Download Products (Confirmed + Ready To Dispatch tabs)
 - "Actions" dropdown (ChevronDown):
   - Confirm — New tab
-  - Generate PO — Confirmed tab (validates single store, opens GeneratePODialog)
-  - Assign AWBs — Confirmed tab (not shown for non-admin on shared store orders)
+  - Generate PO — Confirmed tab (validates selected orders are from a single store, opens GeneratePODialog)
+  - Assign AWBs — Confirmed tab (not shown/disabled for non-admin shared-store selections)
   - Dispatch — Ready To Dispatch tab
   - Close Orders — Delivered tab
-  - Mark RTO Closed — RTO In Transit tab (always creates UPCs)
+  - Mark RTO Closed — RTO In Transit tab
   - RTO Close — RTO Delivered tab
   - Book Returns — DTO Requested tab
-- **Select-all-pages banner** (shown when all current-page orders selected AND total > rowsPerPage): "{N} of {total} orders selected" — allows extending selection across all pages up to 2000 orders.
+- Current-page selection banner: when all visible orders are selected and more pages exist, shows: "All {orders.length} orders on this page are selected. More orders may exist on next pages." There is no cross-page select-all banner.
+- Selection is page-aware but persistent across navigation: users can select some/all orders on page 1, move to page 2, select more, and run supported bulk actions on the accumulated selection. The old global "select all matching orders across all pages" flow is removed.
 
 **Order content area:**
 - **Mobile (md:hidden):** `MobileOrderCard` components — each card shows: order name + store domain (truncated), status badge (All Orders tab only), MoreVertical dropdown menu, customer name + total price + outstanding price, date badge + payment badge + AWB last 6 chars badge + item count badge. Clicking card body opens Order Detail Dialog.
@@ -413,9 +447,11 @@ Renders context-specific actions based on `order.customStatus`:
 - **Footer (shown when has AWB + courier):** "Track Forward Order" button → links to courier tracking page (Delhivery/Shiprocket/Xpressbees).
 
 **Pagination footer (sticky bottom):**
-- "{from}-{to} of {total}" count text (hidden on mobile, shows "{total} orders" instead).
+- Shows `Page {currentPage} • Showing {orders.length} order(s)` on desktop and `Page {currentPage}` on mobile.
 - Rows per page selector (10/20/50/100/200, saved to localStorage).
-- Prev/Next page buttons + "currentPage/totalPages" display.
+- Prev button disabled on page 1 or while fetching.
+- Next button disabled when `hasMore === false` or while fetching.
+- No total order count and no total pages are displayed.
 
 **Syncing indicator:** A fixed pill at bottom center ("Syncing..." with spinning Loader2) when `isFetching && !isLoading`.
 

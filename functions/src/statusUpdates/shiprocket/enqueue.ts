@@ -1,5 +1,5 @@
 import { onSchedule } from "firebase-functions/v2/scheduler";
-import { SHARED_STORE_IDS, SUPER_ADMIN_ID, TASKS_SECRET } from "../../config";
+import { TASKS_SECRET } from "../../config";
 import { createTask } from "../../services";
 import { BusinessData, hasActiveShipments } from "../helpers";
 import { FieldValue } from "firebase-admin/firestore";
@@ -54,13 +54,7 @@ export const enqueueShiprocketStatusUpdateTasksScheduled = onSchedule(
             return;
           }
 
-          if (SHARED_STORE_IDS.includes(acc)) {
-            if (doc.id === SUPER_ADMIN_ID) {
-              allShopIds.add({ accountId: acc, businessId: doc.id });
-            }
-          } else {
-            allShopIds.add({ accountId: acc, businessId: doc.id });
-          }
+          allShopIds.add({ accountId: acc, businessId: doc.id });
         });
       });
 

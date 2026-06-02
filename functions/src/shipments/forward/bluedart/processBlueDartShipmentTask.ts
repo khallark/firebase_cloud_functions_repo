@@ -9,7 +9,7 @@ import {
   getBlueDartToken,
 } from "../../../couriers";
 import { NON_RETRYABLE } from "../../helpers";
-import { TASKS_SECRET, SHARED_STORE_IDS } from "../../../config";
+import { TASKS_SECRET } from "../../../config";
 import {
   BusinessIsAuthorisedToProcessThisOrder,
   handleJobFailure,
@@ -141,11 +141,8 @@ export const processBlueDartShipmentTask = onRequest(
       const batchData = (await batchRef.get()).data();
       const businessData = businessDoc.data();
 
-      // Check authorization for shared stores
-      if (SHARED_STORE_IDS.includes(shop)) {
-        const vendorName = businessData?.vendorName;
-        const vendors = order?.vendors;
-        const canProcess = BusinessIsAuthorisedToProcessThisOrder(businessId, vendorName, vendors);
+      // Check authorization for each order
+        const canProcess = BusinessIsAuthorisedToProcessThisOrder(businessData, order?.storeId ?? "");
 
         if (!canProcess.authorised) {
           const failure = await handleJobFailure({
@@ -176,7 +173,6 @@ export const processBlueDartShipmentTask = onRequest(
           }
           return;
         }
-      }
 
       // Check if order is in correct status for shipping
       if (order?.customStatus !== "Confirmed") {

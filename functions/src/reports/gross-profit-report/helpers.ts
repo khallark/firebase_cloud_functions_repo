@@ -1,9 +1,9 @@
-// ─── Types ────────────────────────────────────────────────────────────────────
-
 import { QueryDocumentSnapshot, Timestamp } from "firebase-admin/firestore";
 import { db, storage } from "../../firebaseAdmin";
 import ExcelJS from "exceljs";
 import { randomUUID } from "crypto";
+
+// ─── Types ────────────────────────────────────────────────────────────────────
 
 export interface MetricRow {
   type: string;
@@ -15,7 +15,7 @@ export interface MetricRow {
   net: number;
 }
 
-// ─── Tax Helpers ──────────────────────────────────────────────────────────────
+// ─── Helpers ──────────────────────────────────────────────────────────────
 
 const TAX_RATE = 0.05;
 
@@ -35,6 +35,99 @@ function reverseCalculateTax(
 
 function round2(n: number): number {
   return Math.round(n * 100) / 100;
+}
+
+function normalizeVariantId(value: unknown): string | null {
+  if (typeof value === "number" && Number.isFinite(value)) {
+    return String(value);
+  }
+
+  if (typeof value === "string" && value.trim() !== "") {
+    return value.trim();
+  }
+
+  return null;
+}
+
+function getLineItems(order: any): any[] {
+  return Array.isArray(order?.raw?.line_items)
+    ? order.raw.line_items
+    : [];
+}
+
+function getRtoReceivedItems(order: any): any[] {
+  const items = getLineItems(order);
+
+  /**
+   * New preferred logic:
+   * raw.line_items[*].rtoReceived tells exactly which line items were received.
+   */
+  const itemsWithRtoFlag = items.filter((item: any) => item?.rtoReceived === true);
+
+  if (itemsWithRtoFlag.length > 0) {
+    return itemsWithRtoFlag;
+  }
+
+  /**
+   * Fallback for partially migrated/older docs:
+   * global rtoReceived contains received variant_ids.
+   */
+  const rtoReceived = Array.isArray(order?.rtoReceived)
+    ? order.rtoReceived
+    : [];
+
+  const receivedVariantSet = new Set(
+    rtoReceived
+      .map(normalizeVariantId)
+      .filter((id: string | null): id is string => id !== null)
+  );
+
+  if (receivedVariantSet.size === 0) {
+    return [];
+  }
+
+  return items.filter((item: any) => {
+    const variantId = normalizeVariantId(item?.variant_id);
+    return !!variantId && receivedVariantSet.has(variantId);
+  });
+}
+
+function calculateItemsNetWithProportionateShipping(order: any, selectedItems: any[]): number {
+  const allItems = getLineItems(order);
+
+  const totalMRP = allItems.reduce((acc: number, item: any) => {
+    const itemQty = Number(item.quantity || 0);
+    const itemPrice = Number(item.price || 0);
+    return acc + Number((itemQty * itemPrice).toFixed(2));
+  }, 0);
+
+  const shippingAmount = Number(
+    order?.raw?.total_shipping_price_set?.presentment_money?.amount ?? 0
+  );
+
+  if (totalMRP <= 0) {
+    return 0;
+  }
+
+  return Number(
+    selectedItems.reduce((sum: number, item: any) => {
+      const itemQty = Number(item.quantity || 0);
+      const itemPrice = Number(item.price || 0);
+      const mrp = Number((itemQty * itemPrice).toFixed(2));
+
+      const discountArr = item.discount_allocations;
+      const discountLinewise = (Array.isArray(discountArr) ? discountArr : []).reduce(
+        (acc: number, discount: any) => acc + Number(discount.amount ?? 0),
+        0
+      );
+
+      const proportionateShippingPrice = Number(
+        ((shippingAmount * mrp) / totalMRP).toFixed(2)
+      );
+
+      return sum + Number((mrp - discountLinewise + proportionateShippingPrice).toFixed(2));
+    }, 0).toFixed(2)
+  );
 }
 
 // ─── Metric Calculators ───────────────────────────────────────────────────────
@@ -119,9 +212,6 @@ export async function calcSaleMetric(
     const a: Record<string, string[]> = {};
     for (const doc of snapshot.docs) {
       const order = doc.data();
-      const vendors: string[] = order.vendors ?? [];
-      if (vendors.length === 1 && (vendors.includes("ENDORA") || vendors.includes("STYLE 05")))
-        continue;
       if (!a[order.customStatus]) a[order.customStatus] = [];
       a[order.customStatus].push(order.name);
       const netPrice = (() => {
@@ -162,23 +252,46 @@ export async function calcSaleMetric(
             }, 0),
           );
         }
+
+        if (isReturn && order.customStatus === "RTO Closed") {
+          const receivedItems = getRtoReceivedItems(order);
+          if (receivedItems.length === 0) {
+            return 0;
+          }
+          return calculateItemsNetWithProportionateShipping(order, receivedItems);
+        }
+
         return Number(order?.raw?.total_price ?? 0);
       })();
       const isPunjab = order?.raw?.shipping_address?.province === "Punjab";
       const tax = reverseCalculateTax(netPrice, isPunjab);
-      const numItems =
-        isReturn && ["Pending Refunds", "DTO Refunded"].includes(order.customStatus)
-          ? Number(
+      const numItems = (() => {
+        if (isReturn && order.customStatus === "RTO Closed") {
+          const receivedItems = getRtoReceivedItems(order);
+
+          return Number(
+            receivedItems.reduce(
+              (sum: number, item: any) => sum + Number(item?.quantity ?? 0),
+              0
+            )
+          );
+        }
+
+        if (isReturn && ["Pending Refunds", "DTO Refunded"].includes(order.customStatus)) {
+          return Number(
             order?.raw?.line_items
               ?.filter((item: any) => item?.qc_status === "QC Pass")
-              ?.reduce((sum: number, item: any) => sum + Number(item?.quantity ?? 0), 0),
-          )
-          : Number(
-            order?.raw?.line_items?.reduce(
-              (sum: number, item: any) => sum + Number(item?.quantity ?? 0),
-              0,
-            ),
+              ?.reduce((sum: number, item: any) => sum + Number(item?.quantity ?? 0), 0)
           );
+        }
+
+        return Number(
+          order?.raw?.line_items?.reduce(
+            (sum: number, item: any) => sum + Number(item?.quantity ?? 0),
+            0
+          )
+        );
+      })();
 
       totalQty += numItems;
       totalNet += netPrice;
@@ -249,9 +362,6 @@ export async function calcLostMetric(
 
     for (const doc of snap.docs) {
       const order = doc.data();
-      const vendors: string[] = order.vendors ?? [];
-      if (vendors.length === 1 && (vendors.includes("ENDORA") || vendors.includes("STYLE 05")))
-        continue;
       const netPrice = Number(order?.raw?.total_price ?? 0);
       const isPunjab = order?.raw?.shipping_address?.province === "Punjab";
       const tax = reverseCalculateTax(netPrice, isPunjab);
@@ -299,8 +409,8 @@ export async function calcPurchaseMetric(
     .collection("users")
     .doc(businessId)
     .collection("grns")
-    .where("createdAt", ">=", startTs)
-    .where("createdAt", "<=", endTs)
+    .where("completedAt", ">=", startTs)
+    .where("completedAt", "<=", endTs)
     .get();
 
   // Collect all unique SKUs across all GRN items so we can batch-fetch tax rates

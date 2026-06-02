@@ -81,11 +81,8 @@ export const updateShiprocketStatusesJob = onRequest(
       const businessDoc = await db.collection("users").doc(businessId).get();
       if (!businessDoc.exists) throw new Error("ACCOUNT_NOT_FOUND");
 
-      const apiKey = businessDoc.data()?.integrations?.couriers?.shiprocket?.apiKey;
-      if (!apiKey) throw new Error("API_KEY_MISSING");
-
       // Process one chunk of orders
-      const result = await processShiprocketOrderChunk(accountId, apiKey, cursor);
+      const result = await processShiprocketOrderChunk(businessDoc, accountId, cursor);
 
       // Update job progress
       await jobRef.update({
@@ -149,7 +146,11 @@ export const updateShiprocketStatusesJob = onRequest(
       await handleJobError(error, req.body);
       const msg = error.message || String(error);
       const code = msg.split(/\s/)[0];
-      const NON_RETRYABLE = ["ACCOUNT_NOT_FOUND", "API_KEY_MISSING", "NO_VALID_USERS_FOR_ACCOUNT"];
+      const NON_RETRYABLE = [
+        "ACCOUNT_NOT_FOUND",
+        "SHIPROCKET_CREDENTIALS_MISSING",
+        "NO_VALID_USERS_FOR_ACCOUNT",
+      ];
       const isRetryable = !NON_RETRYABLE.includes(code);
 
       res.status(isRetryable ? 503 : 200).json({

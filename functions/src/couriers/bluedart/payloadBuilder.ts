@@ -55,9 +55,9 @@ export function buildBlueDartPayload(params: BlueDartShipmentParams) {
     const lineItemDiscount =
       Array.isArray(item.discount_allocations) && item.discount_allocations.length > 0
         ? item.discount_allocations.reduce(
-            (total: number, discount: any) => total + Number(discount.amount || 0),
-            0,
-          )
+          (total: number, discount: any) => total + Number(discount.amount || 0),
+          0,
+        )
         : 0;
 
     // Calculate line total before discount
@@ -104,8 +104,39 @@ export function buildBlueDartPayload(params: BlueDartShipmentParams) {
   const subtotalPrice = Number(order.raw?.subtotal_price || 0);
 
   // Determine commodity details based on items
-  const commodityDetail1 = "Apparel"; // Hardcoded for now
-  const commodityDetail2 = items[0]?.title || "Product";
+  // Collect unique item titles and spread across 3 commodity detail fields
+  const MAX_COMMODITY_LEN = 35;
+  const uniqueTitles: string[] = [];
+  for (const item of items) {
+    const title = item.title || item.name || "";
+    if (title && !uniqueTitles.includes(title)) uniqueTitles.push(title);
+  }
+
+  const commodityDetails = ["", "", ""];
+  let fieldIndex = 0;
+  for (const title of uniqueTitles) {
+    if (fieldIndex >= 3) break;
+    const current = commodityDetails[fieldIndex];
+    const candidate = current ? `${current}, ${title}` : title;
+    if (candidate.length <= MAX_COMMODITY_LEN) {
+      commodityDetails[fieldIndex] = candidate;
+    } else if (!current) {
+      // Single title too long — truncate into this field
+      commodityDetails[fieldIndex] = title.slice(0, MAX_COMMODITY_LEN);
+      fieldIndex++;
+    } else {
+      // Current field full, move to next
+      fieldIndex++;
+      if (fieldIndex < 3) {
+        commodityDetails[fieldIndex] =
+          title.length > MAX_COMMODITY_LEN ? title.slice(0, MAX_COMMODITY_LEN) : title;
+      }
+    }
+  }
+
+  const commodityDetail1 = commodityDetails[0] || "Apparel";
+  const commodityDetail2 = commodityDetails[1] || "";
+  const commodityDetail3 = commodityDetails[2] || "";
 
   const payload = {
     Request: {
@@ -163,7 +194,7 @@ export function buildBlueDartPayload(params: BlueDartShipmentParams) {
         Commodity: {
           CommodityDetail1: commodityDetail1,
           CommodityDetail2: commodityDetail2,
-          CommodityDetail3: "",
+          CommodityDetail3: commodityDetail3,
         },
         CreditReferenceNo: order.name || String(order.id),
         CreditReferenceNo2: "",

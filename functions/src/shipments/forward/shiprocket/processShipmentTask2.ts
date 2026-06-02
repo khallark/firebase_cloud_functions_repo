@@ -8,7 +8,7 @@ import { FieldValue, Transaction, Timestamp } from "firebase-admin/firestore";
 import { buildShiprocketPayload, evaluateShiprocketResponse } from "../../../couriers";
 import { NON_RETRYABLE } from "../../helpers";
 import { requestShiprocketPickup } from "../../../couriers";
-import { TASKS_SECRET, SHARED_STORE_IDS } from "../../../config";
+import { TASKS_SECRET } from "../../../config";
 import {
   BusinessIsAuthorisedToProcessThisOrder,
   handleJobFailure,
@@ -115,41 +115,38 @@ export const processShipmentTask2 = onRequest(
       const businessDoc = await businessRef.get();
       const businessData = businessDoc.data();
 
-      // Check if the shop is exceptional one, if yes, then check if the given business is authorised to process this order or not
-      if (SHARED_STORE_IDS.includes(shop)) {
-        const vendorName = businessData?.vendorName;
-        const vendors = order?.vendors;
-        const canProcess = BusinessIsAuthorisedToProcessThisOrder(businessId, vendorName, vendors);
-        if (!canProcess.authorised) {
-          const failure = await handleJobFailure({
-            businessId,
-            shop,
-            batchRef,
-            jobRef,
-            jobId,
-            errorCode: "NOT_AUTHORIZED_TO_PROCESS_THIS_ORDER",
-            errorMessage:
-              canProcess.status === 500
-                ? "Some internal error occured while checking for authorization"
-                : "The current business is not authorized to process this Order.",
-            isRetryable: false,
-          });
+      // Check authorization for each order
+      const canProcess = BusinessIsAuthorisedToProcessThisOrder(businessData, order?.storeId);
+      if (!canProcess.authorised) {
+        const failure = await handleJobFailure({
+          businessId,
+          shop,
+          batchRef,
+          jobRef,
+          jobId,
+          errorCode: "NOT_AUTHORIZED_TO_PROCESS_THIS_ORDER",
+          errorMessage:
+            canProcess.status === 500
+              ? "Some internal error occured while checking for authorization"
+              : "The current business is not authorized to process this Order.",
+          isRetryable: false,
+        });
 
-          if (failure.shouldReturnFailure) {
-            res.status(failure.statusCode).json({
-              ok: false,
-              reason: failure.reason,
-              code: "NOT_AUTHORIZED_TO_PROCESS_THIS_ORDER",
-            });
-          } else {
-            res.status(failure.statusCode).json({
-              ok: true,
-              action: failure.reason,
-            });
-          }
-          return;
+        if (failure.shouldReturnFailure) {
+          res.status(failure.statusCode).json({
+            ok: false,
+            reason: failure.reason,
+            code: "NOT_AUTHORIZED_TO_PROCESS_THIS_ORDER",
+          });
+        } else {
+          res.status(failure.statusCode).json({
+            ok: true,
+            action: failure.reason,
+          });
         }
+        return;
       }
+
 
       if (order?.customStatus !== "Confirmed") {
         const failure = await handleJobFailure({

@@ -1,7 +1,7 @@
 // functions/src/generateTableData.ts
 import { onRequest } from "firebase-functions/v2/https";
 import { Timestamp } from "firebase-admin/firestore";
-import { ENQUEUE_FUNCTION_SECRET, SHARED_STORE_IDS, SUPER_ADMIN_ID } from "../../config";
+import { ENQUEUE_FUNCTION_SECRET } from "../../config";
 import { requireHeaderSecret } from "../../helpers";
 import { db } from "../../firebaseAdmin";
 
@@ -233,35 +233,14 @@ export const generateTableData = onRequest(
       // Process each store
       for (const storeId of stores) {
         console.log(`📦 Processing store: ${storeId}`);
-
-        const storeRef = db.collection("accounts").doc(storeId);
+        
         const ordersRef = db.collection("accounts").doc(storeId).collection("orders");
 
         // Query orders within date range
         // Using createdAt field for date filtering
-        let ordersQuery = null;
-        if (SHARED_STORE_IDS.includes(storeId)) {
-          if (businessId == SUPER_ADMIN_ID) {
-            ordersQuery = ordersRef
-              .where("createdAt", ">=", startTime)
-              .where("createdAt", "<=", endTime);
-          } else {
-            const memberDoc = await storeRef.collection("members").doc(businessId).get();
-            if (memberDoc.exists && memberDoc.data()?.vendorName) {
-              const vendorName = memberDoc.data()?.vendorName;
-              ordersQuery = ordersRef
-                .where("createdAt", ">=", startTime)
-                .where("createdAt", "<=", endTime)
-                .where("vendors", "array-contains", vendorName);
-            } else {
-              ordersQuery = ordersRef.where("some-random-shit", "==", "some-random-shit");
-            }
-          }
-        } else {
-          ordersQuery = ordersRef
-            .where("createdAt", ">=", startTime)
-            .where("createdAt", "<=", endTime);
-        }
+        const ordersQuery = ordersRef
+          .where("createdAt", ">=", startTime)
+          .where("createdAt", "<=", endTime);
 
         const ordersSnapshot = await ordersQuery.get();
 

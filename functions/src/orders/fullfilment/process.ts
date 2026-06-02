@@ -1,7 +1,6 @@
 import { onRequest } from "firebase-functions/v2/https";
-import { SHARED_STORE_ID, SHARED_STORE_IDS, TASKS_SECRET, UPC } from "../../config";
+import { TASKS_SECRET, UPC } from "../../config";
 import {
-  BusinessIsAuthorisedToProcessThisOrder,
   maybeCompleteSummary,
   requireHeaderSecret,
 } from "../../helpers";
@@ -166,23 +165,6 @@ export const processFulfillmentTask = onRequest(
             message: "Order already fulfilled on Shopify",
           });
           return;
-        }
-
-        // Check authorization for shared store
-        if (SHARED_STORE_IDS.includes(shop)) {
-          const businessData = businessDoc.data();
-          const vendorName = businessData?.vendorName;
-          const vendors = orderData?.vendors;
-          const canProcess = BusinessIsAuthorisedToProcessThisOrder(
-            businessId,
-            vendorName,
-            vendors,
-          );
-          if (!canProcess.authorised) {
-            await markJobFailed("not_authorized", `Business not authorized to process this order`);
-            res.status(403).json({ error: "not_authorized_to_process" });
-            return;
-          }
         }
 
         const accessToken = shopDoc.get("accessToken");
@@ -457,10 +439,6 @@ async function fulfillOrderOnShopify(
   awb: string | number,
   courier: string,
 ): Promise<{ fulfillmentId?: string; nothingToDo?: boolean }> {
-  if (shop === SHARED_STORE_ID) {
-    return { nothingToDo: true };
-  }
-
   const V = "2025-07";
   const headers = {
     "X-Shopify-Access-Token": accessToken,

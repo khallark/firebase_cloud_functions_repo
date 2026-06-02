@@ -39,7 +39,7 @@ interface Product {
   sku: string;
   name: string;
   inventory: Inventory;
-  mappedVariants?: Array<{ variantId: string; [key: string]: any }>;
+  mappedVariants?: Array<{ variantId: string;[key: string]: any }>;
   inventoryTracking?: {
     lastRestockDate: Timestamp | null;
     lastRestockQuantity: number;
@@ -215,7 +215,7 @@ function calculatePreStockoutAverage(
     const avg = preStockoutTotal / preStockoutDays;
     console.log(
       `📊 Pre-stockout avg: ${avg.toFixed(3)} units/day ` +
-        `(${preStockoutTotal} total over ${preStockoutDays} days before ${firstStockoutDate})`,
+      `(${preStockoutTotal} total over ${preStockoutDays} days before ${firstStockoutDate})`,
     );
 
     return avg > 0 ? avg : null;
@@ -330,8 +330,8 @@ export async function calculateCategoryBenchmark(
         unreliableCount++;
         console.warn(
           `⚠️ Excluding peer ${candidateIds[index]} from benchmark — ` +
-            `stockoutFreq=${reliability.stockoutFrequency.toFixed(2)}, ` +
-            `snapshots=${reliability.daysWithSnapshots}/${days}`,
+          `stockoutFreq=${reliability.stockoutFrequency.toFixed(2)}, ` +
+          `snapshots=${reliability.daysWithSnapshots}/${days}`,
         );
       }
     });
@@ -339,7 +339,7 @@ export async function calculateCategoryBenchmark(
     if (reliableIds.length === 0) {
       console.error(
         `🚨 Category benchmark FAILED for "${category}": ` +
-          `all ${unreliableCount} peers have unreliable data`,
+        `all ${unreliableCount} peers have unreliable data`,
       );
       return {
         category,
@@ -386,8 +386,8 @@ export async function calculateCategoryBenchmark(
 
     console.log(
       `📊 Category benchmark "${category}": ` +
-        `${reliableIds.length} reliable, ${unreliableCount} excluded, ` +
-        `quality=${benchmarkQuality}, avg=${categoryAvg.toFixed(3)}`,
+      `${reliableIds.length} reliable, ${unreliableCount} excluded, ` +
+      `quality=${benchmarkQuality}, avg=${categoryAvg.toFixed(3)}`,
     );
 
     return {
@@ -524,8 +524,8 @@ export async function calculateSalesMetrics(
     if (snapshotCoverage < 0.5) {
       console.warn(
         `⚠️ Low snapshot coverage for ${productId}: ` +
-          `${daysWithSnapshots}/${days} days (${(snapshotCoverage * 100).toFixed(0)}%). ` +
-          `Results may be unreliable until daily snapshots are collected.`,
+        `${daysWithSnapshots}/${days} days (${(snapshotCoverage * 100).toFixed(0)}%). ` +
+        `Results may be unreliable until daily snapshots are collected.`,
       );
     }
 
@@ -614,8 +614,8 @@ export async function calculateSalesMetrics(
     if (needsBenchmarking && category) {
       console.log(
         `Product ${productId} needs benchmarking — ` +
-          `inStock=${inStockDays}, stockout=${stockoutDays}, ` +
-          `coverage=${(snapshotCoverage * 100).toFixed(0)}%, sales=${totalSales}`,
+        `inStock=${inStockDays}, stockout=${stockoutDays}, ` +
+        `coverage=${(snapshotCoverage * 100).toFixed(0)}%, sales=${totalSales}`,
       );
 
       try {
@@ -666,13 +666,13 @@ export async function calculateSalesMetrics(
 
           console.log(
             `Blended: ${productWeight * 100}% product + ` +
-              `${categoryWeight * 100}% category (quality: ${categoryBenchmark.benchmarkQuality})`,
+            `${categoryWeight * 100}% category (quality: ${categoryBenchmark.benchmarkQuality})`,
           );
         } else {
           // ─── FIX 6: Cascading failure fallback chain ─────────────────────
           console.error(
             `🚨 Cascading data failure for ${productId}: ` +
-              `product AND all category peers have insufficient data`,
+            `product AND all category peers have insufficient data`,
           );
 
           const preStockoutAvg =
@@ -691,7 +691,7 @@ export async function calculateSalesMetrics(
             dataQuality = "poor";
             console.log(
               `📊 Using full window avg: ${avgDailySales.toFixed(3)} ` +
-                `(${totalSales} units over ${days} day window)`,
+              `(${totalSales} units over ${days} day window)`,
             );
           } else {
             avgDailySales = 0.5;
@@ -904,21 +904,21 @@ export async function calculateRestockRecommendation(
     if (metrics.snapshotCoverage < 0.5) {
       warnings.push(
         `Only ${metrics.daysWithSnapshots} of 30 days have inventory snapshots. ` +
-          `Predictions will improve as daily snapshot data accumulates.`,
+        `Predictions will improve as daily snapshot data accumulates.`,
       );
     }
 
     if (metrics.dataSource === "pre_stockout_history") {
       warnings.push(
         "⚠️ Both product and all category peers have insufficient data. " +
-          "Using pre-stockout sales rate as fallback.",
+        "Using pre-stockout sales rate as fallback.",
       );
     }
 
     if (metrics.dataSource === "conservative_fallback") {
       warnings.push(
         "🚨 CRITICAL: No reliable data found for product or any category peer. " +
-          "Using conservative minimum (0.5 units/day). Manual review required.",
+        "Using conservative minimum (0.5 units/day). Manual review required.",
       );
     }
 
@@ -986,8 +986,8 @@ export async function calculateRestockRecommendation(
       Math.min(
         1,
         dataQualityScore * (1 - Math.min(0.5, volatilityPenalty * 0.1)) -
-          coveragePenalty +
-          categoryBonus,
+        coveragePenalty +
+        categoryBonus,
       ),
     );
 
@@ -1020,7 +1020,11 @@ export async function calculateRestockRecommendation(
 
 export async function calculateAllRestockRecommendations(
   businessId: string,
-  options: { minStockThreshold?: number; forecastDays?: number } = {},
+  options: {
+    minStockThreshold?: number;
+    forecastDays?: number;
+    includeZeroSuggestions?: boolean;
+  } = {},
 ): Promise<RestockRecommendation[]> {
   try {
     if (!businessId) throw new Error("Invalid businessId");
@@ -1083,7 +1087,7 @@ export async function calculateAllRestockRecommendations(
             product, // ← pre-fetched product (skips productDoc fetch ×2)
           );
 
-          if (recommendation.suggestedQuantity > 0) {
+          if (options.includeZeroSuggestions || recommendation.suggestedQuantity > 0) {
             recommendations.push(recommendation);
           }
         } catch (error) {

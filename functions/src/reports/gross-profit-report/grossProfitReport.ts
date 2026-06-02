@@ -50,10 +50,16 @@ export const grossProfitReport = onRequest(
         res.status(404).json({ error: `Business '${businessId}' not found.` });
         return;
       }
+      const businessDocRef = db.collection("users").doc(businessId);
 
       const storeIds: string[] = businessDoc.data()?.stores ?? [];
       if (storeIds.length === 0) {
-        res.status(400).json({ error: "No stores linked to this business." });
+        await businessDocRef.update({
+          "grossProfitData.loading": false,
+          "grossProfitData.error": "No stores linked to this business.",
+          "grossProfitData.lastUpdated": Timestamp.now(),
+        });
+        res.status(200).json({ success: true });
         return;
       }
 
@@ -91,14 +97,6 @@ export const grossProfitReport = onRequest(
         lost,
         grossProfit,
       ];
-
-      // ── 4. Build Excel ─────────────────────────────────────────────────────
-      // const workbook = buildExcel(allRows);
-
-      // ── 5. Upload to Firebase Storage ──────────────────────────────────────
-      // const downloadUrl = await uploadToStorage(workbook, businessId, startDate, endDate);
-
-      const businessDocRef = db.collection("users").doc(businessId);
 
       // ── 6. Write to Firestore ──────────────────────────────────────────────
       await businessDocRef.update({

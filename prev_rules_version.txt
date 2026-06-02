@@ -1,0 +1,67 @@
+rules_version = '2';
+
+service firebase.storage {
+  match /b/{bucket}/o {
+    
+    // ✅ SHARED STORE PATH (for nfkjgp-sv.myshopify.com)
+    match /return-images/shared/{shopId}/{orderId}/{fileName} {
+        function isAuthorized() {
+          return request.auth != null
+                 && firestore.get(/databases/(default)/documents/users/$(request.auth.uid)).data.stores.hasAny([shopId]);
+        }
+
+        // Read: Only authenticated users with access to this store
+        allow read: if isAuthorized();
+
+        // Write images (customer uploads)
+        allow write: if isAuthorized()
+                     && request.resource.size < 10 * 1024 * 1024
+                     && request.resource.contentType.matches('image/.*');
+
+        // Write videos (QC unboxing)
+        allow write: if isAuthorized()
+                     && request.resource.size < 200 * 1024 * 1024
+                     && request.resource.contentType.matches('video/.*')
+                     && fileName.matches('unboxing_video_[0-9]+\\.webm');
+    }
+    
+    // ✅ BUSINESS-SPECIFIC PATH (for regular stores)
+    match /return-images/{businessId}/{shopId}/{orderId}/{fileName} {
+        function isAuthorized() {
+          return request.auth != null
+                 && firestore.get(/databases/(default)/documents/users/$(request.auth.uid)).data.stores.hasAny([shopId]);
+        }
+
+        allow read: if isAuthorized();
+
+        // Write images
+        allow write: if isAuthorized()
+                     && request.resource.size < 10 * 1024 * 1024
+                     && request.resource.contentType.matches('image/.*');
+
+        // Write videos
+        allow write: if isAuthorized()
+                     && request.resource.size < 200 * 1024 * 1024
+                     && request.resource.contentType.matches('video/.*')
+                     && fileName.matches('unboxing_video_[0-9]+\\.webm');
+    }
+    
+    // ✅ LEGACY PATH (backward compatibility - read only)
+    match /return-images/{shopId}/{orderId}/{fileName} {
+        allow read: if true;
+    }
+    
+    match /packaged_orders/{storeId}/{fileName} {
+        function isAuthorized() {
+          return request.auth != null
+                 && firestore.get(/databases/(default)/documents/users/$(request.auth.uid)).data.stores.hasAny([storeId]);
+        }
+
+        allow read: if true;
+
+        allow write: if isAuthorized()
+                     && request.resource.size < 500 * 1024 * 1024
+                     && request.resource.contentType.matches('video/.*');
+    }
+  }
+}

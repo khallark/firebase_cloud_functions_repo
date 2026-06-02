@@ -20,7 +20,8 @@ interface ProductResult {
   saleQty: number;
   saleReturnQty: number;
   purchaseQty: number;
-  grossProfitQty: number; // sale - saleReturn - purchase - openingStock + closingStock
+  creditNoteQty: number;
+  grossProfitQty: number;
   saleOrders: ProductOrderEntry[];
   saleReturnOrders: ProductOrderEntry[];
 }
@@ -29,7 +30,7 @@ export const getGrossProfitByProduct = onRequest(
   { cors: true, timeoutSeconds: 540, memory: "2GiB" },
   async (req, res) => {
     const businessId = (req.query.businessId as string) || req.body?.businessId;
-    const startDate = (req.query.startDate as string) || req.body?.startDate; // YYYY-MM-DD
+    const startDate = (req.query.startDate as string) || req.body?.startDate;
     const endDate = (req.query.endDate as string) || req.body?.endDate;
 
     if (!businessId || !startDate || !endDate) {
@@ -47,8 +48,8 @@ export const getGrossProfitByProduct = onRequest(
       return d.toISOString().split("T")[0];
     })();
 
-    // ── 2. Fetch opening & closing inventory snapshots + GRNs in parallel ────
-    const [openingSnap, closingSnap, grnSnap] = await Promise.all([
+    // ── 2. Fetch opening & closing inventory snapshots + GRNs + Credit Notes in parallel ──
+    const [openingSnap, closingSnap, grnSnap, creditNoteSnap] = await Promise.all([
       db
         .collection("users")
         .doc(businessId)
@@ -65,6 +66,14 @@ export const getGrossProfitByProduct = onRequest(
         .collection("users")
         .doc(businessId)
         .collection("grns")
+        .where("completedAt", ">=", startTs)
+        .where("completedAt", "<=", endTs)
+        .get(),
+      db
+        .collection("users")
+        .doc(businessId)
+        .collection("credit_notes")
+        .where("status", "==", "completed")
         .where("completedAt", ">=", startTs)
         .where("completedAt", "<=", endTs)
         .get(),
@@ -90,7 +99,6 @@ export const getGrossProfitByProduct = onRequest(
       closingByProduct.set(productId, (closingByProduct.get(productId) ?? 0) + qty);
     }
 
-    // GRN items: sku == productId, direct match
     const purchaseByProduct = new Map<string, number>();
     for (const doc of grnSnap.docs) {
       const grn = doc.data();
@@ -102,10 +110,23 @@ export const getGrossProfitByProduct = onRequest(
       }
     }
 
+    // Credit note items by product (sku is the productId)
+    const creditNoteByProduct = new Map<string, number>();
+    for (const doc of creditNoteSnap.docs) {
+      const cn = doc.data();
+      for (const item of cn.items ?? []) {
+        const productId = item.sku as string;
+        if (!productId) continue;
+        const qty = Number(item.quantity ?? 0);
+        creditNoteByProduct.set(productId, (creditNoteByProduct.get(productId) ?? 0) + qty);
+      }
+    }
+
     const allProductIds = new Set<string>([
       ...openingByProduct.keys(),
       ...closingByProduct.keys(),
       ...purchaseByProduct.keys(),
+      ...creditNoteByProduct.keys(),
     ]);
 
     // ── 3. Fetch sale orders ──────────────────────────────────────────────────
@@ -166,7 +187,6 @@ export const getGrossProfitByProduct = onRequest(
           }
         }
 
-        // Cancelled: only fall back to lastStatusUpdate if cancellationRequestedAt is absent
         for (const doc of cancelledSnap.docs) {
           if (seenReturnIds.has(doc.id)) continue;
           const cancelReqAt = doc.data().cancellationRequestedAt as Timestamp | undefined;
@@ -178,10 +198,12 @@ export const getGrossProfitByProduct = onRequest(
     );
 
     // ── 5. SKU → productId matcher ────────────────────────────────────────────
+    const normalize = (s: string) => s.toLowerCase().replace(/[\s-]/g, "");
+
     const findProductId = (sku: string): string | null => {
-      const skuLower = sku.toLowerCase();
+      const skuNorm = normalize(sku);
       for (const productId of allProductIds) {
-        if (productId.toLowerCase().includes(skuLower)) return productId;
+        if (normalize(productId.replace("HEAVENDUSK", "HEAVENDUST")).includes(skuNorm)) return productId;
       }
       return null;
     };
@@ -196,6 +218,7 @@ export const getGrossProfitByProduct = onRequest(
           openingStockQty: openingByProduct.get(productId) ?? 0,
           closingStockQty: closingByProduct.get(productId) ?? 0,
           purchaseQty: purchaseByProduct.get(productId) ?? 0,
+          creditNoteQty: creditNoteByProduct.get(productId) ?? 0,
           saleQty: 0,
           saleReturnQty: 0,
           grossProfitQty: 0,
@@ -225,8 +248,7 @@ export const getGrossProfitByProduct = onRequest(
           console.log(`UNMATCHED SKU: ${sku} in order ${order.name}`);
           continue;
         }
-        console.log(`SKU: ${sku} → ${productId}`); // ← add this
-        if (!productId) continue;
+        console.log(`SKU: ${sku} → ${productId}`);
         const qty = Number(item.quantity ?? 0);
         if (!productHits.has(productId)) productHits.set(productId, []);
         productHits.get(productId)!.push({ sku, quantity: qty });
@@ -272,7 +294,7 @@ export const getGrossProfitByProduct = onRequest(
       .map((r) => ({
         ...r,
         grossProfitQty:
-          r.saleQty - r.saleReturnQty - r.purchaseQty - r.openingStockQty + r.closingStockQty,
+          r.saleQty - r.saleReturnQty - r.purchaseQty + r.creditNoteQty - r.openingStockQty + r.closingStockQty,
       }))
       .sort((a, b) => a.productId.localeCompare(b.productId));
 

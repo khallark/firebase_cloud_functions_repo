@@ -1,7 +1,7 @@
 // functions/src/generateRemittanceTable.ts
 import { onRequest } from "firebase-functions/v2/https";
 import { Timestamp } from "firebase-admin/firestore";
-import { ENQUEUE_FUNCTION_SECRET, SHARED_STORE_IDS } from "../../config";
+import { ENQUEUE_FUNCTION_SECRET } from "../../config";
 import { requireHeaderSecret } from "../../helpers";
 import { db } from "../../firebaseAdmin";
 
@@ -189,14 +189,28 @@ export const generateRemittanceTable = onRequest(
     const { deliveredTimeField, firestoreKey, logEmoji } = COURIER_CONFIG[courierName];
     const fsPath = `remittanceTable.${firestoreKey}`;
 
+    const businessDocRef = db.collection("users").doc(businessId);
+    const businessDoc = await businessDocRef.get()
+    if (!businessDoc.exists) {
+      res.status(404).json({
+        error: `business ${businessDocRef.id} doesn't exists`,
+      });
+      return;
+    }
+    const businessData = businessDoc.data();
+    if (!businessData) {
+      res.status(404).json({
+        error: `business ${businessDocRef.id} doesn't exists`,
+      });
+      return;
+    }
     console.log(`${logEmoji} Starting ${courierName} remittance table generation:`, {
       businessId,
       startDate,
       endDate,
-      stores: SHARED_STORE_IDS,
+      stores: businessData.stores ?? [],
     });
 
-    const businessDocRef = db.collection("users").doc(businessId);
 
     await businessDocRef.update({
       [`${fsPath}.loading`]: true,
@@ -238,7 +252,7 @@ export const generateRemittanceTable = onRequest(
         let totalOrderCount = 0;
         const rowAwbs: string[] = [];
 
-        for (const storeId of SHARED_STORE_IDS) {
+        for (const storeId of businessData.stores ?? []) {
           const ordersRef = db.collection("accounts").doc(storeId).collection("orders");
 
           const statusSnaps = await Promise.all(

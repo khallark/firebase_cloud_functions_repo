@@ -364,10 +364,25 @@ export const getAllRestockRecommendations = onRequest(
         forecastDays = parsed;
       }
 
+      let includeZeroSuggestions = false;
+
+      if (req.body.includeZeroSuggestions !== undefined) {
+        if (typeof req.body.includeZeroSuggestions !== "boolean") {
+          res.status(400).json({
+            success: false,
+            error: "includeZeroSuggestions must be a boolean",
+          });
+          return;
+        }
+
+        includeZeroSuggestions = req.body.includeZeroSuggestions;
+      }
+
       console.log("Processing batch recommendations:", {
         businessId,
         minStockThreshold,
         forecastDays,
+        includeZeroSuggestions,
       });
 
       // Calculate with timeout
@@ -375,6 +390,7 @@ export const getAllRestockRecommendations = onRequest(
         calculateAllRestockRecommendations(businessId, {
           minStockThreshold,
           forecastDays,
+          includeZeroSuggestions,
         }),
         new Promise((_, reject) =>
           setTimeout(() => reject(new Error("Batch calculation timeout")), 530000),

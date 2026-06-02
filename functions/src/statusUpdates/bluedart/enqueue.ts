@@ -1,5 +1,5 @@
 import { onSchedule } from "firebase-functions/v2/scheduler";
-import { SHARED_STORE_IDS, SUPER_ADMIN_ID, TASKS_SECRET } from "../../config";
+import { TASKS_SECRET } from "../../config";
 import { BusinessData, hasActiveShipments } from "../helpers";
 import { createTask } from "../../services";
 import { FieldValue } from "firebase-admin/firestore";
@@ -58,14 +58,8 @@ export const enqueueBlueDartStatusUpdateTasksScheduled = onSchedule(
             console.error(`[Blue Dart] ⚠️ Found undefined store in business ${doc.id}`);
             return;
           }
-
-          if (SHARED_STORE_IDS.includes(acc)) {
-            if (doc.id === SUPER_ADMIN_ID) {
-              allShopIds.add({ accountId: acc, businessId: doc.id });
-            }
-          } else {
-            allShopIds.add({ accountId: acc, businessId: doc.id });
-          }
+          
+          allShopIds.add({ accountId: acc, businessId: doc.id });
         });
       });
 
