@@ -1,9 +1,7 @@
 import {
-  FieldValue,
   Timestamp,
   DocumentReference,
   Query,
-  Transaction,
 } from "firebase-admin/firestore";
 import {
   Movement,
@@ -22,8 +20,6 @@ import {
 import { db } from "../../firebaseAdmin";
 import { chunkArray } from "../../helpers";
 import { enqueuePropagationTask } from "../../services";
-
-const increment = FieldValue.increment;
 
 // ============================================================================
 // UTILITY FUNCTIONS
@@ -345,28 +341,6 @@ export async function createMovement(
   return ref.id;
 }
 
-export function updateLocationStatsInTransaction(
-  transaction: Transaction,
-  businessId: string,
-  placement: Placement,
-  quantityDelta: number,
-) {
-  transaction.update(db.doc(`users/${businessId}/shelves/${placement.shelfId}`), {
-    "stats.totalProducts": increment(quantityDelta),
-  });
-
-  transaction.update(db.doc(`users/${businessId}/racks/${placement.rackId}`), {
-    "stats.totalProducts": increment(quantityDelta),
-  });
-
-  transaction.update(db.doc(`users/${businessId}/zones/${placement.zoneId}`), {
-    "stats.totalProducts": increment(quantityDelta),
-  });
-
-  transaction.update(db.doc(`users/${businessId}/warehouses/${placement.warehouseId}`), {
-    "stats.totalProducts": increment(quantityDelta),
-  });
-}
 
 /**
  * Creates UPC documents for a placement
@@ -416,83 +390,6 @@ export async function createUPCsForPlacement(
   console.log(`Created ${count} UPCs for placement ${placement.id}`);
 }
 
-// ============================================================================
-// SHELF TRIGGERS → Update Rack/Zone Shelf Counts + Propagate Name Changes
-// ============================================================================
-
-export function updateShelfCountsInTransaction(
-  transaction: Transaction,
-  businessId: string,
-  rackId: string,
-  zoneId: string,
-  warehouseId: string,
-  delta: number,
-) {
-  transaction.update(db.doc(`users/${businessId}/racks/${rackId}`), {
-    "stats.totalShelves": increment(delta),
-  });
-
-  transaction.update(db.doc(`users/${businessId}/zones/${zoneId}`), {
-    "stats.totalShelves": increment(delta),
-  });
-
-  transaction.update(db.doc(`users/${businessId}/warehouses/${warehouseId}`), {
-    "stats.totalShelves": increment(delta),
-  });
-}
-
-export async function transferProductStats(
-  businessId: string,
-  shelfId: string,
-  fromRackId: string,
-  fromZoneId: string,
-  fromWarehouseId: string,
-  toRackId: string,
-  toZoneId: string,
-  toWarehouseId: string,
-) {
-  // Query first (outside transaction)
-  const placements = await db
-    .collection(`users/${businessId}/placements`)
-    .where("shelfId", "==", shelfId)
-    .get();
-
-  if (placements.empty) return;
-
-  const totalProducts = placements.docs.reduce((sum, doc) => sum + (doc.data().quantity || 0), 0);
-
-  // Use transaction for atomic stats transfer
-  await db.runTransaction(async (transaction) => {
-    // Rack stats
-    transaction.update(db.doc(`users/${businessId}/racks/${fromRackId}`), {
-      "stats.totalProducts": increment(-totalProducts),
-    });
-    transaction.update(db.doc(`users/${businessId}/racks/${toRackId}`), {
-      "stats.totalProducts": increment(totalProducts),
-    });
-
-    // Zone stats (only if changed)
-    if (fromZoneId !== toZoneId) {
-      transaction.update(db.doc(`users/${businessId}/zones/${fromZoneId}`), {
-        "stats.totalProducts": increment(-totalProducts),
-      });
-      transaction.update(db.doc(`users/${businessId}/zones/${toZoneId}`), {
-        "stats.totalProducts": increment(totalProducts),
-      });
-    }
-
-    // Warehouse stats (only if changed)
-    if (fromWarehouseId !== toWarehouseId) {
-      transaction.update(db.doc(`users/${businessId}/warehouses/${fromWarehouseId}`), {
-        "stats.totalProducts": increment(-totalProducts),
-      });
-      transaction.update(db.doc(`users/${businessId}/warehouses/${toWarehouseId}`), {
-        "stats.totalProducts": increment(totalProducts),
-      });
-    }
-  });
-}
-
 export async function propagateShelfLocationChange(
   businessId: string,
   shelfId: string,
@@ -532,85 +429,6 @@ export async function propagateShelfLocationChange(
     upcsQuery,
     shelf.locationVersion,
   );
-}
-
-// ============================================================================
-// RACK TRIGGERS → Update Zone Rack Counts + Propagate Name Changes
-// ============================================================================
-
-export function updateRackCountsInTransaction(
-  transaction: Transaction,
-  businessId: string,
-  zoneId: string,
-  warehouseId: string,
-  delta: number,
-) {
-  transaction.update(db.doc(`users/${businessId}/zones/${zoneId}`), {
-    "stats.totalRacks": increment(delta),
-  });
-
-  transaction.update(db.doc(`users/${businessId}/warehouses/${warehouseId}`), {
-    "stats.totalRacks": increment(delta),
-  });
-}
-
-export async function transferRackStats(
-  businessId: string,
-  rackId: string,
-  fromZoneId: string,
-  fromWarehouseId: string,
-  toZoneId: string,
-  toWarehouseId: string,
-) {
-  // Query first (outside transaction)
-  const shelves = await db
-    .collection(`users/${businessId}/shelves`)
-    .where("rackId", "==", rackId)
-    .where("isDeleted", "==", false)
-    .get();
-
-  const totalShelves = shelves.size;
-
-  const placements = await db
-    .collection(`users/${businessId}/placements`)
-    .where("rackId", "==", rackId)
-    .get();
-
-  const totalProducts = placements.docs.reduce((sum, doc) => sum + (doc.data().quantity || 0), 0);
-
-  if (totalShelves === 0 && totalProducts === 0) return;
-
-  // Use transaction for atomic stats transfer
-  await db.runTransaction(async (transaction) => {
-    if (totalShelves > 0) {
-      transaction.update(db.doc(`users/${businessId}/zones/${fromZoneId}`), {
-        "stats.totalShelves": increment(-totalShelves),
-      });
-      transaction.update(db.doc(`users/${businessId}/zones/${toZoneId}`), {
-        "stats.totalShelves": increment(totalShelves),
-      });
-    }
-
-    if (totalProducts > 0) {
-      transaction.update(db.doc(`users/${businessId}/zones/${fromZoneId}`), {
-        "stats.totalProducts": increment(-totalProducts),
-      });
-      transaction.update(db.doc(`users/${businessId}/zones/${toZoneId}`), {
-        "stats.totalProducts": increment(totalProducts),
-      });
-    }
-
-    if (fromWarehouseId !== toWarehouseId) {
-      transaction.update(db.doc(`users/${businessId}/warehouses/${fromWarehouseId}`), {
-        "stats.totalShelves": increment(-totalShelves),
-        "stats.totalProducts": increment(-totalProducts),
-      });
-      transaction.update(db.doc(`users/${businessId}/warehouses/${toWarehouseId}`), {
-        "stats.totalShelves": increment(totalShelves),
-        "stats.totalProducts": increment(totalProducts),
-      });
-    }
-  });
 }
 
 export async function propagateRackLocationChange(businessId: string, rackId: string, rack: Rack) {
@@ -663,75 +481,6 @@ export async function propagateRackLocationChange(businessId: string, rackId: st
     upcsQuery,
     rack.locationVersion,
   );
-}
-
-// ============================================================================
-// ZONE TRIGGERS → Propagate Name Changes
-// ============================================================================
-
-export function updateZoneCountsInTransaction(
-  transaction: Transaction,
-  businessId: string,
-  warehouseId: string,
-  delta: number,
-) {
-  transaction.update(db.doc(`users/${businessId}/warehouses/${warehouseId}`), {
-    "stats.totalZones": increment(delta),
-  });
-}
-
-export async function transferZoneStats(
-  businessId: string,
-  zoneId: string,
-  fromWarehouseId: string,
-  toWarehouseId: string,
-) {
-  // Query first (outside transaction)
-  const racks = await db
-    .collection(`users/${businessId}/racks`)
-    .where("zoneId", "==", zoneId)
-    .where("isDeleted", "==", false)
-    .get();
-
-  const totalRacks = racks.size;
-
-  const shelves = await db
-    .collection(`users/${businessId}/shelves`)
-    .where("zoneId", "==", zoneId)
-    .where("isDeleted", "==", false)
-    .get();
-
-  const totalShelves = shelves.size;
-
-  const placements = await db
-    .collection(`users/${businessId}/placements`)
-    .where("zoneId", "==", zoneId)
-    .get();
-
-  const totalProducts = placements.docs.reduce((sum, doc) => sum + (doc.data().quantity || 0), 0);
-
-  if (totalRacks === 0 && totalShelves === 0 && totalProducts === 0) return;
-
-  // Use transaction for atomic stats transfer
-  await db.runTransaction(async (transaction) => {
-    const fromRef = db.doc(`users/${businessId}/warehouses/${fromWarehouseId}`);
-    const toRef = db.doc(`users/${businessId}/warehouses/${toWarehouseId}`);
-
-    if (totalRacks > 0) {
-      transaction.update(fromRef, { "stats.totalRacks": increment(-totalRacks) });
-      transaction.update(toRef, { "stats.totalRacks": increment(totalRacks) });
-    }
-
-    if (totalShelves > 0) {
-      transaction.update(fromRef, { "stats.totalShelves": increment(-totalShelves) });
-      transaction.update(toRef, { "stats.totalShelves": increment(totalShelves) });
-    }
-
-    if (totalProducts > 0) {
-      transaction.update(fromRef, { "stats.totalProducts": increment(-totalProducts) });
-      transaction.update(toRef, { "stats.totalProducts": increment(totalProducts) });
-    }
-  });
 }
 
 export async function propagateZoneLocationChange(businessId: string, zoneId: string, zone: Zone) {
