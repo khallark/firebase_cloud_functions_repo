@@ -45,3 +45,4 @@ export * from "./migrateRtoClosedReceivedItems";
 export * from "./blueDartCodAttemptsReport";
 export * from "./groupProductsByName";
 export * from "./buildParentProducts";
+export * from "./addSizeField";
