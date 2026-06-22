@@ -26,6 +26,33 @@ interface ProductResult {
   saleReturnOrders: ProductOrderEntry[];
 }
 
+function normalizeVariantId(value: unknown): string | null {
+  if (typeof value === "number" && Number.isFinite(value)) return String(value);
+  if (typeof value === "string" && value.trim() !== "") return value.trim();
+  return null;
+}
+
+function getLineItems(order: any): any[] {
+  return Array.isArray(order?.raw?.line_items) ? order.raw.line_items : [];
+}
+
+function getRtoReceivedItems(order: any): any[] {
+  const items = getLineItems(order);
+  const itemsWithRtoFlag = items.filter((item: any) => item?.rtoReceived === true);
+  if (itemsWithRtoFlag.length > 0) return itemsWithRtoFlag;
+
+  const rtoReceived = Array.isArray(order?.rtoReceived) ? order.rtoReceived : [];
+  const receivedVariantSet = new Set(
+    rtoReceived.map(normalizeVariantId).filter((id: string | null): id is string => id !== null),
+  );
+  if (receivedVariantSet.size === 0) return [];
+
+  return items.filter((item: any) => {
+    const variantId = normalizeVariantId(item?.variant_id);
+    return !!variantId && receivedVariantSet.has(variantId);
+  });
+}
+
 export const getGrossProfitByProduct = onRequest(
   { cors: true, timeoutSeconds: 540, memory: "2GiB" },
   async (req, res) => {
@@ -197,15 +224,39 @@ export const getGrossProfitByProduct = onRequest(
       }),
     );
 
-    // ── 5. SKU → productId matcher ────────────────────────────────────────────
-    const normalize = (s: string) => s.toLowerCase().replace(/[\s-]/g, "");
+    // ── 5. Build variantId → businessSku lookup from store product mappings ──
+    // Replaces the old fuzzy SKU-substring matcher. The mapping is authoritative:
+    // a Shopify line item's variant_id resolves directly to the business SKU
+    // that was mapped to it (current mapping).
+    const variantToBusinessSku = new Map<string, string>();
 
-    const findProductId = (sku: string): string | null => {
-      const skuNorm = normalize(sku);
-      for (const productId of allProductIds) {
-        if (normalize(productId.replace("HEAVENDUSK", "HEAVENDUST")).includes(skuNorm)) return productId;
-      }
-      return null;
+    await Promise.all(
+      SHARED_STORE_IDS.map(async (storeId) => {
+        const productsSnap = await db
+          .collection("accounts")
+          .doc(storeId)
+          .collection("products")
+          .get();
+
+        for (const doc of productsSnap.docs) {
+          const variantMappings = doc.data()?.variantMappings as
+            | Record<string, string>
+            | undefined;
+          if (!variantMappings) continue;
+          for (const [variantId, businessSku] of Object.entries(variantMappings)) {
+            if (!businessSku) continue;
+            // variantMappings keys are strings already; normalize defensively.
+            variantToBusinessSku.set(String(variantId), businessSku);
+          }
+        }
+      }),
+    );
+
+    const resolveByVariant = (
+      variantId: number | string | undefined | null,
+    ): string | null => {
+      if (variantId === undefined || variantId === null) return null;
+      return variantToBusinessSku.get(String(variantId)) ?? null;
     };
 
     // ── 6. Initialize product result map ─────────────────────────────────────
@@ -241,17 +292,16 @@ export const getGrossProfitByProduct = onRequest(
       const productHits = new Map<string, ProductLineItem[]>();
 
       for (const item of order?.raw?.line_items ?? []) {
-        const sku = item.sku ?? "";
-        if (!sku) continue;
-        const productId = findProductId(sku);
+        const productId = resolveByVariant(item.variant_id);
         if (!productId) {
-          console.log(`UNMATCHED SKU: ${sku} in order ${order.name}`);
+          console.log(
+            `UNMAPPED variant_id: ${item.variant_id} (sku: ${item.sku ?? "—"}) in order ${order.name}`,
+          );
           continue;
         }
-        console.log(`SKU: ${sku} → ${productId}`);
         const qty = Number(item.quantity ?? 0);
         if (!productHits.has(productId)) productHits.set(productId, []);
-        productHits.get(productId)!.push({ sku, quantity: qty });
+        productHits.get(productId)!.push({ sku: item.sku ?? "", quantity: qty });
       }
 
       for (const [productId, items] of productHits) {
@@ -269,17 +319,20 @@ export const getGrossProfitByProduct = onRequest(
       if (vendors.length === 1 && vendors.some((v) => EXCLUDED_VENDORS.includes(v))) continue;
 
       const isQcFiltered = QC_FILTERED_STATUSES.includes(order.customStatus);
+      const itemsToProcess =
+        order.customStatus === "RTO Closed"
+          ? getRtoReceivedItems(order)
+          : (order?.raw?.line_items ?? []);
+
       const productHits = new Map<string, ProductLineItem[]>();
 
-      for (const item of order?.raw?.line_items ?? []) {
-        const sku = item.sku ?? "";
-        if (!sku) continue;
+      for (const item of itemsToProcess) {
         if (isQcFiltered && item.qc_status !== "QC Pass") continue;
-        const productId = findProductId(sku);
+        const productId = resolveByVariant(item.variant_id);
         if (!productId) continue;
         const qty = Number(item.quantity ?? 0);
         if (!productHits.has(productId)) productHits.set(productId, []);
-        productHits.get(productId)!.push({ sku, quantity: qty });
+        productHits.get(productId)!.push({ sku: item.sku ?? "", quantity: qty });
       }
 
       for (const [productId, items] of productHits) {

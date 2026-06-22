@@ -10,5 +10,6 @@ export * from "./migrations";
 export * from "./reports";
 export * from "./warehouse";
 export * from "./inventory";
+export * from "./parentProducts";
 // export * from "./B2B_OMS_INVENTORY_WAREHOUSE";
 // export * from "./agent";

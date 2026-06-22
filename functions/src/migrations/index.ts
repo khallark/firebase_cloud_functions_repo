@@ -46,3 +46,5 @@ export * from "./blueDartCodAttemptsReport";
 export * from "./groupProductsByName";
 export * from "./buildParentProducts";
 export * from "./addSizeField";
+export * from "./migrateSizeChartsToShopify";
+export * from "./backfillSizeChartNull";

@@ -1,6 +1,5 @@
 import { onRequest } from "firebase-functions/v2/https";
 import { db } from "../firebaseAdmin";
-// import { SHARED_STORE_ID, SHARED_STORE_ID_2 } from "../config";
 
 /**
  * One-time migration function to recalculate blockedStock for all business products
@@ -34,12 +33,6 @@ export const migrateBlockedStock = onRequest(
         res.status(404).json({ error: "Business not found" });
         return;
       }
-
-      const businessData = businessDoc.data();
-      const vendorName = businessData?.vendorName;
-      //   const isOWR = vendorName === "OWR";
-
-      console.log(`📋 Business vendor: ${vendorName}`);
 
       // Get all products for this business
       const productsSnapshot = await db.collection(`users/${businessId}/products`).get();
@@ -107,27 +100,12 @@ export const migrateBlockedStock = onRequest(
                   continue;
                 }
 
-                // const isSharedStore = SHARED_STORE_IDS.includes(storeId);
-
                 // Build query for orders
                 let ordersQuery = db
                   .collection("accounts")
                   .doc(storeId)
                   .collection("orders")
                   .where("customStatus", "in", ["New", "Confirmed", "Ready To Dispatch"]);
-
-                // // Apply vendor filtering for shared stores
-                // if (isSharedStore) {
-                //   if (isOWR) {
-                //     ordersQuery = ordersQuery.where("vendors", "array-contains-any", [
-                //       "OWR",
-                //       "BBB",
-                //       "Ghamand",
-                //     ]);
-                //   } else if (vendorName) {
-                //     ordersQuery = ordersQuery.where("vendors", "array-contains", vendorName);
-                //   }
-                // }
 
                 const ordersSnapshot = await ordersQuery.get();
 
@@ -138,18 +116,6 @@ export const migrateBlockedStock = onRequest(
                   if (!orderDoc.exists) continue;
 
                   const orderData = orderDoc.data();
-                  //   const vendorArray: string[] = orderData?.vendors || [];
-
-                  //   // Filter out orders for OWR in shared stores if they contain ENDORA or STYLE 05
-                  //   if (isSharedStore && isOWR) {
-                  //     const hasExcludedVendor = vendorArray.some(
-                  //       (v) => v === "ENDORA" || v === "STYLE 05",
-                  //     );
-
-                  //     if (hasExcludedVendor) {
-                  //       continue;
-                  //     }
-                  //   }
 
                   const line_items: any[] = orderData?.raw?.line_items || [];
 
