@@ -5,17 +5,22 @@ const DEFAULT_BUSINESS_ID = "2yEGCC8AffNxDoTZEqhAkCRgxNl2";
 const BATCH_LIMIT = 450; // under Firestore's 500-write cap, with headroom
 
 /**
- * Backfill: set `sizeChart: null` on every parentProducts doc where the field
- * is ABSENT. Docs that already have `sizeChart` (null OR a real chart) are left
- * untouched.
+ * Backfill: set `sizeChart`, `description`, and `specifications` to null on
+ * every parentProducts doc where each field is ABSENT — independently per field.
+ * A doc already holding a field (null OR a value) keeps it untouched.
+ *
+ * Each field is checked on its own, so a doc missing two of the three gets both
+ * set in a SINGLE update (one write). Fields already present are never rewritten.
  *
  * Firestore can't query "field missing", so we read all docs and filter in code:
- *   !("sizeChart" in data)  → field key not present at all.
+ *   !("<field>" in data)  → that field key is not present at all.
  *
  * Query params:
  *   ?businessId=...   (optional, defaults to the known business)
  *   ?dryRun=1         report what WOULD change without writing.
  */
+const NULLABLE_FIELDS = ["sizeChart", "description", "specifications"] as const;
+
 export const backfillSizeChartNull = onRequest(
   { cors: true, timeoutSeconds: 540, memory: "1GiB" },
   async (req, res) => {
@@ -32,25 +37,42 @@ export const backfillSizeChartNull = onRequest(
         .get();
 
       const totalDocs = snap.size;
-      let missing = 0;
-      let updated = 0;
-      const missingIds: string[] = [];
+
+      // Per-field "missing" counts.
+      const missingByField: Record<string, number> = {
+        sizeChart: 0,
+        description: 0,
+        specifications: 0,
+      };
+      // Docs that had at least one missing field (= number of writes performed).
+      let docsTouched = 0;
+      const touchedIds: string[] = [];
 
       let batch = db.batch();
       let inBatch = 0;
 
       for (const doc of snap.docs) {
         const data = doc.data();
-        if ("sizeChart" in data) continue; // already present (null or value) → skip
 
-        missing++;
-        missingIds.push(doc.id);
+        // Build an update containing ONLY the fields this doc is missing.
+        const patch: Record<string, null> = {};
+        for (const field of NULLABLE_FIELDS) {
+          if (!(field in data)) {
+            patch[field] = null;
+            missingByField[field]++;
+          }
+        }
+
+        const missingCount = Object.keys(patch).length;
+        if (missingCount === 0) continue; // all three present → skip
+
+        docsTouched++;
+        touchedIds.push(doc.id);
 
         if (dryRun) continue;
 
-        batch.update(doc.ref, { sizeChart: null });
+        batch.update(doc.ref, patch);
         inBatch++;
-        updated++;
 
         if (inBatch >= BATCH_LIMIT) {
           await batch.commit();
@@ -68,10 +90,11 @@ export const backfillSizeChartNull = onRequest(
         dryRun,
         businessId,
         totalDocs,
-        missingField: missing,
-        updated: dryRun ? 0 : updated,
-        alreadyPresent: totalDocs - missing,
-        missingIds,
+        missingByField,
+        docsTouched,
+        docsFullyPresent: totalDocs - docsTouched,
+        writesPerformed: dryRun ? 0 : docsTouched,
+        touchedIds,
       });
     } catch (error: unknown) {
       console.error("[backfillSizeChartNull] error:", error);

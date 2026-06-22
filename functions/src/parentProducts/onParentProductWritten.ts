@@ -10,10 +10,28 @@ interface ProductSizeChart {
   columns: SizeChartCols[];
   values: Record<string, Record<string, string>>;
 }
+interface ProductSpecifications {
+  fit: string;
+  fabric: string;
+  composition: string;
+  technique: string;
+}
 
 interface StoreProductMapping {
   storeId: string;
   productId: string;
+}
+
+// ── Metafield identity (mirror these in Shopify metafield definitions) ──
+const NAMESPACE = "custom";
+const KEY_SIZE_CHART = "majime_size_chart";       // multi_line_text_field
+const KEY_DESCRIPTION = "majime_description";       // multi_line_text_field
+const KEY_SPECIFICATIONS = "majime_specifications"; // json
+
+interface MetafieldInput {
+  key: string;
+  type: string;
+  value: string;
 }
 
 // ── Shopify GraphQL helper (same shape as the inventory sync function) ──
@@ -45,11 +63,12 @@ async function shopifyGraphQL(
   return data;
 }
 
-async function writeSizeChartMetafield(
+// Writes 1..n metafields onto a single product in one mutation.
+async function writeMetafields(
   storeId: string,
   accessToken: string,
   shopifyProductId: string,
-  jsonValue: string,
+  inputs: MetafieldInput[],
 ) {
   return shopifyGraphQL(
     storeId,
@@ -63,15 +82,13 @@ async function writeSizeChartMetafield(
     }
     `,
     {
-      metafields: [
-        {
-          ownerId: `gid://shopify/Product/${shopifyProductId}`,
-          namespace: "custom",
-          key: "majime_size_chart",
-          type: "multi_line_text_field",
-          value: jsonValue,
-        },
-      ],
+      metafields: inputs.map((i) => ({
+        ownerId: `gid://shopify/Product/${shopifyProductId}`,
+        namespace: NAMESPACE,
+        key: i.key,
+        type: i.type,
+        value: i.value,
+      })),
     },
   );
 }
@@ -85,7 +102,26 @@ function serializeChart(chart: ProductSizeChart): string {
   });
 }
 
+function serializeSpecs(s: ProductSpecifications): string {
+  // Fixed key order so change-detection is stable.
+  return JSON.stringify({
+    fit: s.fit,
+    composition: s.composition,
+    technique: s.technique,
+    fabric: s.fabric ?? "",
+  });
+}
+
 const mapKey = (m: StoreProductMapping) => `${m.storeId}::${m.productId}`;
+
+// A field's resolved write-state for this event.
+interface FieldState {
+  label: string;
+  key: string;
+  type: string;
+  value: string | null; // serialized value to write, or null when the field has no value
+  changed: boolean;      // serialized value differs from before
+}
 
 export const onParentProductWritten = onDocumentWritten(
   {
@@ -100,45 +136,63 @@ export const onParentProductWritten = onDocumentWritten(
       const after = event.data?.after?.data();
       const { parentId } = event.params;
 
-      // Doc deleted (no after) → nothing to do. Per the rules, a cleared chart
-      // also never deletes the metafield.
+      // Doc deleted (no after) → nothing to do. A cleared field also never
+      // deletes its metafield (stale value intentionally left behind).
       if (!after) return null;
 
+      // ── sizeChart ──
       const beforeChart: ProductSizeChart | null = before?.sizeChart ?? null;
       const afterChart: ProductSizeChart | null = after?.sizeChart ?? null;
+      const afterChartStr = afterChart ? serializeChart(afterChart) : null;
+      const beforeChartStr = beforeChart ? serializeChart(beforeChart) : null;
+
+      // ── description (treat empty/whitespace/missing as no value) ──
+      const rawBeforeDesc = typeof before?.description === "string" ? before.description : null;
+      const rawAfterDesc = typeof after?.description === "string" ? after.description : null;
+      const beforeDescVal = rawBeforeDesc && rawBeforeDesc.trim() ? rawBeforeDesc : null;
+      const afterDescVal = rawAfterDesc && rawAfterDesc.trim() ? rawAfterDesc : null;
+
+      // ── specifications ──
+      const beforeSpecs: ProductSpecifications | null = before?.specifications ?? null;
+      const afterSpecs: ProductSpecifications | null = after?.specifications ?? null;
+      const afterSpecsStr = afterSpecs ? serializeSpecs(afterSpecs) : null;
+      const beforeSpecsStr = beforeSpecs ? serializeSpecs(beforeSpecs) : null;
+
+      const fields: FieldState[] = [
+        {
+          label: "sizeChart",
+          key: KEY_SIZE_CHART,
+          type: "multi_line_text_field",
+          value: afterChartStr,
+          changed: beforeChartStr !== afterChartStr,
+        },
+        {
+          label: "description",
+          key: KEY_DESCRIPTION,
+          type: "multi_line_text_field",
+          value: afterDescVal,
+          changed: beforeDescVal !== afterDescVal,
+        },
+        {
+          label: "specifications",
+          key: KEY_SPECIFICATIONS,
+          type: "multi_line_text_field",
+          value: afterSpecsStr,
+          changed: beforeSpecsStr !== afterSpecsStr,
+        },
+      ];
 
       const beforeMappings: StoreProductMapping[] = before?.mappedStoreProducts ?? [];
       const afterMappings: StoreProductMapping[] = after?.mappedStoreProducts ?? [];
+      const beforeKeys = new Set(beforeMappings.map(mapKey));
 
-      // Nothing to ever write if there's no chart now.
-      if (!afterChart) return null;
+      const anyChangedNonNull = fields.some((f) => f.changed && f.value !== null);
+      const anyNonNull = fields.some((f) => f.value !== null);
+      const hasNewMappings = afterMappings.some((m) => !beforeKeys.has(mapKey(m)));
 
-      const afterChartStr = serializeChart(afterChart);
-      const beforeChartStr = beforeChart ? serializeChart(beforeChart) : null;
-      const chartChanged = beforeChartStr !== afterChartStr;
-
-      // Decide the target set of mappings to write to.
-      // - chart changed  → ALL current mappings
-      // - chart same but mappings changed → only the NEWLY-ADDED mappings
-      let targets: StoreProductMapping[] = [];
-
-      if (chartChanged) {
-        targets = afterMappings;
-        console.log(`📐 ${parentId}: chart changed → writing all ${targets.length} mapping(s)`);
-      } else {
-        const beforeKeys = new Set(beforeMappings.map(mapKey));
-        const added = afterMappings.filter((m) => !beforeKeys.has(mapKey(m)));
-        if (added.length === 0) {
-          // Neither chart nor mappings (additively) changed — nothing to do.
-          return null;
-        }
-        targets = added;
-        console.log(`🔗 ${parentId}: ${added.length} new mapping(s) → writing existing chart`);
-      }
-
-      if (targets.length === 0) return null;
-
-      const jsonValue = afterChartStr;
+      // Nothing to write if no field changed to a value, and there are no new
+      // mappings that would need the existing (unchanged) values.
+      if (!anyChangedNonNull && !(hasNewMappings && anyNonNull)) return null;
 
       // Cache store tokens across this invocation.
       const storeCache: Record<string, any | null> = {};
@@ -149,8 +203,20 @@ export const onParentProductWritten = onDocumentWritten(
         return storeCache[storeId];
       };
 
-      for (const { storeId, productId } of targets) {
+      for (const m of afterMappings) {
+        const { storeId, productId } = m;
         if (!storeId || !productId) continue;
+
+        const isNew = !beforeKeys.has(mapKey(m));
+
+        // A field is written to this mapping when it has a value AND
+        // (the field changed  OR  the mapping is newly added).
+        const inputs: MetafieldInput[] = fields
+          .filter((f) => f.value !== null && (f.changed || isNew))
+          .map((f) => ({ key: f.key, type: f.type, value: f.value as string }));
+
+        if (inputs.length === 0) continue;
+
         try {
           const store = await getStore(storeId);
           const accessToken = store?.accessToken;
@@ -159,8 +225,10 @@ export const onParentProductWritten = onDocumentWritten(
             continue;
           }
 
-          await writeSizeChartMetafield(storeId, accessToken, productId, jsonValue);
-          console.log(`  ✅ ${parentId} → ${storeId}/${productId}`);
+          await writeMetafields(storeId, accessToken, productId, inputs);
+          console.log(
+            `  ✅ ${parentId} → ${storeId}/${productId} [${inputs.map((i) => i.key).join(", ")}]${isNew ? " (new mapping)" : ""}`,
+          );
           await sleep(200); // throttle, matching the inventory sync cadence
         } catch (err: any) {
           console.error(`  ❌ ${parentId} → ${storeId}/${productId}: ${err.message}`);
